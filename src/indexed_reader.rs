@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
@@ -607,8 +609,70 @@ impl IndexedReader {
 
     /// Resolve one full object id into an owned value.
     pub fn resolve_object(&self, id: crate::ObjectId) -> IndexedReaderResult<Object> {
+        self.resolve_object_shared(id).map(|object| (*object).clone())
+    }
+
+    /// Resolve one full object id into a shareable owned value.
+    pub fn resolve_object_shared(&self, id: crate::ObjectId) -> IndexedReaderResult<Arc<Object>> {
         let mut state = ResolutionState::default();
-        self.resolve_inner(id, &mut state)
+        self.resolve_inner(id, &mut state).map(Arc::new)
+    }
+
+    /// Resolve each unique requested id into a shareable owned value.
+    ///
+    /// Results retain the first-occurrence order of `ids`; duplicate ids are
+    /// resolved once and omitted from later positions. Independent ordinary
+    /// objects may complete out of order internally. Compressed requests are
+    /// grouped by object-stream container so each successful container is
+    /// resolved, decoded and header-indexed once for this call.
+    pub fn resolve_many_shared(
+        &self, ids: &[crate::ObjectId],
+    ) -> Vec<(crate::ObjectId, IndexedReaderResult<Arc<Object>>)> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        let unique: Vec<_> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+        let mut normal = Vec::new();
+        let mut compressed: BTreeMap<u32, Vec<CompressedBatchRequest>> = BTreeMap::new();
+
+        for (position, id) in unique.iter().copied().enumerate() {
+            match self.index.locations.get(&id.0) {
+                Some(ObjectLocation64::Compressed { container, index }) => {
+                    compressed.entry(*container).or_default().push(CompressedBatchRequest {
+                        position,
+                        id,
+                        index: *index,
+                    });
+                }
+                _ => normal.push((position, id)),
+            }
+        }
+
+        #[cfg(feature = "rayon")]
+        let normal_results: Vec<_> = normal
+            .into_par_iter()
+            .map(|(position, id)| (position, self.resolve_object_shared(id)))
+            .collect();
+        #[cfg(not(feature = "rayon"))]
+        let normal_results: Vec<_> = normal
+            .into_iter()
+            .map(|(position, id)| (position, self.resolve_object_shared(id)))
+            .collect();
+
+        let mut results: Vec<Option<IndexedReaderResult<Arc<Object>>>> =
+            std::iter::repeat_with(|| None).take(unique.len()).collect();
+        for (position, result) in normal_results {
+            results[position] = Some(result);
+        }
+        for (container, requests) in compressed {
+            for (position, result) in self.resolve_compressed_group(container, &requests) {
+                results[position] = Some(result);
+            }
+        }
+
+        unique
+            .into_iter()
+            .zip(results)
+            .map(|(id, result)| (id, result.expect("every unique batch id is classified")))
+            .collect()
     }
 
     /// Derive the actual ordered leaf-page map by walking `/Kids`.
@@ -760,6 +824,122 @@ impl IndexedReader {
                 source,
             }
         })
+    }
+
+    fn resolve_compressed_group(
+        &self, container_number: u32, requests: &[CompressedBatchRequest],
+    ) -> Vec<(usize, IndexedReaderResult<Arc<Object>>)> {
+        // Very small depth limits make the active root id observable. Preserve
+        // exact scalar behavior rather than sharing container setup there.
+        if self.limits.max_length_depth < 2 {
+            return requests
+                .iter()
+                .map(|request| (request.position, self.resolve_object_shared(request.id)))
+                .collect();
+        }
+
+        let mut results = Vec::with_capacity(requests.len());
+        let valid: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                if request.id.1 == 0 {
+                    true
+                } else {
+                    results.push((
+                        request.position,
+                        Err(IndexedReaderError::GenerationMismatch {
+                            id: request.id,
+                            indexed: 0,
+                        }),
+                    ));
+                    false
+                }
+            })
+            .collect();
+        if valid.is_empty() {
+            return results;
+        }
+
+        let container = (container_number, 0);
+        let mut state = ResolutionState {
+            active: HashSet::from([container]),
+            // Reserve the same target-object and container depths used by the
+            // scalar compressed path.
+            depth: 2,
+        };
+        let object = match self.resolve_normal(container, &mut state) {
+            Ok(object) => object,
+            Err(_) => {
+                // IndexedReaderError is intentionally not Clone. On malformed
+                // shared setup, rerun scalar resolution so every requested id
+                // owns the exact error it would have received independently.
+                results.extend(
+                    valid
+                        .into_iter()
+                        .map(|request| (request.position, self.resolve_object_shared(request.id))),
+                );
+                return results;
+            }
+        };
+        let Object::Stream(stream) = object else {
+            results.extend(valid.into_iter().map(|request| {
+                (
+                    request.position,
+                    Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                        id: request.id,
+                        container,
+                    }),
+                )
+            }));
+            return results;
+        };
+        let limit = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
+        let selected = match ObjectStream::selected_members_with_limit(&stream, Some(limit)) {
+            Ok(selected) => selected,
+            Err(_) => {
+                results.extend(
+                    valid
+                        .into_iter()
+                        .map(|request| (request.position, self.resolve_object_shared(request.id))),
+                );
+                return results;
+            }
+        };
+
+        #[cfg(feature = "rayon")]
+        let parsed: Vec<_> = valid
+            .into_par_iter()
+            .map(|request| {
+                let result = selected
+                    .parse_member(request.id, request.index)
+                    .map(Arc::new)
+                    .map_err(|source| IndexedReaderError::ObjectStreamMember {
+                        id: request.id,
+                        container,
+                        index: request.index,
+                        source,
+                    });
+                (request.position, result)
+            })
+            .collect();
+        #[cfg(not(feature = "rayon"))]
+        let parsed: Vec<_> = valid
+            .into_iter()
+            .map(|request| {
+                let result = selected
+                    .parse_member(request.id, request.index)
+                    .map(Arc::new)
+                    .map_err(|source| IndexedReaderError::ObjectStreamMember {
+                        id: request.id,
+                        container,
+                        index: request.index,
+                        source,
+                    });
+                (request.position, result)
+            })
+            .collect();
+        results.extend(parsed);
+        results
     }
 
     fn resolve_normal(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
@@ -1050,6 +1230,13 @@ impl IndexedReader {
 struct ResolutionState {
     active: HashSet<crate::ObjectId>,
     depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CompressedBatchRequest {
+    position: usize,
+    id: crate::ObjectId,
+    index: u32,
 }
 
 fn authenticate_password(
@@ -4135,6 +4322,191 @@ mod tests {
                 format!("{:?}", eager.get_object(id).unwrap())
             );
         }
+    }
+
+    #[test]
+    fn shared_batch_deduplicates_and_restores_first_occurrence_order_with_errors() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"(one)",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"[2 (two)]",
+            },
+        ]);
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let resolved = reader.resolve_many_shared(&[(2, 0), (99, 0), (1, 0), (2, 0), (1, 1)]);
+
+        assert_eq!(
+            resolved.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [(2, 0), (99, 0), (1, 0), (1, 1)]
+        );
+        assert_eq!(resolved[0].1.as_ref().unwrap().as_array().unwrap().len(), 2);
+        assert!(matches!(
+            resolved[1].1,
+            Err(IndexedReaderError::MissingNormalObject { id: (99, 0) })
+        ));
+        assert_eq!(resolved[2].1.as_ref().unwrap().as_str().unwrap(), b"one");
+        assert!(matches!(
+            resolved[3].1,
+            Err(IndexedReaderError::GenerationMismatch { id: (1, 1), indexed: 0 })
+        ));
+        assert!(reader.resolve_many_shared(&[]).is_empty());
+    }
+
+    #[test]
+    fn shared_batch_groups_object_stream_reads_and_preserves_member_errors() {
+        let members = [
+            (10, b"(ten)".as_slice()),
+            (11, b"(eleven)".as_slice()),
+            (12, b"[12]".as_slice()),
+        ];
+        let (first, decoded) = object_stream_content(&members);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&decoded).unwrap();
+        let content = encoder.finish().unwrap();
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 3 /First {first} /Filter /FlateDecode"),
+            &content,
+            &[(10, 0), (11, 1), (12, 2), (13, 1)],
+        );
+        let source = Arc::new(TracingBytesSource {
+            bytes: fixture.pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+
+        let resolved = reader.resolve_many_shared(&[(12, 0), (10, 0), (13, 0), (11, 0), (10, 0)]);
+        let batch_reads = source.requests.lock().unwrap().len();
+        assert_eq!(
+            resolved.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [(12, 0), (10, 0), (13, 0), (11, 0)]
+        );
+        assert_eq!(
+            resolved[0].1.as_ref().unwrap().as_array().unwrap()[0].as_i64().unwrap(),
+            12
+        );
+        assert_eq!(resolved[1].1.as_ref().unwrap().as_str().unwrap(), b"ten");
+        assert!(matches!(
+            resolved[2].1,
+            Err(IndexedReaderError::ObjectStreamMember {
+                id: (13, 0),
+                container: (5, 0),
+                index: 1,
+                ..
+            })
+        ));
+        assert_eq!(resolved[3].1.as_ref().unwrap().as_str().unwrap(), b"eleven");
+
+        source.requests.lock().unwrap().clear();
+        for id in [(12, 0), (10, 0), (13, 0), (11, 0)] {
+            let _ = reader.resolve_object(id);
+        }
+        let scalar_reads = source.requests.lock().unwrap().len();
+        assert!(batch_reads < scalar_reads, "batch={batch_reads}, scalar={scalar_reads}");
+
+        let malformed_header = b"10 0 bad nope 12 6 ";
+        let mut malformed_content = malformed_header.to_vec();
+        malformed_content.extend_from_slice(b"(ten) (twelve)");
+        let malformed = object_stream_fixture(
+            &format!("/Type /ObjStm /N 3 /First {}", malformed_header.len()),
+            &malformed_content,
+            &[(10, 0), (12, 2)],
+        );
+        let reader = open_reader(&malformed.pdf, ResolverLimits::default());
+        let resolved = reader.resolve_many_shared(&[(12, 0), (10, 0)]);
+        assert_eq!(resolved[0].1.as_ref().unwrap().as_str().unwrap(), b"twelve");
+        assert_eq!(resolved[1].1.as_ref().unwrap().as_str().unwrap(), b"ten");
+
+        let duplicate_header = b"10 0 10 6 ";
+        let mut duplicate_content = duplicate_header.to_vec();
+        duplicate_content.extend_from_slice(b"(one) (two)");
+        let duplicate = object_stream_fixture(
+            &format!("/Type /ObjStm /N 2 /First {}", duplicate_header.len()),
+            &duplicate_content,
+            &[(10, 1)],
+        );
+        let reader = open_reader(&duplicate.pdf, ResolverLimits::default());
+        let resolved = reader.resolve_many_shared(&[(10, 0), (10, 0)]);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].1.as_ref().unwrap().as_str().unwrap(), b"two");
+    }
+
+    #[test]
+    fn shared_batch_preserves_encryption_for_revisions_two_through_six() {
+        for revision in 2..=6 {
+            let pdf = encrypted_pdf(revision, "owner", "user");
+            let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+            let resolved = reader.resolve_many_shared(&[(2, 0), (1, 0), (2, 0)]);
+            assert_eq!(resolved.len(), 2);
+            assert_eq!(
+                resolved[0].1.as_ref().unwrap().as_stream().unwrap().content,
+                b"encrypted stream"
+            );
+            assert_eq!(resolved[1].1.as_ref().unwrap().as_str().unwrap(), b"encrypted string");
+        }
+
+        let (pdf, image_plaintext, _) = encrypted_object_stream_pdf();
+        let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+        let resolved = reader.resolve_many_shared(&[(10, 0), (20, 0), (21, 0)]);
+        assert_eq!(
+            resolved[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Text")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            b"member secret"
+        );
+        assert_eq!(
+            resolved[1].1.as_ref().unwrap().as_stream().unwrap().content,
+            image_plaintext
+        );
+        assert_eq!(resolved[2].1.as_ref().unwrap().as_str().unwrap(), b"normal secret");
+    }
+
+    #[test]
+    fn shared_batch_limit_errors_match_scalar_and_types_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<IndexedReader>();
+        assert_send_sync::<Arc<Object>>();
+
+        let large = format!("({})", "x".repeat(16 * 1_024));
+        let (first, decoded) = object_stream_content(&[(10, large.as_bytes()), (11, b"(small)")]);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&decoded).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 2 /First {first} /Filter /FlateDecode"),
+            &compressed,
+            &[(10, 0), (11, 1)],
+        );
+        let reader = open_reader(
+            &fixture.pdf,
+            ResolverLimits {
+                max_stream_bytes: 1_024,
+                ..ResolverLimits::default()
+            },
+        );
+        let batch = reader.resolve_many_shared(&[(11, 0), (10, 0)]);
+        for (_, result) in batch {
+            assert!(matches!(result, Err(IndexedReaderError::ObjectStreamMember { .. })));
+        }
+        assert!(matches!(
+            reader.resolve_object((11, 0)),
+            Err(IndexedReaderError::ObjectStreamMember { .. })
+        ));
     }
 
     #[test]

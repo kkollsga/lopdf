@@ -25,6 +25,15 @@ pub struct ObjectStream {
     compression_level: u32,
 }
 
+/// Call-local decoded bytes and a compact index for selected ObjStm members.
+/// Invalid unrelated header pairs remain represented instead of rejecting the
+/// complete stream, preserving the selected-member parser's permissive policy.
+pub(crate) struct SelectedObjectStream<'a> {
+    decoded: Cow<'a, [u8]>,
+    first: usize,
+    pairs: Vec<(Option<u32>, Option<u32>)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectStreamBuilder {
     max_objects: usize,
@@ -165,113 +174,15 @@ impl ObjectStream {
             ));
         }
 
-        // Decode into call-local storage. This leaves the caller's compressed
-        // stream unchanged and drops the full object-stream container before
-        // returning the selected object.
-        let decoded = if stream.is_compressed() {
-            match max_decompressed_size {
-                Some(max) => Cow::Owned(stream.decompressed_content_with_limit(max)?),
-                // The eager unbounded constructor deliberately ignores a
-                // decompression error and continues against the original
-                // bytes. Preserve that outcome without mutating the caller.
-                None => match stream.decompressed_content() {
-                    Ok(decoded) => Cow::Owned(decoded),
-                    Err(_) => Cow::Borrowed(stream.content.as_slice()),
-                },
-            }
-        } else {
-            if let Some(max) = max_decompressed_size
-                && stream.content.len() > max
-            {
-                return Err(DecompressError::MemoryLimitExceeded { limit: max }.into());
-            }
-            Cow::Borrowed(stream.content.as_slice())
-        };
+        SelectedObjectStream::new_with_limit(stream, max_decompressed_size)?.parse_member(expected_id, member_index)
+    }
 
-        if decoded.is_empty() {
-            return Err(Error::InvalidObjectStream(
-                "selected object stream member is not present".to_string(),
-            ));
-        }
-
-        let first = stream
-            .dict
-            .get(b"First")
-            .and_then(Object::as_i64)?
-            .try_into()
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-
-        let index_block = decoded.get(..first).ok_or(Error::InvalidOffset(first))?;
-        let index_text = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
-        let token_limit = MAX_SELECTED_OBJECT_STREAM_MEMBERS
-            .checked_add(1)
-            .and_then(|pairs| pairs.checked_mul(2))
-            .ok_or_else(|| Error::InvalidObjectStream("selected-parser member limit overflow".to_string()))?;
-        let number_count = index_text.split_whitespace().take(token_limit).count();
-        if number_count == token_limit {
-            return Err(Error::InvalidObjectStream(format!(
-                "parsed member count exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
-            )));
-        }
-        let pair_count = number_count / 2;
-
-        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
-        let member_limit = i64::try_from(MAX_SELECTED_OBJECT_STREAM_MEMBERS)
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        if n > member_limit {
-            return Err(Error::InvalidObjectStream(format!(
-                "declared member count {n} exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
-            )));
-        }
-        if number_count.try_into().ok() != n.checked_mul(2) {
-            warn!("object stream: the object stream dictionary specifies a wrong number of objects")
-        }
-
-        let member_index: usize = member_index
-            .try_into()
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        if member_index >= pair_count {
-            return Err(Error::InvalidObjectStream(format!(
-                "member index {member_index} is outside the {pair_count} complete header pairs"
-            )));
-        }
-        let token_index = member_index
-            .checked_mul(2)
-            .ok_or_else(|| Error::InvalidObjectStream("object stream member index overflow".to_string()))?;
-        let mut numbers = index_text.split_whitespace();
-        let declared_id = numbers
-            .nth(token_index)
-            .and_then(|number| u32::from_str(number).ok())
-            .ok_or_else(|| Error::InvalidObjectStream("selected object id is invalid".to_string()))?;
-        let relative_offset = numbers
-            .next()
-            .and_then(|number| u32::from_str(number).ok())
-            .ok_or_else(|| Error::InvalidObjectStream("selected object offset is invalid".to_string()))?;
-        if declared_id != expected_id.0 {
-            return Err(Error::InvalidObjectStream(format!(
-                "member index {member_index} declares object {declared_id}, not {}",
-                expected_id.0
-            )));
-        }
-
-        let relative_offset: usize = relative_offset
-            .try_into()
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        let start = first
-            .checked_add(relative_offset)
-            .ok_or_else(|| Error::InvalidObjectStream("object stream member offset overflow".to_string()))?;
-        if start >= decoded.len() {
-            return Err(Error::InvalidOffset(start));
-        }
-        let start = decoded[start..]
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .and_then(|leading| start.checked_add(leading))
-            .ok_or_else(|| Error::InvalidObjectStream("selected object stream member is empty".to_string()))?;
-
-        parser::direct_object(&decoded[start..]).ok_or_else(|| {
-            Error::InvalidObjectStream("selected object stream member is truncated or invalid".to_string())
-        })
+    /// Decode and index one object stream for resolving multiple selected
+    /// members without retaining the decoded container beyond the caller.
+    pub(crate) fn selected_members_with_limit(
+        stream: &Stream, max_decompressed_size: Option<usize>,
+    ) -> Result<SelectedObjectStream<'_>> {
+        SelectedObjectStream::new_with_limit(stream, max_decompressed_size)
     }
 
     /// Create a builder for constructing new object streams
@@ -466,6 +377,132 @@ impl ObjectStream {
             }
         }
         false
+    }
+}
+
+impl<'a> SelectedObjectStream<'a> {
+    fn new_with_limit(stream: &'a Stream, max_decompressed_size: Option<usize>) -> Result<Self> {
+        // Keep decompression call-local. A batch therefore retains at most the
+        // decoded containers it is actively resolving, never a source-wide map.
+        let decoded = if stream.is_compressed() {
+            match max_decompressed_size {
+                Some(max) => Cow::Owned(stream.decompressed_content_with_limit(max)?),
+                // Preserve the eager unbounded constructor's fallback to the
+                // original bytes when a filter cannot be decoded.
+                None => match stream.decompressed_content() {
+                    Ok(decoded) => Cow::Owned(decoded),
+                    Err(_) => Cow::Borrowed(stream.content.as_slice()),
+                },
+            }
+        } else {
+            if let Some(max) = max_decompressed_size
+                && stream.content.len() > max
+            {
+                return Err(DecompressError::MemoryLimitExceeded { limit: max }.into());
+            }
+            Cow::Borrowed(stream.content.as_slice())
+        };
+
+        if decoded.is_empty() {
+            return Err(Error::InvalidObjectStream(
+                "selected object stream member is not present".to_string(),
+            ));
+        }
+
+        let first = stream
+            .dict
+            .get(b"First")
+            .and_then(Object::as_i64)?
+            .try_into()
+            .map_err(|error: TryFromIntError| Error::NumericCast(error.to_string()))?;
+        let index_block = decoded.get(..first).ok_or(Error::InvalidOffset(first))?;
+        let index_text =
+            std::str::from_utf8(index_block).map_err(|error| Error::InvalidObjectStream(error.to_string()))?;
+        let token_limit = MAX_SELECTED_OBJECT_STREAM_MEMBERS
+            .checked_add(1)
+            .and_then(|pairs| pairs.checked_mul(2))
+            .ok_or_else(|| Error::InvalidObjectStream("selected-parser member limit overflow".to_string()))?;
+        let number_count = index_text.split_whitespace().take(token_limit).count();
+        if number_count == token_limit {
+            return Err(Error::InvalidObjectStream(format!(
+                "parsed member count exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
+            )));
+        }
+
+        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
+        let member_limit = i64::try_from(MAX_SELECTED_OBJECT_STREAM_MEMBERS)
+            .map_err(|error: TryFromIntError| Error::NumericCast(error.to_string()))?;
+        if n > member_limit {
+            return Err(Error::InvalidObjectStream(format!(
+                "declared member count {n} exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
+            )));
+        }
+        if number_count.try_into().ok() != n.checked_mul(2) {
+            warn!("object stream: the object stream dictionary specifies a wrong number of objects")
+        }
+
+        // Parse each header token independently. Unrelated malformed pairs stay
+        // advisory; only selecting one turns its invalid token into an error.
+        let pair_count = number_count / 2;
+        let mut pairs = Vec::with_capacity(pair_count);
+        let mut tokens = index_text.split_whitespace();
+        for _ in 0..pair_count {
+            pairs.push((
+                tokens.next().and_then(|token| u32::from_str(token).ok()),
+                tokens.next().and_then(|token| u32::from_str(token).ok()),
+            ));
+        }
+        Ok(Self { decoded, first, pairs })
+    }
+
+    pub(crate) fn parse_member(&self, expected_id: ObjectId, member_index: u32) -> Result<Object> {
+        if expected_id.1 != 0 {
+            return Err(Error::InvalidObjectStream(
+                "compressed objects must have generation zero".to_string(),
+            ));
+        }
+
+        let member_index: usize = member_index
+            .try_into()
+            .map_err(|error: TryFromIntError| Error::NumericCast(error.to_string()))?;
+        let Some(&(declared_id, relative_offset)) = self.pairs.get(member_index) else {
+            return Err(Error::InvalidObjectStream(format!(
+                "member index {member_index} is outside the {} complete header pairs",
+                self.pairs.len()
+            )));
+        };
+        let declared_id =
+            declared_id.ok_or_else(|| Error::InvalidObjectStream("selected object id is invalid".to_string()))?;
+        let relative_offset = relative_offset
+            .ok_or_else(|| Error::InvalidObjectStream("selected object offset is invalid".to_string()))?;
+        if declared_id != expected_id.0 {
+            return Err(Error::InvalidObjectStream(format!(
+                "member index {member_index} declares object {declared_id}, not {}",
+                expected_id.0
+            )));
+        }
+
+        let relative_offset: usize = relative_offset
+            .try_into()
+            .map_err(|error: TryFromIntError| Error::NumericCast(error.to_string()))?;
+        let start = self
+            .first
+            .checked_add(relative_offset)
+            .ok_or_else(|| Error::InvalidObjectStream("object stream member offset overflow".to_string()))?;
+        if start >= self.decoded.len() {
+            return Err(Error::InvalidOffset(start));
+        }
+        let start = self.decoded[start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .and_then(|leading| start.checked_add(leading))
+            .ok_or_else(|| Error::InvalidObjectStream("selected object stream member is empty".to_string()))?;
+
+        // Do not bound parsing at the next declared offset: the existing eager
+        // prefix policy accepts the first complete direct object from this tail.
+        parser::direct_object(&self.decoded[start..]).ok_or_else(|| {
+            Error::InvalidObjectStream("selected object stream member is truncated or invalid".to_string())
+        })
     }
 }
 
