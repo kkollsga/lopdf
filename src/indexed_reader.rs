@@ -9,7 +9,9 @@ use crate::source::{RandomAccessSource, SourceError};
 use crate::{Dictionary, Object, Stream};
 
 const HEADER_SCAN_LIMIT: u64 = 1_024;
+const HEADER_PARSE_OVERLAP: u64 = 64;
 const TAIL_SCAN_LIMIT: u64 = 64 * 1_024;
+const XREF_INITIAL_WINDOW: u64 = 4 * 1_024;
 const XREF_WINDOW_LIMIT: u64 = 16 * 1_024 * 1_024;
 const XREF_DECOMPRESSED_LIMIT: usize = 32 * 1_024 * 1_024;
 const MAX_XREF_ENTRIES: u64 = 1_000_000;
@@ -150,11 +152,21 @@ fn merge_newest(target: &mut BTreeMap<u32, ObjectLocation64>, entries: BTreeMap<
 }
 
 fn read_header(source: &dyn RandomAccessSource, source_len: u64) -> IndexResult<(u64, String)> {
-    let length = source_len.min(HEADER_SCAN_LIMIT);
-    let bytes = source.read_range(0, length, HEADER_SCAN_LIMIT)?;
+    let read_limit = HEADER_SCAN_LIMIT
+        .checked_add(HEADER_PARSE_OVERLAP)
+        .ok_or(IndexError::InvalidHeader {
+            limit: HEADER_SCAN_LIMIT,
+        })?;
+    let length = source_len.min(read_limit);
+    let bytes = source.read_range(0, length, read_limit)?;
     let origin = bytes
         .windows(5)
         .position(|window| window == b"%PDF-")
+        .filter(|origin| {
+            u64::try_from(*origin)
+                .ok()
+                .is_some_and(|origin| origin < HEADER_SCAN_LIMIT)
+        })
         .ok_or(IndexError::InvalidHeader {
             limit: HEADER_SCAN_LIMIT,
         })?;
@@ -192,22 +204,38 @@ fn read_xref_section(
     let remaining = source_len.checked_sub(physical_offset).ok_or(IndexError::InvalidXref {
         offset: physical_offset,
     })?;
-    let length = remaining.min(XREF_WINDOW_LIMIT);
-    let window = source.read_range(physical_offset, length, XREF_WINDOW_LIMIT)?;
-    let result = if starts_with_token(&window, b"xref") {
-        parse_classic_xref(&window, physical_offset)
-    } else {
-        parse_xref_stream(&window, physical_offset)
-    };
-    match result {
-        Err(IndexError::InvalidXref { .. } | IndexError::InvalidTrailer { .. }) if remaining > XREF_WINDOW_LIMIT => {
-            Err(IndexError::StructureLimitExceeded {
-                structure: "cross-reference section",
-                limit: XREF_WINDOW_LIMIT,
-            })
+    let maximum = remaining.min(XREF_WINDOW_LIMIT);
+    let mut length = maximum.min(XREF_INITIAL_WINDOW);
+    loop {
+        let window = source.read_range(physical_offset, length, length)?;
+        let result = if starts_with_token(&window, b"xref") {
+            parse_classic_xref(&window, physical_offset)
+        } else {
+            parse_xref_stream(&window, physical_offset)
+        };
+        match result {
+            Ok(section) => return Ok(section),
+            Err(error) if length < maximum && is_incomplete_xref_error(&error) => {
+                length = length.saturating_mul(2).min(maximum);
+            }
+            Err(IndexError::InvalidXref { .. } | IndexError::InvalidTrailer { .. })
+                if remaining > XREF_WINDOW_LIMIT =>
+            {
+                return Err(IndexError::StructureLimitExceeded {
+                    structure: "cross-reference section",
+                    limit: XREF_WINDOW_LIMIT,
+                });
+            }
+            Err(error) => return Err(error),
         }
-        other => other,
     }
+}
+
+fn is_incomplete_xref_error(error: &IndexError) -> bool {
+    matches!(
+        error,
+        IndexError::InvalidXref { .. } | IndexError::InvalidTrailer { .. } | IndexError::StructureLimitExceeded { .. }
+    )
 }
 
 fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> {
@@ -293,6 +321,9 @@ fn parse_xref_stream(window: &[u8], offset: u64) -> IndexResult<XrefSection64> {
         .take(stream_len)
         .ok_or(IndexError::InvalidXref { offset })?
         .to_vec();
+    cursor.consume_optional_eol();
+    cursor.expect(b"endstream").ok_or(IndexError::InvalidXref { offset })?;
+    cursor.expect(b"endobj").ok_or(IndexError::InvalidXref { offset })?;
     let mut stream = Stream::new(dictionary.clone(), content);
     if stream.is_compressed() {
         stream
@@ -527,6 +558,14 @@ impl<'a> TokenCursor<'a> {
         }
     }
 
+    fn consume_optional_eol(&mut self) {
+        if self.remaining.starts_with(b"\r\n") {
+            self.remaining = &self.remaining[2..];
+        } else if self.remaining.starts_with(b"\n") || self.remaining.starts_with(b"\r") {
+            self.remaining = &self.remaining[1..];
+        }
+    }
+
     fn take(&mut self, length: usize) -> Option<&'a [u8]> {
         let (taken, remaining) = self.remaining.split_at_checked(length)?;
         self.remaining = remaining;
@@ -757,6 +796,22 @@ mod tests {
     }
 
     #[test]
+    fn header_starting_at_last_scannable_byte_uses_bounded_overlap() {
+        let pdf = classic_pdf();
+        let mut boundary = vec![b'x'; usize::try_from(HEADER_SCAN_LIMIT - 1).unwrap()];
+        boundary.extend_from_slice(&pdf);
+        let index = open_bytes(&boundary);
+        assert_eq!(index.source_origin, HEADER_SCAN_LIMIT - 1);
+
+        let mut outside = vec![b'x'; usize::try_from(HEADER_SCAN_LIMIT).unwrap()];
+        outside.extend_from_slice(&pdf);
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(outside))),
+            Err(IndexError::InvalidHeader { .. })
+        ));
+    }
+
+    #[test]
     fn malformed_startxref_and_prev_fail_without_fallback() {
         let mut missing = classic_pdf();
         let marker = rfind(&missing, b"startxref").unwrap();
@@ -804,6 +859,95 @@ mod tests {
         );
         let index = open_bytes(&pdf);
         assert_eq!(index.xref_start, xref);
+    }
+
+    fn padded_classic_xref(padding_over_limit: u64) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let xref = u64::try_from(pdf.len()).unwrap();
+        let prefix = b"xref\n";
+        let suffix = b"trailer\n<< /Size 1 /Root 1 0 R >>";
+        pdf.extend_from_slice(prefix);
+        let used = u64::try_from(prefix.len() + suffix.len()).unwrap();
+        let padding = XREF_WINDOW_LIMIT - used + padding_over_limit;
+        pdf.resize(pdf.len() + usize::try_from(padding).unwrap(), 0);
+        pdf.extend_from_slice(suffix);
+        pdf.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn raw_xref_window_accepts_boundary_and_rejects_one_byte_over() {
+        assert!(PdfIndex::open(Arc::new(BytesSource::from(padded_classic_xref(0)))).is_ok());
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(padded_classic_xref(1)))),
+            Err(IndexError::StructureLimitExceeded {
+                structure: "cross-reference section",
+                limit: XREF_WINDOW_LIMIT
+            })
+        ));
+    }
+
+    fn compressed_limit_xref(decoded_len: usize) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&vec![0_u8; decoded_len]).unwrap();
+        let content = encoder.finish().unwrap();
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let xref = u64::try_from(pdf.len()).unwrap();
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Type /XRef /Size 1 /Index [0 1] /W [1 0 0] /Filter /FlateDecode /Length {} >>\nstream\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&content);
+        pdf.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn decoded_xref_limit_accepts_boundary_and_rejects_one_byte_over() {
+        assert!(
+            PdfIndex::open(Arc::new(BytesSource::from(compressed_limit_xref(
+                XREF_DECOMPRESSED_LIMIT
+            ))))
+            .is_ok()
+        );
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(compressed_limit_xref(
+                XREF_DECOMPRESSED_LIMIT + 1
+            )))),
+            Err(IndexError::XrefDecompression(_))
+        ));
+    }
+
+    fn empty_width_xref(width: u64) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let xref = u64::try_from(pdf.len()).unwrap();
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Type /XRef /Size 0 /Index [0 0] /W [1 {width} 1] /Length 0 >>\nstream\n\nendstream\nendobj\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn xref_field_width_and_entry_count_limits_are_inclusive() {
+        assert!(PdfIndex::open(Arc::new(BytesSource::from(empty_width_xref(8)))).is_ok());
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(empty_width_xref(9)))),
+            Err(IndexError::InvalidXref { .. })
+        ));
+        assert!(check_entry_limit(MAX_XREF_ENTRIES).is_ok());
+        assert!(matches!(
+            check_entry_limit(MAX_XREF_ENTRIES + 1),
+            Err(IndexError::EntryLimitExceeded {
+                count,
+                limit: MAX_XREF_ENTRIES
+            }) if count == MAX_XREF_ENTRIES + 1
+        ));
     }
 
     #[cfg(any(unix, windows))]
@@ -898,5 +1042,166 @@ mod tests {
         );
         let total: usize = requests.iter().map(|(_, length)| *length).sum();
         assert!(u64::try_from(total).unwrap() < len / 100);
+    }
+
+    #[test]
+    fn tiny_xref_at_one_megabyte_uses_only_the_initial_window() {
+        let len = 100_u64 * 1_024 * 1_024;
+        let xref = 1_024_u64 * 1_024;
+        let xref_bytes = b"xref\n1 1\n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\n".to_vec();
+        let eof_offset = len - 128;
+        let tail = format!("startxref\n{xref}\n%%EOF\n").into_bytes();
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![(0, b"%PDF-1.7\n".to_vec()), (xref, xref_bytes), (eof_offset, tail)],
+            requests: Mutex::new(Vec::new()),
+        });
+
+        PdfIndex::open(source.clone()).unwrap();
+        let requests = source.requests.lock().unwrap();
+        assert!(requests.contains(&(xref, usize::try_from(XREF_INITIAL_WINDOW).unwrap())));
+        assert!(
+            !requests
+                .iter()
+                .any(|(offset, length)| { *offset == xref && u64::try_from(*length).unwrap() > XREF_INITIAL_WINDOW })
+        );
+    }
+
+    #[test]
+    fn incremental_revisions_each_stop_at_the_initial_window() {
+        let len = 100_u64 * 1_024 * 1_024;
+        let base = 1_024_u64 * 1_024;
+        let newest = 2_u64 * 1_024 * 1_024;
+        let base_bytes = b"xref\n1 1\n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\n".to_vec();
+        let newest_bytes =
+            format!("xref\n1 1\n0000000042 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R /Prev {base} >>\n").into_bytes();
+        let eof_offset = len - 128;
+        let tail = format!("startxref\n{newest}\n%%EOF\n").into_bytes();
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![
+                (0, b"%PDF-1.7\n".to_vec()),
+                (base, base_bytes),
+                (newest, newest_bytes),
+                (eof_offset, tail),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let index = PdfIndex::open(source.clone()).unwrap();
+        assert_eq!(
+            index.locations.get(&1),
+            Some(&ObjectLocation64::Normal {
+                offset: 42,
+                generation: 0
+            })
+        );
+        let requests = source.requests.lock().unwrap();
+        for offset in [base, newest] {
+            let lengths: Vec<_> = requests
+                .iter()
+                .filter_map(|(actual, length)| (*actual == offset).then_some(*length))
+                .collect();
+            assert_eq!(lengths, vec![usize::try_from(XREF_INITIAL_WINDOW).unwrap()]);
+        }
+    }
+
+    fn revision_source(count: usize) -> Arc<OverlaySource> {
+        let first = 1_024_u64 * 1_024;
+        let stride = 8_u64 * 1_024;
+        let mut regions = vec![(0, b"%PDF-1.7\n".to_vec())];
+        for revision in 0..count {
+            let revision = u64::try_from(revision).unwrap();
+            let offset = first + revision * stride;
+            let previous = (revision > 0).then(|| first + (revision - 1) * stride);
+            let prev = previous.map(|value| format!(" /Prev {value}")).unwrap_or_default();
+            regions.push((
+                offset,
+                format!("xref\n1 1\n{revision:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R{prev} >>\n").into_bytes(),
+            ));
+        }
+        let newest = first + u64::try_from(count - 1).unwrap() * stride;
+        let len = newest + 2 * TAIL_SCAN_LIMIT;
+        let eof_offset = len - 128;
+        regions.push((eof_offset, format!("startxref\n{newest}\n%%EOF\n").into_bytes()));
+        Arc::new(OverlaySource {
+            len,
+            regions,
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[test]
+    fn revision_limit_accepts_1024_and_rejects_1025() {
+        let boundary = revision_source(MAX_XREF_REVISIONS);
+        assert!(PdfIndex::open(boundary).is_ok());
+
+        let over = revision_source(MAX_XREF_REVISIONS + 1);
+        assert!(matches!(
+            PdfIndex::open(over),
+            Err(IndexError::RevisionLimitExceeded {
+                limit: MAX_XREF_REVISIONS
+            })
+        ));
+    }
+
+    #[test]
+    fn two_node_prev_cycle_is_detected_without_extra_reads() {
+        let len = 4_u64 * 1_024 * 1_024;
+        let first = 1_024_u64 * 1_024;
+        let second = 2_u64 * 1_024 * 1_024;
+        let first_bytes =
+            format!("xref\n1 1\n0000000011 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R /Prev {second} >>\n").into_bytes();
+        let second_bytes =
+            format!("xref\n1 1\n0000000022 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R /Prev {first} >>\n").into_bytes();
+        let eof_offset = len - 128;
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![
+                (0, b"%PDF-1.7\n".to_vec()),
+                (first, first_bytes),
+                (second, second_bytes),
+                (eof_offset, format!("startxref\n{second}\n%%EOF\n").into_bytes()),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let index = PdfIndex::open(source.clone()).unwrap();
+        assert_eq!(
+            index.locations.get(&1),
+            Some(&ObjectLocation64::Normal {
+                offset: 22,
+                generation: 0
+            })
+        );
+        let requests = source.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|(offset, _)| *offset == first).count(), 1);
+        assert_eq!(requests.iter().filter(|(offset, _)| *offset == second).count(), 1);
+    }
+
+    fn corrupt_marker(mut pdf: Vec<u8>, marker: &[u8]) -> Vec<u8> {
+        let position = rfind(&pdf, marker).unwrap();
+        pdf[position..position + marker.len()].fill(b'x');
+        pdf
+    }
+
+    #[test]
+    fn xref_stream_requires_endstream_and_endobj_terminators() {
+        let valid = xref_stream_pdf(true);
+        assert!(Document::load_mem(&valid).is_ok());
+        assert!(PdfIndex::open(Arc::new(BytesSource::from(valid.clone()))).is_ok());
+
+        let missing_endstream = corrupt_marker(valid.clone(), b"endstream");
+        assert!(Document::load_mem(&missing_endstream).is_err());
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(missing_endstream))),
+            Err(IndexError::InvalidXref { .. })
+        ));
+
+        let missing_endobj = corrupt_marker(valid, b"endobj");
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(missing_endobj))),
+            Err(IndexError::InvalidXref { .. })
+        ));
     }
 }
