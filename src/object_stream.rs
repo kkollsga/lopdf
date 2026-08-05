@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::num::TryFromIntError;
 use std::str::FromStr;
 
-/// Maximum `/N` accepted by the selected-member object-stream parsers.
+/// Maximum `/N` and parsed header-pair count accepted by the selected-member
+/// object-stream parsers.
 ///
 /// This bounds header-validation work for untrusted object streams. It applies
 /// only to [`ObjectStream::parse_selected_member`] and
@@ -137,7 +138,7 @@ impl ObjectStream {
     /// `member_index` is the zero-based index recorded by the compressed xref
     /// entry. The header entry at that index must name `expected_id`, whose
     /// generation must be zero. Only that member is parsed into an [`Object`];
-    /// the other members are validated without materializing their objects.
+    /// the header is scanned without materializing the other objects.
     /// Repeated object ids are accepted; the index selects the exact declared
     /// occurrence, which must name `expected_id`.
     ///
@@ -150,11 +151,11 @@ impl ObjectStream {
     /// Parse one declared member, rejecting the object stream if decompression
     /// exceeds `max_decompressed_size`. `None` means no decompression limit.
     ///
-    /// Unlike [`ObjectStream::new_with_limit`], malformed header counts,
-    /// invalid offsets, xref index/id disagreement and truncated selected
-    /// objects are errors. Repeated ids remain accepted, matching the eager
-    /// parser's header behavior. This is the strict contract needed by an
-    /// indexed resolver.
+    /// Header count mismatches, odd trailing header tokens, repeated ids and
+    /// unrelated malformed pairs retain [`ObjectStream::new_with_limit`]'s
+    /// advisory/filtering behavior. The requested complete pair must exist,
+    /// name `expected_id` and point to a parseable object. Parsing starts at its
+    /// declared offset and uses the eager parser's prefix policy.
     pub fn parse_selected_member_with_limit(
         stream: &Stream, expected_id: ObjectId, member_index: u32, max_decompressed_size: Option<usize>,
     ) -> Result<Object> {
@@ -164,41 +165,20 @@ impl ObjectStream {
             ));
         }
 
-        let first = stream
-            .dict
-            .get(b"First")
-            .and_then(Object::as_i64)?
-            .try_into()
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        let n: usize = stream
-            .dict
-            .get(b"N")
-            .and_then(Object::as_i64)?
-            .try_into()
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        if n > MAX_SELECTED_OBJECT_STREAM_MEMBERS {
-            return Err(Error::InvalidObjectStream(format!(
-                "declared member count {n} exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
-            )));
-        }
-        let member_index: usize = member_index
-            .try_into()
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-
-        if member_index >= n {
-            return Err(Error::InvalidObjectStream(format!(
-                "member index {member_index} is outside declared count {n}"
-            )));
-        }
-
         // Decode into call-local storage. This leaves the caller's compressed
         // stream unchanged and drops the full object-stream container before
         // returning the selected object.
         let decoded = if stream.is_compressed() {
-            Cow::Owned(match max_decompressed_size {
-                Some(max) => stream.decompressed_content_with_limit(max)?,
-                None => stream.decompressed_content()?,
-            })
+            match max_decompressed_size {
+                Some(max) => Cow::Owned(stream.decompressed_content_with_limit(max)?),
+                // The eager unbounded constructor deliberately ignores a
+                // decompression error and continues against the original
+                // bytes. Preserve that outcome without mutating the caller.
+                None => match stream.decompressed_content() {
+                    Ok(decoded) => Cow::Owned(decoded),
+                    Err(_) => Cow::Borrowed(stream.content.as_slice()),
+                },
+            }
         } else {
             if let Some(max) = max_decompressed_size
                 && stream.content.len() > max
@@ -208,48 +188,65 @@ impl ObjectStream {
             Cow::Borrowed(stream.content.as_slice())
         };
 
+        if decoded.is_empty() {
+            return Err(Error::InvalidObjectStream(
+                "selected object stream member is not present".to_string(),
+            ));
+        }
+
+        let first = stream
+            .dict
+            .get(b"First")
+            .and_then(Object::as_i64)?
+            .try_into()
+            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+
         let index_block = decoded.get(..first).ok_or(Error::InvalidOffset(first))?;
         let index_text = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
-        let mut numbers = index_text.split_whitespace();
-        let mut previous_offset = None;
-        let mut selected = None;
-        let mut selected_end = None;
-
-        for index in 0..n {
-            let id = parse_object_stream_number(numbers.next(), "object id", index)?;
-            let relative_offset: usize = parse_object_stream_number(numbers.next(), "member offset", index)?
-                .try_into()
-                .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-
-            if previous_offset.is_some_and(|previous| relative_offset <= previous) {
-                return Err(Error::InvalidObjectStream(
-                    "object stream member offsets are not strictly increasing".to_string(),
-                ));
-            }
-
-            let absolute_offset = first
-                .checked_add(relative_offset)
-                .ok_or_else(|| Error::InvalidObjectStream("object stream member offset overflow".to_string()))?;
-            if absolute_offset >= decoded.len() {
-                return Err(Error::InvalidOffset(absolute_offset));
-            }
-
-            if index == member_index {
-                selected = Some((id, absolute_offset));
-            } else if index == member_index + 1 {
-                selected_end = Some(absolute_offset);
-            }
-            previous_offset = Some(relative_offset);
-        }
-
-        if numbers.next().is_some() {
+        let token_limit = MAX_SELECTED_OBJECT_STREAM_MEMBERS
+            .checked_add(1)
+            .and_then(|pairs| pairs.checked_mul(2))
+            .ok_or_else(|| Error::InvalidObjectStream("selected-parser member limit overflow".to_string()))?;
+        let number_count = index_text.split_whitespace().take(token_limit).count();
+        if number_count == token_limit {
             return Err(Error::InvalidObjectStream(format!(
-                "object stream header has more than the declared {n} members"
+                "parsed member count exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
             )));
         }
+        let pair_count = number_count / 2;
 
-        let (declared_id, start) = selected
-            .ok_or_else(|| Error::InvalidObjectStream("selected object stream member was not declared".to_string()))?;
+        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
+        let member_limit = i64::try_from(MAX_SELECTED_OBJECT_STREAM_MEMBERS)
+            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+        if n > member_limit {
+            return Err(Error::InvalidObjectStream(format!(
+                "declared member count {n} exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
+            )));
+        }
+        if number_count.try_into().ok() != n.checked_mul(2) {
+            warn!("object stream: the object stream dictionary specifies a wrong number of objects")
+        }
+
+        let member_index: usize = member_index
+            .try_into()
+            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+        if member_index >= pair_count {
+            return Err(Error::InvalidObjectStream(format!(
+                "member index {member_index} is outside the {pair_count} complete header pairs"
+            )));
+        }
+        let token_index = member_index
+            .checked_mul(2)
+            .ok_or_else(|| Error::InvalidObjectStream("object stream member index overflow".to_string()))?;
+        let mut numbers = index_text.split_whitespace();
+        let declared_id = numbers
+            .nth(token_index)
+            .and_then(|number| u32::from_str(number).ok())
+            .ok_or_else(|| Error::InvalidObjectStream("selected object id is invalid".to_string()))?;
+        let relative_offset = numbers
+            .next()
+            .and_then(|number| u32::from_str(number).ok())
+            .ok_or_else(|| Error::InvalidObjectStream("selected object offset is invalid".to_string()))?;
         if declared_id != expected_id.0 {
             return Err(Error::InvalidObjectStream(format!(
                 "member index {member_index} declares object {declared_id}, not {}",
@@ -257,23 +254,24 @@ impl ObjectStream {
             )));
         }
 
-        let end = selected_end.unwrap_or(decoded.len());
-        let member = &decoded[start..end];
-        let member = member
+        let relative_offset: usize = relative_offset
+            .try_into()
+            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+        let start = first
+            .checked_add(relative_offset)
+            .ok_or_else(|| Error::InvalidObjectStream("object stream member offset overflow".to_string()))?;
+        if start >= decoded.len() {
+            return Err(Error::InvalidOffset(start));
+        }
+        let start = decoded[start..]
             .iter()
             .position(|byte| !byte.is_ascii_whitespace())
-            .map(|leading| &member[leading..])
+            .and_then(|leading| start.checked_add(leading))
             .ok_or_else(|| Error::InvalidObjectStream("selected object stream member is empty".to_string()))?;
 
-        let (remainder, object) = parser::direct_object_with_remainder(member).ok_or_else(|| {
+        parser::direct_object(&decoded[start..]).ok_or_else(|| {
             Error::InvalidObjectStream("selected object stream member is truncated or invalid".to_string())
-        })?;
-        if !is_pdf_whitespace_or_comments(remainder) {
-            return Err(Error::InvalidObjectStream(
-                "selected object stream member has trailing non-whitespace data".to_string(),
-            ));
-        }
-        Ok(object)
+        })
     }
 
     /// Create a builder for constructing new object streams
@@ -471,34 +469,6 @@ impl ObjectStream {
     }
 }
 
-fn parse_object_stream_number(value: Option<&str>, kind: &str, index: usize) -> Result<u32> {
-    let value = value.ok_or_else(|| {
-        Error::InvalidObjectStream(format!("object stream header ended before {kind} for member {index}"))
-    })?;
-    value
-        .parse()
-        .map_err(|_| Error::InvalidObjectStream(format!("invalid {kind} for object stream member {index}")))
-}
-
-fn is_pdf_whitespace_or_comments(mut input: &[u8]) -> bool {
-    while let Some((&byte, remainder)) = input.split_first() {
-        if b" \t\n\r\0\x0C".contains(&byte) {
-            input = remainder;
-        } else if byte == b'%' {
-            input = remainder;
-            while let Some((&comment_byte, remainder)) = input.split_first() {
-                input = remainder;
-                if matches!(comment_byte, b'\r' | b'\n') {
-                    break;
-                }
-            }
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
 impl ObjectStreamBuilder {
     /// Set the maximum number of objects per stream
     pub fn max_objects(mut self, max: usize) -> Self {
@@ -568,6 +538,35 @@ mod selected_member_tests {
         }
     }
 
+    #[derive(Debug, PartialEq)]
+    enum MemberFingerprint {
+        Value(Object),
+        Error,
+    }
+
+    fn eager_fingerprint(mut stream: Stream, id: ObjectId) -> MemberFingerprint {
+        match ObjectStream::new(&mut stream) {
+            Ok(parsed) => parsed
+                .objects
+                .get(&id)
+                .cloned()
+                .map(MemberFingerprint::Value)
+                .unwrap_or(MemberFingerprint::Error),
+            Err(_) => MemberFingerprint::Error,
+        }
+    }
+
+    fn selected_fingerprint(stream: &Stream, id: ObjectId, index: u32) -> MemberFingerprint {
+        ObjectStream::parse_selected_member(stream, id, index)
+            .map(MemberFingerprint::Value)
+            .unwrap_or(MemberFingerprint::Error)
+    }
+
+    fn assert_eager_selected_fingerprint(stream: Stream, id: ObjectId, index: u32, expected: MemberFingerprint) {
+        assert_eq!(eager_fingerprint(stream.clone(), id), expected);
+        assert_eq!(selected_fingerprint(&stream, id, index), expected);
+    }
+
     #[test]
     fn selected_members_match_the_existing_eager_parser() {
         let members: &[(u32, &[u8])] = &[
@@ -618,20 +617,40 @@ mod selected_member_tests {
     }
 
     #[test]
-    fn declared_count_must_match_the_complete_header() {
-        let too_large = raw_stream(b"1 0 2 3 ", b"42 true ", 3);
-        let message = invalid_object_stream(ObjectStream::parse_selected_member(&too_large, (1, 0), 0));
-        assert!(message.contains("ended before object id for member 2"));
+    fn malformed_header_counts_and_odd_tokens_match_eager_fingerprints() {
+        let header = b"10 0 11 5 ";
+        let body = b"(ten)(eleven)";
+        assert_eager_selected_fingerprint(
+            raw_stream(header, body, 1),
+            (11, 0),
+            1,
+            MemberFingerprint::Value(Object::string_literal("eleven")),
+        );
+        assert_eager_selected_fingerprint(
+            raw_stream(header, body, 3),
+            (10, 0),
+            0,
+            MemberFingerprint::Value(Object::string_literal("ten")),
+        );
+        assert_eager_selected_fingerprint(
+            raw_stream(header, body, -1),
+            (11, 0),
+            1,
+            MemberFingerprint::Value(Object::string_literal("eleven")),
+        );
 
-        let too_small = raw_stream(b"1 0 2 3 ", b"42 true ", 1);
-        let message = invalid_object_stream(ObjectStream::parse_selected_member(&too_small, (1, 0), 0));
-        assert!(message.contains("more than the declared 1 members"));
+        let odd = raw_stream(b"10 0 dangling", b"(ten)", 1);
+        assert_eager_selected_fingerprint(
+            odd.clone(),
+            (10, 0),
+            0,
+            MemberFingerprint::Value(Object::string_literal("ten")),
+        );
+        assert_eager_selected_fingerprint(odd, (11, 0), 1, MemberFingerprint::Error);
 
-        let negative = raw_stream(b"1 0 ", b"42 ", -1);
-        assert!(matches!(
-            ObjectStream::parse_selected_member(&negative, (1, 0), 0),
-            Err(Error::NumericCast(_))
-        ));
+        let mut invalid_n = raw_stream(b"10 0 ", b"(ten)", 1);
+        invalid_n.dict.set("N", "invalid");
+        assert_eager_selected_fingerprint(invalid_n, (10, 0), 0, MemberFingerprint::Error);
     }
 
     #[test]
@@ -646,8 +665,7 @@ mod selected_member_tests {
 
         let mut cuts_header = generated_stream(&[(1, b"42")]);
         cuts_header.dict.set("First", 0i64);
-        let message = invalid_object_stream(ObjectStream::parse_selected_member(&cuts_header, (1, 0), 0));
-        assert!(message.contains("ended before object id"));
+        assert!(ObjectStream::parse_selected_member(&cuts_header, (1, 0), 0).is_err());
 
         let mut negative = generated_stream(&[(1, b"42")]);
         negative.dict.set("First", -1i64);
@@ -663,7 +681,7 @@ mod selected_member_tests {
 
         let bad_index = generated_stream(members);
         let message = invalid_object_stream(ObjectStream::parse_selected_member(&bad_index, (9, 0), 2));
-        assert!(message.contains("outside declared count"));
+        assert!(message.contains("complete header pairs"));
 
         let bad_id = generated_stream(members);
         let message = invalid_object_stream(ObjectStream::parse_selected_member(&bad_id, (9, 0), 0));
@@ -709,20 +727,60 @@ mod selected_member_tests {
     }
 
     #[test]
-    fn invalid_offsets_are_rejected() {
-        let duplicate_offset = raw_stream(b"1 0 2 0 ", b"42 true ", 2);
-        let message = invalid_object_stream(ObjectStream::parse_selected_member(&duplicate_offset, (1, 0), 0));
-        assert!(message.contains("not strictly increasing"));
+    fn malformed_offsets_and_tokens_match_eager_fingerprints() {
+        let equal = raw_stream(b"10 0 11 0 ", b"(shared)", 2);
+        for (id, index) in [((10, 0), 0), ((11, 0), 1)] {
+            assert_eager_selected_fingerprint(
+                equal.clone(),
+                id,
+                index,
+                MemberFingerprint::Value(Object::string_literal("shared")),
+            );
+        }
 
-        let out_of_bounds = raw_stream(b"1 50 ", b"42 ", 1);
-        assert!(matches!(
-            ObjectStream::parse_selected_member(&out_of_bounds, (1, 0), 0),
-            Err(Error::InvalidOffset(_))
-        ));
+        let decreasing = raw_stream(b"10 8 11 0 ", b"(eleven)(ten)", 2);
+        assert_eager_selected_fingerprint(
+            decreasing.clone(),
+            (10, 0),
+            0,
+            MemberFingerprint::Value(Object::string_literal("ten")),
+        );
+        assert_eager_selected_fingerprint(
+            decreasing,
+            (11, 0),
+            1,
+            MemberFingerprint::Value(Object::string_literal("eleven")),
+        );
+
+        let unrelated_out_of_bounds = raw_stream(b"10 0 11 99 ", b"(ten)", 2);
+        assert_eager_selected_fingerprint(
+            unrelated_out_of_bounds.clone(),
+            (10, 0),
+            0,
+            MemberFingerprint::Value(Object::string_literal("ten")),
+        );
+        assert_eager_selected_fingerprint(unrelated_out_of_bounds, (11, 0), 1, MemberFingerprint::Error);
+
+        let unrelated_invalid = raw_stream(b"10 0 invalid offset ", b"(ten)", 2);
+        assert_eager_selected_fingerprint(
+            unrelated_invalid,
+            (10, 0),
+            0,
+            MemberFingerprint::Value(Object::string_literal("ten")),
+        );
+
+        let target_invalid = raw_stream(b"10 invalid 11 0 ", b"(eleven)", 2);
+        assert_eager_selected_fingerprint(target_invalid.clone(), (10, 0), 0, MemberFingerprint::Error);
+        assert_eager_selected_fingerprint(
+            target_invalid,
+            (11, 0),
+            1,
+            MemberFingerprint::Value(Object::string_literal("eleven")),
+        );
     }
 
     #[test]
-    fn selected_member_rejects_trailing_non_whitespace_data() {
+    fn selected_member_uses_eager_prefix_parse_policy() {
         let valid_comment = generated_stream(&[(1, b"42 % trailing comment")]);
         assert_eq!(
             ObjectStream::parse_selected_member(&valid_comment, (1, 0), 0).unwrap(),
@@ -730,8 +788,24 @@ mod selected_member_tests {
         );
 
         let trailing_object = generated_stream(&[(1, b"42 true"), (2, b"false")]);
-        let message = invalid_object_stream(ObjectStream::parse_selected_member(&trailing_object, (1, 0), 0));
-        assert!(message.contains("trailing non-whitespace data"));
+        assert_eager_selected_fingerprint(
+            trailing_object,
+            (1, 0),
+            0,
+            MemberFingerprint::Value(Object::Integer(42)),
+        );
+    }
+
+    #[test]
+    fn unbounded_decompression_failure_matches_eager_raw_byte_fallback() {
+        let mut dict = Dictionary::new();
+        dict.set("Type", "ObjStm");
+        dict.set("N", 1i64);
+        dict.set("First", 4i64);
+        dict.set("Filter", "UnsupportedDecode");
+        let stream = Stream::new(dict, b"1 0 42".to_vec());
+
+        assert_eager_selected_fingerprint(stream, (1, 0), 0, MemberFingerprint::Value(Object::Integer(42)));
     }
 
     #[test]
@@ -741,8 +815,10 @@ mod selected_member_tests {
             MAX_SELECTED_OBJECT_STREAM_MEMBERS,
         ] {
             let within_limit = raw_stream(b"1 0 ", b"42 ", accepted_count as i64);
-            let message = invalid_object_stream(ObjectStream::parse_selected_member(&within_limit, (1, 0), 0));
-            assert!(message.contains("ended before object id for member 1"));
+            assert_eq!(
+                ObjectStream::parse_selected_member(&within_limit, (1, 0), 0).unwrap(),
+                Object::Integer(42)
+            );
         }
 
         let above_limit = raw_stream(
@@ -752,6 +828,11 @@ mod selected_member_tests {
         );
         let message = invalid_object_stream(ObjectStream::parse_selected_member(&above_limit, (1, 0), 0));
         assert!(message.contains("exceeds selected-parser limit"));
+
+        let oversized_header = "1 0 ".repeat(MAX_SELECTED_OBJECT_STREAM_MEMBERS + 1);
+        let actual_above_limit = raw_stream(oversized_header.as_bytes(), b"42 ", 1);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&actual_above_limit, (1, 0), 0));
+        assert!(message.contains("parsed member count"));
     }
 
     #[test]
