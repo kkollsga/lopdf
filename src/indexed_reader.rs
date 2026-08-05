@@ -1,5 +1,7 @@
 //! Bounded structural bootstrap for the staged indexed reader.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -26,6 +28,11 @@ const DEFAULT_ENDSTREAM_TAIL_LIMIT: u64 = 64;
 const DEFAULT_LENGTH_DEPTH_LIMIT: usize = 64;
 
 type IndexResult<T> = std::result::Result<T, IndexError>;
+
+#[cfg(test)]
+thread_local! {
+    static OBJECT_BODY_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum IndexError {
@@ -212,44 +219,60 @@ impl IndexedReader {
         let maximum = remaining.min(self.limits.max_object_bytes);
         let initial_length = maximum.min(INITIAL_OBJECT_WINDOW);
         let mut window = self.source.read_range(body_offset, initial_length, initial_length)?;
+        let mut dictionary_framer = DirectObjectFramer::for_dictionary(&window);
         loop {
-            match parse_object_body(&window, id, body_offset) {
-                Ok(parsed) => return self.finish_object(id, body_offset, source_len, parsed, state),
-                Err(IndexError::IncompleteObject { .. })
-                    if u64::try_from(window.len()).unwrap_or(u64::MAX) < maximum =>
-                {
-                    let current = u64::try_from(window.len()).map_err(|_| IndexError::ObjectLimitExceeded {
-                        id,
-                        limit: self.limits.max_object_bytes,
-                    })?;
-                    // Extend the retained prefix instead of rereading it. A
-                    // fixed upper growth step caps speculative stream-payload
-                    // reads while still doubling small object probes.
-                    let target = current
-                        .saturating_mul(2)
-                        .min(current.saturating_add(OBJECT_GROWTH_CHUNK))
-                        .min(maximum);
-                    let extension_length = target - current;
-                    let extension_offset =
-                        body_offset
-                            .checked_add(current)
-                            .ok_or(IndexError::InvalidIndirectObject {
-                                id,
-                                offset: body_offset,
-                            })?;
-                    let extension = self
-                        .source
-                        .read_range(extension_offset, extension_length, extension_length)?;
-                    window.extend_from_slice(&extension);
-                }
-                Err(IndexError::IncompleteObject { .. }) if remaining > self.limits.max_object_bytes => {
-                    return Err(IndexError::ObjectLimitExceeded {
-                        id,
-                        limit: self.limits.max_object_bytes,
-                    });
-                }
-                Err(error) => return Err(error),
+            let frame_status = dictionary_framer
+                .as_mut()
+                .map_or(FrameStatus::Ready, |framer| framer.advance(&window));
+            if frame_status == FrameStatus::Invalid {
+                return Err(IndexError::InvalidIndirectObject {
+                    id,
+                    offset: body_offset,
+                });
             }
+            if frame_status == FrameStatus::Ready {
+                match parse_object_body(&window, id, body_offset) {
+                    Ok(parsed) => return self.finish_object(id, body_offset, source_len, parsed, state),
+                    Err(IndexError::IncompleteObject { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let current = u64::try_from(window.len()).map_err(|_| IndexError::ObjectLimitExceeded {
+                id,
+                limit: self.limits.max_object_bytes,
+            })?;
+            if current >= maximum {
+                return if remaining > self.limits.max_object_bytes {
+                    Err(IndexError::ObjectLimitExceeded {
+                        id,
+                        limit: self.limits.max_object_bytes,
+                    })
+                } else {
+                    Err(IndexError::IncompleteObject {
+                        id,
+                        offset: body_offset,
+                    })
+                };
+            }
+            // Extend the retained prefix instead of rereading it. A fixed
+            // upper growth step caps speculative stream-payload reads while
+            // still doubling small object probes.
+            let target = current
+                .saturating_mul(2)
+                .min(current.saturating_add(OBJECT_GROWTH_CHUNK))
+                .min(maximum);
+            let extension_length = target - current;
+            let extension_offset = body_offset
+                .checked_add(current)
+                .ok_or(IndexError::InvalidIndirectObject {
+                    id,
+                    offset: body_offset,
+                })?;
+            let extension = self
+                .source
+                .read_range(extension_offset, extension_length, extension_length)?;
+            window.extend_from_slice(&extension);
         }
     }
 
@@ -1103,7 +1126,241 @@ fn parse_indirect_header(input: &[u8]) -> Option<(crate::ObjectId, usize)> {
     Some(((number, generation), original_len - cursor.remaining().len()))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameStatus {
+    NeedMore,
+    Ready,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameLex {
+    Normal,
+    Comment,
+    Name,
+    Bare,
+    Literal { depth: usize, escaped: bool },
+    Hex,
+    AfterDictionary,
+    AfterComment,
+    StreamToken { matched: usize },
+    StreamEol,
+}
+
+/// Incrementally frames a dictionary direct object and its possible `stream`
+/// header. It consumes only bytes appended since the previous call, leaving
+/// semantic object construction to the existing parser once framing is ready.
+struct DirectObjectFramer {
+    position: usize,
+    containers: Vec<u8>,
+    lex: FrameLex,
+    status: FrameStatus,
+    scanned_bytes: usize,
+}
+
+impl DirectObjectFramer {
+    fn for_dictionary(input: &[u8]) -> Option<Self> {
+        input.starts_with(b"<<").then(|| Self {
+            position: 2,
+            containers: vec![b'<'],
+            lex: FrameLex::Normal,
+            status: FrameStatus::NeedMore,
+            scanned_bytes: 2,
+        })
+    }
+
+    fn advance(&mut self, input: &[u8]) -> FrameStatus {
+        while self.status == FrameStatus::NeedMore && self.position < input.len() {
+            let before = self.position;
+            match self.lex {
+                FrameLex::Normal => self.advance_normal(input),
+                FrameLex::Comment => self.advance_comment(input, FrameLex::Normal),
+                FrameLex::Name | FrameLex::Bare => self.advance_regular(input),
+                FrameLex::Literal { depth, escaped } => self.advance_literal(input, depth, escaped),
+                FrameLex::Hex => self.advance_hex(input),
+                FrameLex::AfterDictionary => self.advance_after_dictionary(input),
+                FrameLex::AfterComment => self.advance_comment(input, FrameLex::AfterDictionary),
+                FrameLex::StreamToken { matched } => self.advance_stream_token(input, matched),
+                FrameLex::StreamEol => self.advance_stream_eol(input),
+            }
+            self.scanned_bytes = self.scanned_bytes.saturating_add(self.position.saturating_sub(before));
+            if self.position == before && self.status == FrameStatus::NeedMore {
+                break;
+            }
+        }
+        self.status
+    }
+
+    fn advance_normal(&mut self, input: &[u8]) {
+        let byte = input[self.position];
+        match byte {
+            b'%' => {
+                self.position += 1;
+                self.lex = FrameLex::Comment;
+            }
+            b'(' => {
+                self.position += 1;
+                self.lex = FrameLex::Literal {
+                    depth: 1,
+                    escaped: false,
+                };
+            }
+            b'/' => {
+                self.position += 1;
+                self.lex = FrameLex::Name;
+            }
+            b'<' => {
+                let Some(next) = input.get(self.position + 1) else {
+                    return;
+                };
+                if *next == b'<' {
+                    self.position += 2;
+                    if self.containers.len() >= crate::reader::MAX_NESTING_DEPTH {
+                        self.status = FrameStatus::Invalid;
+                    } else {
+                        self.containers.push(b'<');
+                    }
+                } else {
+                    self.position += 1;
+                    self.lex = FrameLex::Hex;
+                }
+            }
+            b'>' => {
+                let Some(next) = input.get(self.position + 1) else {
+                    return;
+                };
+                if *next != b'>' || self.containers.pop() != Some(b'<') {
+                    self.status = FrameStatus::Invalid;
+                    return;
+                }
+                self.position += 2;
+                if self.containers.is_empty() {
+                    self.lex = FrameLex::AfterDictionary;
+                }
+            }
+            b'[' => {
+                self.position += 1;
+                if self.containers.len() >= crate::reader::MAX_NESTING_DEPTH {
+                    self.status = FrameStatus::Invalid;
+                } else {
+                    self.containers.push(b'[');
+                }
+            }
+            b']' => {
+                self.position += 1;
+                if self.containers.pop() != Some(b'[') || self.containers.is_empty() {
+                    self.status = FrameStatus::Invalid;
+                }
+            }
+            b'@' => self.status = FrameStatus::Invalid,
+            byte if is_pdf_whitespace(byte) => self.position += 1,
+            _ => {
+                self.position += 1;
+                self.lex = FrameLex::Bare;
+            }
+        }
+    }
+
+    fn advance_comment(&mut self, input: &[u8], next: FrameLex) {
+        let byte = input[self.position];
+        self.position += 1;
+        if matches!(byte, b'\r' | b'\n') {
+            self.lex = next;
+        }
+    }
+
+    fn advance_regular(&mut self, input: &[u8]) {
+        let byte = input[self.position];
+        if is_pdf_whitespace(byte) || is_pdf_delimiter(byte) {
+            self.lex = FrameLex::Normal;
+            self.advance_normal(input);
+        } else {
+            self.position += 1;
+        }
+    }
+
+    fn advance_literal(&mut self, input: &[u8], mut depth: usize, escaped: bool) {
+        let byte = input[self.position];
+        self.position += 1;
+        if escaped {
+            self.lex = FrameLex::Literal { depth, escaped: false };
+            return;
+        }
+        match byte {
+            b'\\' => {
+                self.lex = FrameLex::Literal { depth, escaped: true };
+            }
+            b'(' => {
+                depth += 1;
+                self.lex = FrameLex::Literal { depth, escaped: false };
+            }
+            b')' if depth == 1 => self.lex = FrameLex::Normal,
+            b')' => {
+                depth -= 1;
+                self.lex = FrameLex::Literal { depth, escaped: false };
+            }
+            _ => {}
+        }
+    }
+
+    fn advance_hex(&mut self, input: &[u8]) {
+        let byte = input[self.position];
+        self.position += 1;
+        if byte == b'>' {
+            self.lex = FrameLex::Normal;
+        }
+    }
+
+    fn advance_after_dictionary(&mut self, input: &[u8]) {
+        match input[self.position] {
+            b'%' => {
+                self.position += 1;
+                self.lex = FrameLex::AfterComment;
+            }
+            byte if is_pdf_whitespace(byte) => self.position += 1,
+            b's' => {
+                self.position += 1;
+                self.lex = FrameLex::StreamToken { matched: 1 };
+            }
+            _ => self.status = FrameStatus::Ready,
+        }
+    }
+
+    fn advance_stream_token(&mut self, input: &[u8], matched: usize) {
+        const STREAM: &[u8] = b"stream";
+        let byte = input[self.position];
+        if matched < STREAM.len() {
+            if byte != STREAM[matched] {
+                self.status = FrameStatus::Ready;
+            } else {
+                self.position += 1;
+                self.lex = FrameLex::StreamToken { matched: matched + 1 };
+            }
+            return;
+        }
+        if !is_token_boundary(Some(byte)) {
+            self.status = FrameStatus::Ready;
+        } else {
+            self.lex = FrameLex::StreamEol;
+            self.advance_stream_eol(input);
+        }
+    }
+
+    fn advance_stream_eol(&mut self, input: &[u8]) {
+        match input[self.position] {
+            b' ' | b'\t' => self.position += 1,
+            b'\r' | b'\n' => {
+                self.position += 1;
+                self.status = FrameStatus::Ready;
+            }
+            _ => self.status = FrameStatus::Ready,
+        }
+    }
+}
+
 fn parse_object_body(input: &[u8], id: crate::ObjectId, offset: u64) -> IndexResult<ParsedObject> {
+    #[cfg(test)]
+    OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let Some((consumed, object)) = crate::parser::direct_object_with_consumed(input) else {
         return if direct_object_may_be_truncated(input) {
             Err(IndexError::IncompleteObject { id, offset })
@@ -2163,6 +2420,7 @@ mod tests {
         });
         let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
+        OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
 
         let stream = reader.resolve((1, 0)).unwrap();
         assert_eq!(
@@ -2195,6 +2453,7 @@ mod tests {
                 .count(),
             1
         );
+        OBJECT_BODY_PARSE_CALLS.with(|calls| assert_eq!(calls.get(), 1));
     }
 
     #[test]
@@ -2293,6 +2552,7 @@ mod tests {
         let mut object_prefix = b"1 0 obj\n<< /Pad (".to_vec();
         object_prefix.resize(object_prefix.len() + 2 * 1_024 * 1_024 + 1, b'x');
         object_prefix.extend_from_slice(format!(") /Length {stream_length} >>\nstream\n").as_bytes());
+        let framed_body = object_prefix[b"1 0 obj\n".len()..].to_vec();
         let stream_start = object_offset + u64::try_from(object_prefix.len()).unwrap();
         let stream_end = stream_start + stream_length;
         let xref = len - 512;
@@ -2312,6 +2572,7 @@ mod tests {
         });
         let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
+        OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
 
         let stream = reader.resolve((1, 0)).unwrap();
         assert_eq!(
@@ -2337,6 +2598,14 @@ mod tests {
                 .count(),
             1
         );
+        OBJECT_BODY_PARSE_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+
+        let mut framer = DirectObjectFramer::for_dictionary(&framed_body[..2]).unwrap();
+        for end in (2..framed_body.len()).step_by(usize::try_from(OBJECT_GROWTH_CHUNK).unwrap()) {
+            let _ = framer.advance(&framed_body[..end]);
+        }
+        assert_eq!(framer.advance(&framed_body), FrameStatus::Ready);
+        assert!(framer.scanned_bytes <= framed_body.len());
     }
 
     #[test]
@@ -2513,6 +2782,38 @@ mod tests {
         assert!(!dictionary_may_be_truncated(
             b"<< /Text (a >> nested \\) value) /Hex <3e3e> >>"
         ));
+    }
+
+    #[test]
+    fn dictionary_framer_matches_parser_at_every_split_point() {
+        let valid = [
+            b"<< /Value 1 >>\nendobj".as_slice(),
+            b"<< /Nested << /Array [1 (two \\) >>) <3e3e>] >> /Name /has@sign >>\nendobj".as_slice(),
+            b"<< /Length 5 >> % comment\nstream\nhello".as_slice(),
+        ];
+        for sample in valid {
+            assert!(parse_object_body(sample, (1, 0), 0).is_ok());
+            for split in 2..sample.len() {
+                let mut framer = DirectObjectFramer::for_dictionary(&sample[..2]).unwrap();
+                let first = framer.advance(&sample[..split]);
+                if first != FrameStatus::Ready {
+                    assert_eq!(framer.advance(sample), FrameStatus::Ready, "split {split}: {sample:?}");
+                }
+                assert!(framer.scanned_bytes <= sample.len());
+            }
+        }
+
+        let invalid = b"<< /Broken @";
+        assert!(matches!(
+            parse_object_body(invalid, (1, 0), 0),
+            Err(IndexError::InvalidIndirectObject { .. })
+        ));
+        for split in 2..=invalid.len() {
+            let mut framer = DirectObjectFramer::for_dictionary(&invalid[..2]).unwrap();
+            let _ = framer.advance(&invalid[..split]);
+            assert_eq!(framer.advance(invalid), FrameStatus::Invalid);
+            assert!(framer.scanned_bytes <= invalid.len());
+        }
     }
 
     fn corrupt_marker(mut pdf: Vec<u8>, marker: &[u8]) -> Vec<u8> {
