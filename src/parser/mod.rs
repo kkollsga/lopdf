@@ -406,6 +406,12 @@ pub fn direct_object(input: ParserInput) -> Option<Object> {
     strip_nom(_direct_object(crate::reader::MAX_NESTING_DEPTH)(input))
 }
 
+pub(crate) fn direct_object_with_consumed(input: ParserInput) -> Option<(usize, Object)> {
+    _direct_object(crate::reader::MAX_NESTING_DEPTH)(input)
+        .ok()
+        .map(|(remaining, object)| (input.len() - remaining.len(), object))
+}
+
 fn object<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>) -> NomResult<'a, Object> {
     terminated(
         alt((

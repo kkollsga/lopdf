@@ -13,6 +13,8 @@ pub mod xref;
 mod object;
 mod document;
 mod incremental_document;
+#[cfg_attr(not(test), allow(dead_code))]
+mod indexed_reader;
 
 mod bookmarks;
 mod cmap_section;
