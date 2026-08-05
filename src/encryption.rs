@@ -223,6 +223,41 @@ pub struct EncryptionState {
     pub(crate) encrypt_object_id: Option<ObjectId>,
 }
 
+/// Build the crypt-filter map from an immutable `/Encrypt` dictionary.
+///
+/// Unknown and malformed filter entries are ignored, matching
+/// [`Document::get_crypt_filters`].
+pub fn crypt_filters_from_dictionary(encrypted: &Dictionary) -> BTreeMap<Vec<u8>, Arc<dyn CryptFilter>> {
+    let mut crypt_filters = BTreeMap::new();
+
+    let Ok(filters) = encrypted.get(b"CF").and_then(Object::as_dict) else {
+        return crypt_filters;
+    };
+
+    for (name, filter) in filters {
+        let Ok(filter) = filter.as_dict() else {
+            continue;
+        };
+
+        if filter.get(b"Type").is_ok() && !filter.has_type(b"CryptFilter") {
+            continue;
+        }
+
+        let cfm = filter.get(b"CFM").and_then(Object::as_name).ok();
+        let crypt_filter: Arc<dyn CryptFilter> = match cfm {
+            Some(b"V2") => Arc::new(Rc4CryptFilter),
+            Some(b"AESV2") => Arc::new(Aes128CryptFilter),
+            Some(b"AESV3") => Arc::new(Aes256CryptFilter),
+            Some(b"Identity") | None => Arc::new(IdentityCryptFilter),
+            _ => continue,
+        };
+
+        crypt_filters.insert(name.to_vec(), crypt_filter);
+    }
+
+    crypt_filters
+}
+
 impl TryFrom<EncryptionVersion<'_>> for EncryptionState {
     type Error = Error;
 
@@ -251,9 +286,10 @@ impl TryFrom<EncryptionVersion<'_>> for EncryptionState {
                 algorithm.owner_value =
                     algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
 
-                algorithm.user_value = algorithm.compute_hashed_user_password_r2(document, &user_password)?;
+                let file_id = algorithms::document_file_id(document)?;
+                algorithm.user_value = algorithm.compute_hashed_user_password_r2(file_id, &user_password)?;
 
-                let file_encryption_key = algorithm.compute_file_encryption_key_r4(document, &user_password)?;
+                let file_encryption_key = algorithm.compute_file_encryption_key_r4(file_id, &user_password)?;
 
                 Ok(Self {
                     version: algorithm.version,
@@ -291,9 +327,10 @@ impl TryFrom<EncryptionVersion<'_>> for EncryptionState {
                 algorithm.owner_value =
                     algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
 
-                algorithm.user_value = algorithm.compute_hashed_user_password_r3_r4(document, &user_password)?;
+                let file_id = algorithms::document_file_id(document)?;
+                algorithm.user_value = algorithm.compute_hashed_user_password_r3_r4(file_id, &user_password)?;
 
-                let file_encryption_key = algorithm.compute_file_encryption_key_r4(document, &user_password)?;
+                let file_encryption_key = algorithm.compute_file_encryption_key_r4(file_id, &user_password)?;
 
                 Ok(Self {
                     version: algorithm.version,
@@ -334,9 +371,10 @@ impl TryFrom<EncryptionVersion<'_>> for EncryptionState {
                 algorithm.owner_value =
                     algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
 
-                algorithm.user_value = algorithm.compute_hashed_user_password_r3_r4(document, &user_password)?;
+                let file_id = algorithms::document_file_id(document)?;
+                algorithm.user_value = algorithm.compute_hashed_user_password_r3_r4(file_id, &user_password)?;
 
-                let file_encryption_key = algorithm.compute_file_encryption_key_r4(document, &user_password)?;
+                let file_encryption_key = algorithm.compute_file_encryption_key_r4(file_id, &user_password)?;
 
                 Ok(Self {
                     version: algorithm.version,
@@ -549,13 +587,41 @@ impl EncryptionState {
             return Err(Error::NotEncrypted);
         }
 
+        let encrypted = document
+            .get_encrypted()
+            .map_err(|_| DecryptionError::MissingEncryptDictionary)?;
+        Self::validate_security_handler(encrypted)?;
+        let algorithm = PasswordAlgorithm::try_from(encrypted)?;
+        let file_id = match algorithm.revision {
+            2..=4 => Some(algorithms::document_file_id(document)?),
+            _ => None,
+        };
+
+        Self::decode_with_algorithm(encrypted, algorithm, file_id, password)
+    }
+
+    /// Decode encryption state from immutable bootstrap parts without requiring
+    /// a fully materialized [`Document`].
+    ///
+    /// `file_id` is the first string in the trailer's `/ID` array. It is required
+    /// for revisions 2 through 4 and ignored for revisions 5 and 6. Crypt filters
+    /// and the default stream/string filter names are read from `encrypted`.
+    pub fn decode_from_dictionary<P>(encrypted: &Dictionary, file_id: Option<&[u8]>, password: P) -> Result<Self, Error>
+    where
+        P: AsRef<[u8]>,
+    {
+        Self::validate_security_handler(encrypted)?;
+        let algorithm = PasswordAlgorithm::try_from(encrypted)?;
+        Self::decode_with_algorithm(encrypted, algorithm, file_id, password)
+    }
+
+    fn validate_security_handler(encrypted: &Dictionary) -> Result<(), Error> {
         // The name of the preferred security handler for this document. It shall be the name of
         // the security handler that was used to encrypt the document.
         //
         // Standard shall be the name of the built-in password-based security handler.
-        let filter = document
-            .get_encrypted()
-            .and_then(|dict| dict.get(b"Filter"))
+        let filter = encrypted
+            .get(b"Filter")
             .and_then(|object| object.as_name())
             .map_err(|_| Error::DictKey("Filter".to_string()))?;
 
@@ -563,10 +629,18 @@ impl EncryptionState {
             return Err(Error::UnsupportedSecurityHandler(filter.to_vec()));
         }
 
-        let algorithm = PasswordAlgorithm::try_from(document)?;
-        let file_encryption_key = algorithm.compute_file_encryption_key(document, password)?;
+        Ok(())
+    }
 
-        let mut crypt_filters = document.get_crypt_filters();
+    fn decode_with_algorithm<P>(
+        encrypted: &Dictionary, algorithm: PasswordAlgorithm, file_id: Option<&[u8]>, password: P,
+    ) -> Result<Self, Error>
+    where
+        P: AsRef<[u8]>,
+    {
+        let file_encryption_key = algorithm.compute_file_encryption_key_with_file_id(file_id, password)?;
+
+        let mut crypt_filters = crypt_filters_from_dictionary(encrypted);
 
         // CF is meaningful only when the value of V is 4 (PDF 1.5) or 5 (PDF 2.0).
         if algorithm.version < 4 {
@@ -591,19 +665,11 @@ impl EncryptionState {
 
         // StmF and StrF are meaningful only when the value of V is 4 (PDF 1.5) or 5 (PDF 2.0).
         if algorithm.version == 4 || algorithm.version == 5 {
-            if let Ok(stream_filter) = document
-                .get_encrypted()
-                .and_then(|dict| dict.get(b"StmF"))
-                .and_then(|object| object.as_name())
-            {
+            if let Ok(stream_filter) = encrypted.get(b"StmF").and_then(|object| object.as_name()) {
                 state.stream_filter = stream_filter.to_vec();
             }
 
-            if let Ok(string_filter) = document
-                .get_encrypted()
-                .and_then(|dict| dict.get(b"StrF"))
-                .and_then(|object| object.as_name())
-            {
+            if let Ok(string_filter) = encrypted.get(b"StrF").and_then(|object| object.as_name()) {
                 state.string_filter = string_filter.to_vec();
             }
         }
@@ -866,11 +932,70 @@ pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Objec
 mod tests {
     use super::rc4::Rc4;
     use crate::creator::tests::create_document;
-    use crate::encryption::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
+    use crate::encryption::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter, PasswordAlgorithm};
     use crate::{EncryptionState, EncryptionVersion, Permissions};
     use rand::RngExt as _;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    fn assert_dictionary_parts_match(document: &crate::Document, expected: &EncryptionState) {
+        let encrypted = document.get_encrypted().unwrap();
+        let file_id = if expected.revision() <= 4 {
+            Some(super::algorithms::document_file_id(document).unwrap())
+        } else {
+            None
+        };
+
+        let decoded = EncryptionState::decode_from_dictionary(encrypted, file_id, b"user").unwrap();
+        assert_eq!(decoded.version(), expected.version());
+        assert_eq!(decoded.revision(), expected.revision());
+        assert_eq!(
+            decoded.key_length(),
+            if expected.revision() >= 5 {
+                Some(256)
+            } else {
+                expected.key_length()
+            }
+        );
+        assert_eq!(decoded.encrypt_metadata(), expected.encrypt_metadata());
+        assert_eq!(decoded.file_encryption_key(), expected.file_encryption_key());
+        assert_eq!(decoded.default_stream_filter(), expected.default_stream_filter());
+        assert_eq!(decoded.default_string_filter(), expected.default_string_filter());
+        assert_eq!(decoded.owner_value(), expected.owner_value());
+        assert_eq!(decoded.owner_encrypted(), expected.owner_encrypted());
+        assert_eq!(decoded.user_value(), expected.user_value());
+        assert_eq!(decoded.user_encrypted(), expected.user_encrypted());
+        assert_eq!(decoded.permissions(), expected.permissions());
+        assert_eq!(decoded.permission_encrypted(), expected.permission_encrypted());
+
+        let expected_filters: Vec<_> = expected
+            .crypt_filters()
+            .iter()
+            .map(|(name, filter)| (name.as_slice(), filter.method()))
+            .collect();
+        let decoded_filters: Vec<_> = decoded
+            .crypt_filters()
+            .iter()
+            .map(|(name, filter)| (name.as_slice(), filter.method()))
+            .collect();
+        assert_eq!(decoded_filters, expected_filters);
+
+        let algorithm = PasswordAlgorithm::try_from(encrypted).unwrap();
+        algorithm
+            .authenticate_user_password_with_file_id(file_id, b"user")
+            .unwrap();
+        algorithm
+            .authenticate_owner_password_with_file_id(file_id, b"owner")
+            .unwrap();
+        assert!(
+            algorithm
+                .authenticate_user_password_with_file_id(file_id, b"wrong")
+                .is_err()
+        );
+
+        document.authenticate_raw_user_password(b"user").unwrap();
+        document.authenticate_raw_owner_password(b"owner").unwrap();
+    }
 
     #[test]
     fn rc4_works() {
@@ -912,6 +1037,7 @@ mod tests {
         let state = EncryptionState::try_from(version).unwrap();
 
         assert!(document.encrypt(&state).is_ok());
+        assert_dictionary_parts_match(&document, &state);
         assert!(document.decrypt("user").is_ok());
     }
 
@@ -930,6 +1056,7 @@ mod tests {
         let state = EncryptionState::try_from(version).unwrap();
 
         assert!(document.encrypt(&state).is_ok());
+        assert_dictionary_parts_match(&document, &state);
         assert!(document.decrypt("user").is_ok());
     }
 
@@ -953,6 +1080,7 @@ mod tests {
         let state = EncryptionState::try_from(version).unwrap();
 
         assert!(document.encrypt(&state).is_ok());
+        assert_dictionary_parts_match(&document, &state);
         assert!(document.decrypt("user").is_ok());
     }
 
@@ -1015,6 +1143,7 @@ mod tests {
         let state = EncryptionState::try_from(version).unwrap();
 
         assert!(document.encrypt(&state).is_ok());
+        assert_dictionary_parts_match(&document, &state);
         assert!(document.decrypt("user").is_ok());
     }
 
@@ -1043,6 +1172,7 @@ mod tests {
         let state = EncryptionState::try_from(version).unwrap();
 
         assert!(document.encrypt(&state).is_ok());
+        assert_dictionary_parts_match(&document, &state);
         assert!(document.decrypt("user").is_ok());
     }
 }

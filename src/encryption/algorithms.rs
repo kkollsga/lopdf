@@ -2,7 +2,7 @@ use super::DecryptionError;
 use super::rc4::Rc4;
 use crate::encodings;
 use crate::encryption::Permissions;
-use crate::{Document, Error, Object};
+use crate::{Dictionary, Document, Error, Object};
 use aes::cipher::{BlockModeDecrypt as _, BlockModeEncrypt as _, KeyInit as _, KeyIvInit as _};
 use md5::{Digest as _, Md5};
 use rand::RngExt as _;
@@ -18,6 +18,19 @@ type AesBlock = aes::cipher::Block<aes::Aes128>;
 
 fn aes_block_mut(block: &mut [u8]) -> &mut AesBlock {
     block.try_into().expect("AES block must be 16 bytes")
+}
+
+pub(crate) fn document_file_id(document: &Document) -> Result<&[u8], DecryptionError> {
+    document
+        .trailer
+        .get(b"ID")
+        .map_err(|_| DecryptionError::MissingFileID)?
+        .as_array()
+        .map_err(|_| DecryptionError::InvalidType)?
+        .first()
+        .ok_or(DecryptionError::InvalidType)?
+        .as_str()
+        .map_err(|_| DecryptionError::InvalidType)
 }
 
 // If the password string is less than 32 bytes long, pad it by appending the required number of
@@ -45,11 +58,18 @@ impl TryFrom<&Document> for PasswordAlgorithm {
     type Error = Error;
 
     fn try_from(value: &Document) -> Result<Self, Self::Error> {
-        // Get the encrypted dictionary.
         let encrypted = value
             .get_encrypted()
             .map_err(|_| DecryptionError::MissingEncryptDictionary)?;
 
+        Self::try_from(encrypted)
+    }
+}
+
+impl TryFrom<&Dictionary> for PasswordAlgorithm {
+    type Error = Error;
+
+    fn try_from(encrypted: &Dictionary) -> Result<Self, Self::Error> {
         // Get the EncryptMetadata field.
         let encrypt_metadata = encrypted
             .get(b"EncryptMetadata")
@@ -286,7 +306,7 @@ impl PasswordAlgorithm {
     ///
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_file_encryption_key_r4<P>(
-        &self, doc: &Document, password: P,
+        &self, file_id: &[u8], password: P,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         P: AsRef<[u8]>,
@@ -325,17 +345,7 @@ impl PasswordAlgorithm {
 
         // Pass the first element of the file's file identifier array (the value of the ID entry in the
         // document's trailer dictionary to the MD5 hash function.
-        let file_id_0 = doc
-            .trailer
-            .get(b"ID")
-            .map_err(|_| DecryptionError::MissingFileID)?
-            .as_array()
-            .map_err(|_| DecryptionError::InvalidType)?
-            .first()
-            .ok_or(DecryptionError::InvalidType)?
-            .as_str()
-            .map_err(|_| DecryptionError::InvalidType)?;
-        hasher.update(file_id_0);
+        hasher.update(file_id);
 
         // (Security handlers of revision 4 or greater) If document metadata is not being encrypted,
         // pass 4 bytes with the value 0xFFFFFFFF to the MD5 hash function.
@@ -696,13 +706,13 @@ impl PasswordAlgorithm {
     ///
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_hashed_user_password_r2<U>(
-        &self, doc: &Document, user_password: U,
+        &self, file_id: &[u8], user_password: U,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         U: AsRef<[u8]>,
     {
         // Create a file encryption key based on the user password string.
-        let file_encryption_key = self.compute_file_encryption_key_r4(doc, user_password)?;
+        let file_encryption_key = self.compute_file_encryption_key_r4(file_id, user_password)?;
 
         // Encrypt the 32-byte padding string using an RC4 encryption function with the file encryption
         // key from the preceding step.
@@ -718,13 +728,13 @@ impl PasswordAlgorithm {
     ///
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_hashed_user_password_r3_r4<U>(
-        &self, doc: &Document, user_password: U,
+        &self, file_id: &[u8], user_password: U,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         U: AsRef<[u8]>,
     {
         // Create a file encryption key based on the user password string.
-        let file_encryption_key = self.compute_file_encryption_key_r4(doc, user_password)?;
+        let file_encryption_key = self.compute_file_encryption_key_r4(file_id, user_password)?;
 
         // Initialize the MD5 hash function and pass the 32-byte padding string.
         let mut hasher = Md5::new();
@@ -733,17 +743,7 @@ impl PasswordAlgorithm {
 
         // Pass the first element of the file's file identifier array (the value of the ID entry in the
         // document's trailer dictionary) to the hash function and finish the hash.
-        let file_id_0 = doc
-            .trailer
-            .get(b"ID")
-            .map_err(|_| DecryptionError::MissingFileID)?
-            .as_array()
-            .map_err(|_| DecryptionError::InvalidType)?
-            .first()
-            .ok_or(DecryptionError::InvalidType)?
-            .as_str()
-            .map_err(|_| DecryptionError::InvalidType)?;
-        hasher.update(file_id_0);
+        hasher.update(file_id);
 
         let hash = hasher.finalize();
 
@@ -782,7 +782,7 @@ impl PasswordAlgorithm {
     /// This implements Algorithm 6 as described in ISO 32000-2:2020 (PDF 2.0).
     ///
     /// This algorithm is deprecated in PDF 2.0.
-    fn authenticate_user_password_r4<U>(&self, doc: &Document, user_password: U) -> Result<(), DecryptionError>
+    fn authenticate_user_password_r4<U>(&self, file_id: &[u8], user_password: U) -> Result<(), DecryptionError>
     where
         U: AsRef<[u8]>,
     {
@@ -790,8 +790,8 @@ impl PasswordAlgorithm {
         // 5 (security handlers of revision 3 or 4) using the supplied password string to compute the
         // encryption dictionary's U-entry value.
         let hashed_user_password = match self.revision {
-            2 => self.compute_hashed_user_password_r2(doc, &user_password)?,
-            3 | 4 => self.compute_hashed_user_password_r3_r4(doc, &user_password)?,
+            2 => self.compute_hashed_user_password_r2(file_id, &user_password)?,
+            3 | 4 => self.compute_hashed_user_password_r3_r4(file_id, &user_password)?,
             _ => return Err(DecryptionError::InvalidRevision),
         };
 
@@ -819,7 +819,7 @@ impl PasswordAlgorithm {
     /// This implements Algorithm 7 as described in ISO 32000-2:2020 (PDF 2.0).
     ///
     /// This algorithm is deprecated in PDF 2.0.
-    fn authenticate_owner_password_r4<O>(&self, doc: &Document, owner_password: O) -> Result<(), DecryptionError>
+    fn authenticate_owner_password_r4<O>(&self, file_id: &[u8], owner_password: O) -> Result<(), DecryptionError>
     where
         O: AsRef<[u8]>,
     {
@@ -900,7 +900,7 @@ impl PasswordAlgorithm {
         // The result of the previous step purports to be the user password. Authenticate this user
         // password using Algorithm 5. If it is correct, the password supplied is the correct owner
         // password.
-        self.authenticate_user_password_r4(doc, &result)
+        self.authenticate_user_password_r4(file_id, &result)
     }
 
     /// Compute the encryption dictionary's U-entry value (revision 6).
@@ -1177,26 +1177,73 @@ impl PasswordAlgorithm {
         }
     }
 
-    /// Compute the file encryption key used to encrypt/decrypt the document.
-    pub fn compute_file_encryption_key<P>(&self, doc: &Document, password: P) -> Result<Vec<u8>, DecryptionError>
+    /// Compute the file encryption key from the immutable encryption inputs.
+    ///
+    /// `file_id` is the first string in the trailer's `/ID` array. It is required
+    /// for revisions 2 through 4 and ignored for revisions 5 and 6.
+    pub fn compute_file_encryption_key_with_file_id<P>(
+        &self, file_id: Option<&[u8]>, password: P,
+    ) -> Result<Vec<u8>, DecryptionError>
     where
         P: AsRef<[u8]>,
     {
         match self.revision {
-            2..=4 => self.compute_file_encryption_key_r4(doc, password),
+            2..=4 => self.compute_file_encryption_key_r4(file_id.ok_or(DecryptionError::MissingFileID)?, password),
             5..=6 => self.compute_file_encryption_key_r6(password),
             _ => Err(DecryptionError::UnsupportedRevision),
         }
     }
 
-    /// Authenticate the owner password.
-    pub fn authenticate_user_password<U>(&self, doc: &Document, user_password: U) -> Result<(), DecryptionError>
+    /// Compute the file encryption key used to encrypt/decrypt the document.
+    pub fn compute_file_encryption_key<P>(&self, doc: &Document, password: P) -> Result<Vec<u8>, DecryptionError>
+    where
+        P: AsRef<[u8]>,
+    {
+        let file_id = match self.revision {
+            2..=4 => Some(document_file_id(doc)?),
+            _ => None,
+        };
+        self.compute_file_encryption_key_with_file_id(file_id, password)
+    }
+
+    /// Authenticate the user password from the immutable encryption inputs.
+    pub fn authenticate_user_password_with_file_id<U>(
+        &self, file_id: Option<&[u8]>, user_password: U,
+    ) -> Result<(), DecryptionError>
     where
         U: AsRef<[u8]>,
     {
         match self.revision {
-            2..=4 => self.authenticate_user_password_r4(doc, user_password),
+            2..=4 => self.authenticate_user_password_r4(file_id.ok_or(DecryptionError::MissingFileID)?, user_password),
             5..=6 => self.authenticate_user_password_r6(user_password),
+            _ => Err(DecryptionError::UnsupportedRevision),
+        }
+    }
+
+    /// Authenticate the user password.
+    pub fn authenticate_user_password<U>(&self, doc: &Document, user_password: U) -> Result<(), DecryptionError>
+    where
+        U: AsRef<[u8]>,
+    {
+        let file_id = match self.revision {
+            2..=4 => Some(document_file_id(doc)?),
+            _ => None,
+        };
+        self.authenticate_user_password_with_file_id(file_id, user_password)
+    }
+
+    /// Authenticate the owner password from the immutable encryption inputs.
+    pub fn authenticate_owner_password_with_file_id<O>(
+        &self, file_id: Option<&[u8]>, owner_password: O,
+    ) -> Result<(), DecryptionError>
+    where
+        O: AsRef<[u8]>,
+    {
+        match self.revision {
+            2..=4 => {
+                self.authenticate_owner_password_r4(file_id.ok_or(DecryptionError::MissingFileID)?, owner_password)
+            }
+            5..=6 => self.authenticate_owner_password_r6(owner_password),
             _ => Err(DecryptionError::UnsupportedRevision),
         }
     }
@@ -1206,16 +1253,17 @@ impl PasswordAlgorithm {
     where
         O: AsRef<[u8]>,
     {
-        match self.revision {
-            2..=4 => self.authenticate_owner_password_r4(doc, owner_password),
-            5..=6 => self.authenticate_owner_password_r6(owner_password),
-            _ => Err(DecryptionError::UnsupportedRevision),
-        }
+        let file_id = match self.revision {
+            2..=4 => Some(document_file_id(doc)?),
+            _ => None,
+        };
+        self.authenticate_owner_password_with_file_id(file_id, owner_password)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::document_file_id;
     use crate::Permissions;
     use crate::creator::tests::create_document;
     use crate::encryption::PasswordAlgorithm;
@@ -1224,6 +1272,7 @@ mod tests {
     #[test]
     fn authenticate_password_r2() {
         let document = create_document();
+        let file_id = document_file_id(&document).unwrap();
 
         let mut algorithm = PasswordAlgorithm {
             encrypt_metadata: true,
@@ -1247,30 +1296,26 @@ mod tests {
             .unwrap();
 
         algorithm.user_value = algorithm
-            .compute_hashed_user_password_r2(&document, &user_password)
+            .compute_hashed_user_password_r2(file_id, &user_password)
             .unwrap();
 
         // Assert that the correct passwords authenticate.
         assert!(
             algorithm
-                .authenticate_owner_password_r4(&document, &owner_password)
+                .authenticate_owner_password_r4(file_id, &owner_password)
                 .is_ok()
         );
-        assert!(
-            algorithm
-                .authenticate_user_password_r4(&document, &user_password)
-                .is_ok()
-        );
+        assert!(algorithm.authenticate_user_password_r4(file_id, &user_password).is_ok());
 
         // Assert that the swapped passwords do not authenticate.
         assert!(
             algorithm
-                .authenticate_owner_password_r4(&document, user_password)
+                .authenticate_owner_password_r4(file_id, user_password)
                 .is_err()
         );
         assert!(
             algorithm
-                .authenticate_user_password_r4(&document, owner_password)
+                .authenticate_user_password_r4(file_id, owner_password)
                 .is_err()
         );
     }
@@ -1278,6 +1323,7 @@ mod tests {
     #[test]
     fn authenticate_password_r3() {
         let document = create_document();
+        let file_id = document_file_id(&document).unwrap();
 
         let mut algorithm = PasswordAlgorithm {
             encrypt_metadata: true,
@@ -1301,30 +1347,26 @@ mod tests {
             .unwrap();
 
         algorithm.user_value = algorithm
-            .compute_hashed_user_password_r3_r4(&document, &user_password)
+            .compute_hashed_user_password_r3_r4(file_id, &user_password)
             .unwrap();
 
         // Assert that the correct passwords authenticate.
         assert!(
             algorithm
-                .authenticate_owner_password_r4(&document, &owner_password)
+                .authenticate_owner_password_r4(file_id, &owner_password)
                 .is_ok()
         );
-        assert!(
-            algorithm
-                .authenticate_user_password_r4(&document, &user_password)
-                .is_ok()
-        );
+        assert!(algorithm.authenticate_user_password_r4(file_id, &user_password).is_ok());
 
         // Assert that the swapped passwords do not authenticate.
         assert!(
             algorithm
-                .authenticate_owner_password_r4(&document, user_password)
+                .authenticate_owner_password_r4(file_id, user_password)
                 .is_err()
         );
         assert!(
             algorithm
-                .authenticate_user_password_r4(&document, owner_password)
+                .authenticate_user_password_r4(file_id, owner_password)
                 .is_err()
         );
     }
@@ -1332,6 +1374,7 @@ mod tests {
     #[test]
     fn authenticate_password_r4() {
         let document = create_document();
+        let file_id = document_file_id(&document).unwrap();
 
         let mut algorithm = PasswordAlgorithm {
             encrypt_metadata: true,
@@ -1355,30 +1398,26 @@ mod tests {
             .unwrap();
 
         algorithm.user_value = algorithm
-            .compute_hashed_user_password_r3_r4(&document, &user_password)
+            .compute_hashed_user_password_r3_r4(file_id, &user_password)
             .unwrap();
 
         // Assert that the correct passwords authenticate.
         assert!(
             algorithm
-                .authenticate_owner_password_r4(&document, &owner_password)
+                .authenticate_owner_password_r4(file_id, &owner_password)
                 .is_ok()
         );
-        assert!(
-            algorithm
-                .authenticate_user_password_r4(&document, &user_password)
-                .is_ok()
-        );
+        assert!(algorithm.authenticate_user_password_r4(file_id, &user_password).is_ok());
 
         // Assert that the swapped passwords do not authenticate.
         assert!(
             algorithm
-                .authenticate_owner_password_r4(&document, user_password)
+                .authenticate_owner_password_r4(file_id, user_password)
                 .is_err()
         );
         assert!(
             algorithm
-                .authenticate_user_password_r4(&document, owner_password)
+                .authenticate_user_password_r4(file_id, owner_password)
                 .is_err()
         );
     }
