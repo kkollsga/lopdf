@@ -27,6 +27,9 @@ const DEFAULT_OBJECT_LIMIT: u64 = 4 * 1_024 * 1_024;
 const DEFAULT_STREAM_LIMIT: u64 = 64 * 1_024 * 1_024;
 const DEFAULT_ENDSTREAM_TAIL_LIMIT: u64 = 64;
 const DEFAULT_LENGTH_DEPTH_LIMIT: usize = 64;
+const DEFAULT_PAGE_TREE_DEPTH_LIMIT: usize = 256;
+const DEFAULT_PAGE_COUNT_LIMIT: usize = 1_000_000;
+const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
 
 type IndexResult<T> = std::result::Result<T, IndexError>;
 
@@ -117,6 +120,8 @@ pub(crate) enum IndexError {
         #[source]
         source: crate::encryption::DecryptionError,
     },
+    #[error("page tree exceeds the {limit}-page limit")]
+    PageCountLimitExceeded { limit: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +178,152 @@ pub(crate) struct IndexedReader {
     limits: ResolverLimits,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InheritedPageAttributeOwners {
+    pub(crate) resources: Option<crate::ObjectId>,
+    pub(crate) media_box: Option<crate::ObjectId>,
+    pub(crate) crop_box: Option<crate::ObjectId>,
+    pub(crate) rotate: Option<crate::ObjectId>,
+}
+
+impl InheritedPageAttributeOwners {
+    fn updated(mut self, owner: crate::ObjectId, dictionary: &Dictionary) -> Self {
+        if dictionary.has(b"Resources") {
+            self.resources = Some(owner);
+        }
+        if dictionary.has(b"MediaBox") {
+            self.media_box = Some(owner);
+        }
+        if dictionary.has(b"CropBox") {
+            self.crop_box = Some(owner);
+        }
+        if dictionary.has(b"Rotate") {
+            self.rotate = Some(owner);
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PageMapEntry {
+    pub(crate) id: crate::ObjectId,
+    pub(crate) inherited: InheritedPageAttributeOwners,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PageMap {
+    pub(crate) pages: Vec<PageMapEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PageMapLimits {
+    max_depth: usize,
+    max_pages: usize,
+}
+
+impl Default for PageMapLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: DEFAULT_PAGE_TREE_DEPTH_LIMIT,
+            max_pages: DEFAULT_PAGE_COUNT_LIMIT,
+        }
+    }
+}
+
+struct PageMapBuilder<'a> {
+    reader: &'a IndexedReader,
+    limits: PageMapLimits,
+    active: HashSet<crate::ObjectId>,
+}
+
+impl PageMap {
+    pub(crate) fn from_reader(reader: &IndexedReader) -> IndexResult<Self> {
+        Self::from_reader_with_limits(reader, PageMapLimits::default())
+    }
+
+    fn from_reader_with_limits(reader: &IndexedReader, limits: PageMapLimits) -> IndexResult<Self> {
+        let Some(root_id) = reader
+            .index
+            .trailer
+            .get(b"Root")
+            .ok()
+            .and_then(|root| root.as_reference().ok())
+        else {
+            return Ok(Self::default());
+        };
+        let Some(catalog) = reader.resolve_dictionary_deref(root_id) else {
+            return Ok(Self::default());
+        };
+        let Some(pages_id) = catalog.get(b"Pages").ok().and_then(|pages| pages.as_reference().ok()) else {
+            return Ok(Self::default());
+        };
+
+        let mut page_map = Self::default();
+        let mut builder = PageMapBuilder {
+            reader,
+            limits,
+            active: HashSet::new(),
+        };
+        builder.walk_node(
+            &mut page_map,
+            pages_id,
+            false,
+            0,
+            InheritedPageAttributeOwners::default(),
+        )?;
+        Ok(page_map)
+    }
+}
+
+impl PageMapBuilder<'_> {
+    fn walk_node(
+        &mut self, page_map: &mut PageMap, id: crate::ObjectId, check_type: bool, depth: usize,
+        inherited: InheritedPageAttributeOwners,
+    ) -> IndexResult<()> {
+        if depth > self.limits.max_depth || !self.active.insert(id) {
+            return Ok(());
+        }
+        let result = self.walk_active_node(page_map, id, check_type, depth, inherited);
+        self.active.remove(&id);
+        result
+    }
+
+    fn walk_active_node(
+        &mut self, page_map: &mut PageMap, id: crate::ObjectId, check_type: bool, depth: usize,
+        inherited: InheritedPageAttributeOwners,
+    ) -> IndexResult<()> {
+        let Some(dictionary) = self.reader.resolve_dictionary_deref(id) else {
+            return Ok(());
+        };
+        let inherited = inherited.updated(id, &dictionary);
+        if check_type {
+            match dictionary.get_type() {
+                Ok(b"Page") => {
+                    if page_map.pages.len() >= self.limits.max_pages {
+                        return Err(IndexError::PageCountLimitExceeded {
+                            limit: self.limits.max_pages,
+                        });
+                    }
+                    page_map.pages.push(PageMapEntry { id, inherited });
+                    return Ok(());
+                }
+                Ok(b"Pages") => {}
+                _ => return Ok(()),
+            }
+        }
+
+        let Some(kids) = self.reader.resolve_array_value(dictionary.get(b"Kids").ok().cloned()) else {
+            return Ok(());
+        };
+        for kid in kids {
+            if let Ok(kid_id) = kid.as_reference() {
+                self.walk_node(page_map, kid_id, true, depth + 1, inherited)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl IndexedReader {
     pub(crate) fn open(source: Arc<dyn RandomAccessSource>, limits: ResolverLimits) -> IndexResult<Self> {
         Self::open_with_password(source, limits, None)
@@ -190,6 +341,33 @@ impl IndexedReader {
     pub(crate) fn resolve(&self, id: crate::ObjectId) -> IndexResult<Object> {
         let mut state = ResolutionState::default();
         self.resolve_inner(id, &mut state)
+    }
+
+    fn resolve_dictionary_deref(&self, id: crate::ObjectId) -> Option<Dictionary> {
+        match self.resolve_deref_value(self.resolve(id).ok()?)? {
+            Object::Dictionary(dictionary) => Some(dictionary),
+            _ => None,
+        }
+    }
+
+    fn resolve_array_value(&self, value: Option<Object>) -> Option<Vec<Object>> {
+        match self.resolve_deref_value(value?)? {
+            Object::Array(array) => Some(array),
+            _ => None,
+        }
+    }
+
+    fn resolve_deref_value(&self, mut object: Object) -> Option<Object> {
+        let mut seen = HashSet::new();
+        let mut dereferences = 0;
+        while let Object::Reference(id) = object {
+            if dereferences >= PAGE_TREE_DEREFERENCE_LIMIT || !seen.insert(id) {
+                return None;
+            }
+            object = self.resolve(id).ok()?;
+            dereferences += 1;
+        }
+        Some(object)
     }
 
     fn resolve_inner(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
@@ -2465,6 +2643,122 @@ mod tests {
         (pdf, image_plaintext, xref_content)
     }
 
+    fn generated_page_tree_pdf(page_count: u32, declared_count: i64) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let kids: Vec<_> = (0..page_count)
+            .map(|index| {
+                let id = (index + 3, 0);
+                document.objects.insert(
+                    id,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Page",
+                        "Parent" => Object::Reference((2, 0)),
+                        "Index" => i64::from(index),
+                    }),
+                );
+                Object::Reference(id)
+            })
+            .collect();
+        document.objects.insert(
+            (2, 0),
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => declared_count,
+                "Resources" => Object::Dictionary(dictionary! { "Marker" => "root" }),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            }),
+        );
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        document.max_id = page_count + 2;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    fn encrypted_page_tree_pdf() -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        document.objects.insert(
+            (2, 0),
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference((3, 0)), Object::Reference((4, 0))],
+                "Count" => 99,
+                "Rotate" => 90,
+            }),
+        );
+        for id in [3, 4] {
+            document.objects.insert(
+                (id, 0),
+                Object::Dictionary(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => Object::Reference((2, 0)),
+                    "Secret" => format!("page-{id}"),
+                }),
+            );
+        }
+        document.max_id = 4;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        let file_id = vec![0x61; 16];
+        document.trailer.set(
+            "ID",
+            Object::Array(vec![
+                Object::String(file_id.clone(), StringFormat::Literal),
+                Object::String(file_id, StringFormat::Literal),
+            ]),
+        );
+        let aes128: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+        let state = EncryptionState::try_from(EncryptionVersion::V4 {
+            document: &document,
+            encrypt_metadata: true,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes128)]),
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password: "user",
+            permissions: Permissions::PRINTABLE,
+        })
+        .unwrap();
+        document.encrypt(&state).unwrap();
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    fn generated_deep_page_tree_pdf(leaf_depth: usize) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        for depth in 0..=leaf_depth {
+            let id = u32::try_from(depth).unwrap() + 2;
+            let object = if depth == leaf_depth {
+                Object::Dictionary(dictionary! { "Type" => "Page" })
+            } else {
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![Object::Reference((id + 1, 0))],
+                    "Count" => 1,
+                })
+            };
+            document.objects.insert((id, 0), object);
+        }
+        document.max_id = u32::try_from(leaf_depth).unwrap() + 2;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
     fn open_encrypted(pdf: &[u8], password: Option<&[u8]>) -> IndexResult<IndexedReader> {
         IndexedReader::open_with_password(
             Arc::new(BytesSource::from(pdf.to_vec())),
@@ -2705,6 +2999,205 @@ mod tests {
         assert!(reader.index.encryption_state.is_some());
         assert_eq!(reader.index.encrypt_object_id, None);
         assert_encrypted_fixture_plaintext(&reader);
+    }
+
+    #[test]
+    fn page_map_uses_physical_kids_order_ignores_count_and_tracks_inheritance() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Catalog /Pages 2 0 R >>",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Count 999 /Resources 8 0 R /MediaBox [0 0 600 800] /Kids 10 0 R >>",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page /Parent 2 0 R /CropBox [0 0 300 400] >>",
+            },
+            ObjectDef {
+                id: 4,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Count 0 /Rotate 90 /Resources << /Nested true >> /Kids [7 0 R] >>",
+            },
+            ObjectDef {
+                id: 5,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+            ObjectDef {
+                id: 6,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /NotPage >>",
+            },
+            ObjectDef {
+                id: 7,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page /MediaBox [0 0 200 200] >>",
+            },
+            ObjectDef {
+                id: 8,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /RootResource true >>",
+            },
+            ObjectDef {
+                id: 10,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"[3 0 R << /Type /Page >> 4 0 R 9 0 R 5 1 R 3 0 R 6 0 R]",
+            },
+        ]);
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let page_map = PageMap::from_reader(&reader).unwrap();
+        let eager: Vec<_> = Document::load_mem(&pdf).unwrap().page_iter().collect();
+
+        assert_eq!(page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(), eager);
+        assert_eq!(eager, vec![(3, 0), (7, 0), (3, 0)]);
+        assert_eq!(
+            page_map.pages[0].inherited,
+            InheritedPageAttributeOwners {
+                resources: Some((2, 0)),
+                media_box: Some((2, 0)),
+                crop_box: Some((3, 0)),
+                rotate: None,
+            }
+        );
+        assert_eq!(
+            page_map.pages[1].inherited,
+            InheritedPageAttributeOwners {
+                resources: Some((4, 0)),
+                media_box: Some((7, 0)),
+                crop_box: None,
+                rotate: Some((4, 0)),
+            }
+        );
+        assert_eq!(page_map.pages[2], page_map.pages[0]);
+    }
+
+    #[test]
+    fn page_map_bounds_cycles_depth_and_page_count_without_trusting_count() {
+        let cyclic = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Catalog /Pages 2 0 R >>",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 999999 >>",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Kids [2 0 R 5 0 R] /Count -1 >>",
+            },
+            ObjectDef {
+                id: 4,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+            ObjectDef {
+                id: 5,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+        ]);
+        let reader = open_reader(&cyclic, ResolverLimits::default());
+        assert_eq!(
+            PageMap::from_reader(&reader)
+                .unwrap()
+                .pages
+                .iter()
+                .map(|page| page.id)
+                .collect::<Vec<_>>(),
+            vec![(5, 0), (4, 0)]
+        );
+
+        let depth_limited = PageMap::from_reader_with_limits(
+            &reader,
+            PageMapLimits {
+                max_depth: 0,
+                max_pages: 10,
+            },
+        )
+        .unwrap();
+        assert!(depth_limited.pages.is_empty());
+
+        assert!(matches!(
+            PageMap::from_reader_with_limits(
+                &reader,
+                PageMapLimits {
+                    max_depth: 256,
+                    max_pages: 1,
+                }
+            ),
+            Err(IndexError::PageCountLimitExceeded { limit: 1 })
+        ));
+    }
+
+    #[test]
+    fn page_map_depth_limit_is_inclusive_and_bounded() {
+        let at_limit = generated_deep_page_tree_pdf(DEFAULT_PAGE_TREE_DEPTH_LIMIT);
+        let reader = open_reader(&at_limit, ResolverLimits::default());
+        assert_eq!(PageMap::from_reader(&reader).unwrap().pages.len(), 1);
+
+        let over_limit = generated_deep_page_tree_pdf(DEFAULT_PAGE_TREE_DEPTH_LIMIT + 1);
+        let reader = open_reader(&over_limit, ResolverLimits::default());
+        assert!(PageMap::from_reader(&reader).unwrap().pages.is_empty());
+    }
+
+    #[test]
+    fn encrypted_page_map_matches_authenticated_eager_order() {
+        let pdf = encrypted_page_tree_pdf();
+        assert!(matches!(open_encrypted(&pdf, None), Err(IndexError::PasswordRequired)));
+        let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+        let page_map = PageMap::from_reader(&reader).unwrap();
+        let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
+        let eager_pages: Vec<_> = eager.page_iter().collect();
+        assert_eq!(
+            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            eager_pages
+        );
+        assert_eq!(eager_pages, vec![(3, 0), (4, 0)]);
+        assert_eq!(page_map.pages[0].inherited.rotate, Some((2, 0)));
+    }
+
+    #[test]
+    fn page_map_enumerates_five_thousand_unique_pages() {
+        let pdf = generated_page_tree_pdf(5_000, 1);
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let page_map = PageMap::from_reader(&reader).unwrap();
+        assert_eq!(page_map.pages.len(), 5_000);
+        assert_eq!(page_map.pages.first().unwrap().id, (3, 0));
+        assert_eq!(page_map.pages.last().unwrap().id, (5_002, 0));
+        assert_eq!(
+            page_map.pages.iter().map(|page| page.id).collect::<HashSet<_>>().len(),
+            5_000
+        );
+        assert!(
+            page_map
+                .pages
+                .iter()
+                .all(|page| { page.inherited.resources == Some((2, 0)) && page.inherited.media_box == Some((2, 0)) })
+        );
     }
 
     #[test]
@@ -3687,6 +4180,43 @@ mod tests {
         let reader =
             IndexedReader::open_with_password(source.clone(), ResolverLimits::default(), Some(b"user")).unwrap();
         assert_encrypted_fixture_plaintext(&reader);
+
+        let requests = source.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|(_, length)| u64::try_from(*length).unwrap() <= TAIL_SCAN_LIMIT)
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|(offset, length)| { *offset == 0 && u64::try_from(*length).unwrap_or(u64::MAX) == len })
+        );
+        let total: usize = requests.iter().map(|(_, length)| *length).sum();
+        assert!(u64::try_from(total).unwrap() < 1_024 * 1_024);
+    }
+
+    #[test]
+    fn page_map_walk_is_bounded_on_a_sparse_hundred_megabyte_source() {
+        let pdf = generated_page_tree_pdf(3, 999_999);
+        let pdf_source = BytesSource::from(pdf.clone());
+        let pdf_len = u64::try_from(pdf.len()).unwrap();
+        let xref = read_startxref(&pdf_source, pdf_len).unwrap();
+        let len = 100_u64 * 1_024 * 1_024;
+        let tail = format!("startxref\n{xref}\n%%EOF\n").into_bytes();
+        let tail_offset = len - u64::try_from(tail.len()).unwrap();
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![(0, pdf), (tail_offset, tail)],
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let page_map = PageMap::from_reader(&reader).unwrap();
+        assert_eq!(
+            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            vec![(3, 0), (4, 0), (5, 0)]
+        );
 
         let requests = source.requests.lock().unwrap();
         assert!(
