@@ -412,6 +412,10 @@ pub(crate) fn direct_object_with_consumed(input: ParserInput) -> Option<(usize, 
         .map(|(remaining, object)| (input.len() - remaining.len(), object))
 }
 
+pub(crate) fn direct_object_with_remainder(input: ParserInput) -> Option<(ParserInput, Object)> {
+    _direct_object(crate::reader::MAX_NESTING_DEPTH)(input).ok()
+}
+
 fn object<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>) -> NomResult<'a, Object> {
     terminated(
         alt((
