@@ -1616,7 +1616,7 @@ impl DirectObjectFramer {
                 self.position += 1;
                 self.lex = FrameLex::ReferenceBoundary;
             }
-            b'.' if self.position == second_token_end => self.fallback_integer(scalar_completion),
+            b'.' if self.position == second_token_end => self.continue_adjacent_real(scalar_completion),
             _ => self.fallback_two_integers(scalar_completion, second_completion),
         }
     }
@@ -1652,6 +1652,24 @@ impl DirectObjectFramer {
         self.position = fallback;
         self.lex = FrameLex::Normal;
         self.finish_value(false);
+    }
+
+    fn continue_adjacent_real(&mut self, second_token_start: usize) {
+        if self.container_depth == 0 {
+            self.fallback_integer(second_token_start);
+            return;
+        }
+        self.finish_value(false);
+        if self.status != FrameStatus::NeedMore {
+            return;
+        }
+        self.position += 1;
+        self.lex = FrameLex::Number {
+            start: second_token_start,
+            dot: true,
+            digits: true,
+            unsigned: false,
+        };
     }
 
     fn fallback_two_integers(&mut self, scalar_completion: usize, second_completion: usize) {
@@ -3812,6 +3830,45 @@ mod tests {
             assert!(
                 framer.scanned_work <= body.len() + 6,
                 "work={} input={} expected={expected:?}",
+                framer.scanned_work,
+                body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn leading_zero_reference_probe_continues_adjacent_real_without_replay() {
+        let mut body = b"[1 ".to_vec();
+        body.extend(std::iter::repeat_n(b'0', 256 * 1_024));
+        body.extend_from_slice(b"2.3 -4.5 +.6] ");
+        let expected = Object::Array(vec![
+            Object::Integer(1),
+            Object::Real(2.3),
+            Object::Real(-4.5),
+            Object::Real(0.6),
+        ]);
+        assert_eq!(crate::parser::direct_object_with_consumed(&body).unwrap().1, expected);
+
+        let dot = body.windows(b"2.3".len()).position(|window| window == b"2.3").unwrap() + 1;
+        let minus = body
+            .windows(b"-4.5".len())
+            .position(|window| window == b"-4.5")
+            .unwrap();
+        let plus = body.windows(b"+.6".len()).position(|window| window == b"+.6").unwrap();
+        let mut splits: Vec<_> = (OBJECT_GROWTH_CHUNK as usize..body.len())
+            .step_by(OBJECT_GROWTH_CHUNK as usize)
+            .collect();
+        splits.extend([dot, dot + 1, minus, minus + 1, plus, plus + 1]);
+        splits.sort_unstable();
+        splits.dedup();
+
+        for split in splits {
+            let mut framer = DirectObjectFramer::new();
+            assert_ne!(framer.advance(&body[..split]), FrameStatus::Invalid, "split {split}");
+            assert_eq!(framer.advance(&body), FrameStatus::Ready, "split {split}");
+            assert!(
+                framer.scanned_work <= body.len() + 6,
+                "split={split} work={} input={}",
                 framer.scanned_work,
                 body.len()
             );
