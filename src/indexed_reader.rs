@@ -2122,6 +2122,21 @@ mod tests {
         assert!(Document::load_mem(&spaced_header).is_ok());
         assert!(PdfIndex::open(Arc::new(BytesSource::from(spaced_header))).is_ok());
 
+        for replacement in [b"".as_slice(), b"\x0c\n", b" % gap\n"] {
+            let mut rejected = valid.clone();
+            let marker = rejected
+                .windows(b"stream\n".len())
+                .position(|window| window == b"stream\n")
+                .unwrap();
+            let eol = marker + b"stream".len();
+            rejected.splice(eol..eol + 1, replacement.iter().copied());
+            assert!(Document::load_mem(&rejected).is_err());
+            assert!(matches!(
+                PdfIndex::open(Arc::new(BytesSource::from(rejected))),
+                Err(IndexError::InvalidXref { .. })
+            ));
+        }
+
         for replacement in [b"".as_slice(), b"\r\n"] {
             let mut accepted = valid.clone();
             let marker = rfind(&accepted, b"endstream").unwrap();
