@@ -2,7 +2,8 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -235,12 +236,21 @@ struct PageMapBuilder<'a> {
     limits: PageMapLimits,
     remaining_work: usize,
     consumed_work: usize,
+    peak_pending_items: usize,
 }
 
-struct PageTreeFrame {
-    kids: std::vec::IntoIter<Object>,
-    inherited: InheritedPageAttributeOwners,
-    depth: usize,
+#[derive(Clone)]
+struct PendingKid {
+    id: Option<crate::ObjectId>,
+    inherited: Rc<InheritedPageAttributeOwners>,
+    depth: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PageMapWork {
+    consumed: usize,
+    peak_pending_items: usize,
+    peak_pending_bytes: usize,
 }
 
 impl PageMap {
@@ -253,6 +263,24 @@ impl PageMap {
     }
 
     fn from_reader_with_limits_and_work(reader: &IndexedReader, limits: PageMapLimits) -> IndexResult<(Self, usize)> {
+        Self::from_reader_with_limits_and_stats(reader, limits).map(|(page_map, work)| (page_map, work.consumed))
+    }
+
+    fn from_reader_with_limits_and_stats(
+        reader: &IndexedReader, limits: PageMapLimits,
+    ) -> IndexResult<(Self, PageMapWork)> {
+        let work_budget = reader
+            .index
+            .locations
+            .values()
+            .filter(|location| !matches!(location, ObjectLocation64::Free { .. }))
+            .count();
+        Self::from_reader_with_work_budget_and_stats(reader, limits, work_budget)
+    }
+
+    fn from_reader_with_work_budget_and_stats(
+        reader: &IndexedReader, limits: PageMapLimits, work_budget: usize,
+    ) -> IndexResult<(Self, PageMapWork)> {
         let Some(root_id) = reader
             .index
             .trailer
@@ -260,74 +288,67 @@ impl PageMap {
             .ok()
             .and_then(|root| root.as_reference().ok())
         else {
-            return Ok((Self::default(), 0));
+            return Ok((Self::default(), PageMapWork::default()));
         };
         let Some(catalog) = reader.resolve_dictionary_deref(root_id)? else {
-            return Ok((Self::default(), 0));
+            return Ok((Self::default(), PageMapWork::default()));
         };
         let Some(pages_id) = catalog.get(b"Pages").ok().and_then(|pages| pages.as_reference().ok()) else {
-            return Ok((Self::default(), 0));
+            return Ok((Self::default(), PageMapWork::default()));
         };
 
         let mut page_map = Self::default();
         let mut builder = PageMapBuilder {
             reader,
             limits,
-            remaining_work: reader
-                .index
-                .locations
-                .values()
-                .filter(|location| !matches!(location, ObjectLocation64::Free { .. }))
-                .count(),
+            remaining_work: work_budget,
             consumed_work: 0,
+            peak_pending_items: 0,
         };
         builder.walk_page_tree(&mut page_map, pages_id)?;
-        Ok((page_map, builder.consumed_work))
+        Ok((
+            page_map,
+            PageMapWork {
+                consumed: builder.consumed_work,
+                peak_pending_items: builder.peak_pending_items,
+                peak_pending_bytes: builder
+                    .peak_pending_items
+                    .saturating_mul(std::mem::size_of::<PendingKid>()),
+            },
+        ))
     }
 }
 
 impl PageMapBuilder<'_> {
     fn walk_page_tree(&mut self, page_map: &mut PageMap, root_id: crate::ObjectId) -> IndexResult<()> {
-        let Some(root) = self.reader.resolve_dictionary_deref(root_id)? else {
+        let Some(mut root) = self.reader.resolve_dictionary_deref(root_id)? else {
             return Ok(());
         };
         let inherited = InheritedPageAttributeOwners::default().updated(root_id, &root);
-        let Some(kids) = self.reader.resolve_array_value(root.get(b"Kids").ok().cloned())? else {
+        let kids_value = root.remove(b"Kids");
+        // Do not retain the resolved dictionary alongside its potentially wide
+        // `/Kids`; only compact pending slots survive into traversal.
+        drop(root);
+        let Some(kids) = self.reader.resolve_array_value(kids_value)? else {
             return Ok(());
         };
-        let mut stack = vec![PageTreeFrame {
-            kids: kids.into_iter(),
-            inherited,
-            depth: 0,
-        }];
+        let mut pending = VecDeque::new();
+        self.prepend_kids(&mut pending, kids, Rc::new(inherited), 1);
 
-        while !stack.is_empty() {
-            let next = stack.last_mut().and_then(|frame| frame.kids.next());
-            let Some(kid) = next else {
-                stack.pop();
-                continue;
-            };
-
-            if self.remaining_work == 0 {
-                break;
-            }
+        while let Some(kid) = pending.pop_front() {
             self.remaining_work -= 1;
             self.consumed_work += 1;
 
-            let Ok(id) = kid.as_reference() else {
+            let Some(id) = kid.id else {
                 continue;
             };
-            let Some(parent) = stack.last() else {
-                break;
-            };
-            let depth = parent.depth + 1;
-            if depth > self.limits.max_depth {
+            if usize::try_from(kid.depth).unwrap_or(usize::MAX) > self.limits.max_depth {
                 continue;
             }
-            let Some(dictionary) = self.reader.resolve_dictionary_deref(id)? else {
+            let Some(mut dictionary) = self.reader.resolve_dictionary_deref(id)? else {
                 continue;
             };
-            let inherited = parent.inherited.updated(id, &dictionary);
+            let inherited = (*kid.inherited).updated(id, &dictionary);
             match dictionary.get_type() {
                 Ok(b"Page") => {
                     if page_map.pages.len() >= self.limits.max_pages {
@@ -338,18 +359,36 @@ impl PageMapBuilder<'_> {
                     page_map.pages.push(PageMapEntry { id, inherited });
                 }
                 Ok(b"Pages") => {
-                    if let Some(kids) = self.reader.resolve_array_value(dictionary.get(b"Kids").ok().cloned())? {
-                        stack.push(PageTreeFrame {
-                            kids: kids.into_iter(),
-                            inherited,
-                            depth,
-                        });
+                    let kids_value = dictionary.remove(b"Kids");
+                    drop(dictionary);
+                    if let Some(kids) = self.reader.resolve_array_value(kids_value)? {
+                        self.prepend_kids(&mut pending, kids, Rc::new(inherited), kid.depth.saturating_add(1));
                     }
                 }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    fn prepend_kids(
+        &mut self, pending: &mut VecDeque<PendingKid>, mut kids: Vec<Object>,
+        inherited: Rc<InheritedPageAttributeOwners>, depth: u32,
+    ) {
+        // Only the first `remaining_work` DFS slots can ever be observed. Drop
+        // later siblings before prepending children, then convert every owned
+        // Object into a fixed-size slot as it leaves the temporary Kids array.
+        kids.truncate(self.remaining_work);
+        pending.truncate(self.remaining_work - kids.len());
+        for kid in kids.into_iter().rev() {
+            pending.push_front(PendingKid {
+                id: kid.as_reference().ok(),
+                inherited: Rc::clone(&inherited),
+                depth,
+            });
+        }
+        debug_assert!(pending.len() <= self.remaining_work);
+        self.peak_pending_items = self.peak_pending_items.max(pending.len());
     }
 }
 
@@ -2853,6 +2892,39 @@ mod tests {
         pdf
     }
 
+    fn wide_page_tree_pdf(distinct_nodes: u32, non_reference_kids: usize, self_cycle: bool) -> Vec<u8> {
+        assert!(distinct_nodes > 0);
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        for node in 0..distinct_nodes {
+            let id = node + 2;
+            let child = if self_cycle || node + 1 == distinct_nodes {
+                (id, 0)
+            } else {
+                (id + 1, 0)
+            };
+            let mut kids = Vec::with_capacity(non_reference_kids + 1);
+            kids.push(Object::Reference(child));
+            kids.extend(std::iter::repeat_n(Object::Null, non_reference_kids));
+            document.objects.insert(
+                (id, 0),
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => kids,
+                    "Count" => 0,
+                }),
+            );
+        }
+        document.max_id = distinct_nodes + 1;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
     fn open_encrypted(pdf: &[u8], password: Option<&[u8]>) -> IndexResult<IndexedReader> {
         IndexedReader::open_with_password(
             Arc::new(BytesSource::from(pdf.to_vec())),
@@ -3279,6 +3351,51 @@ mod tests {
         assert_eq!(eager_pages.len(), 3);
         assert_eq!(work, eager.objects.len());
         assert!(source.requests.lock().unwrap().len() <= (work + 2) * 4);
+    }
+
+    #[test]
+    fn wide_self_cycle_pending_metadata_is_capped_by_near_maximum_work() {
+        const NON_REFERENCE_KIDS: usize = 14_000;
+        let pdf = wide_page_tree_pdf(1, NON_REFERENCE_KIDS, true);
+        assert!(pdf.len() > 64 * 1_024);
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let work_budget = usize::try_from(MAX_XREF_ENTRIES - 1).unwrap();
+        let (page_map, work) =
+            PageMap::from_reader_with_work_budget_and_stats(&reader, PageMapLimits::default(), work_budget).unwrap();
+
+        assert!(page_map.pages.is_empty());
+        assert_eq!(work.consumed, work_budget);
+        assert!(work.peak_pending_items <= work_budget);
+        assert!(work.peak_pending_items > work_budget * 9 / 10);
+        assert_eq!(
+            work.peak_pending_bytes,
+            work.peak_pending_items * std::mem::size_of::<PendingKid>()
+        );
+        assert!(std::mem::size_of::<PendingKid>() <= 32);
+    }
+
+    #[test]
+    fn repeated_distinct_wide_nodes_keep_only_compact_reachable_work() {
+        const DISTINCT_NODES: u32 = 24;
+        const NON_REFERENCE_KIDS: usize = 14_000;
+        let pdf = wide_page_tree_pdf(DISTINCT_NODES, NON_REFERENCE_KIDS, false);
+        assert!(pdf.len() > usize::try_from(DISTINCT_NODES).unwrap() * 64 * 1_024);
+        let eager = Document::load_mem(&pdf).unwrap();
+        let eager_pages: Vec<_> = eager.page_iter().collect();
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let (page_map, work) = PageMap::from_reader_with_limits_and_stats(&reader, PageMapLimits::default()).unwrap();
+
+        assert_eq!(
+            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            eager_pages
+        );
+        assert_eq!(work.consumed, eager.objects.len());
+        assert!(work.peak_pending_items <= work.consumed);
+        assert!(work.peak_pending_bytes < 64 * 1_024);
+        assert_eq!(
+            work.peak_pending_bytes,
+            work.peak_pending_items * std::mem::size_of::<PendingKid>()
+        );
     }
 
     #[test]
