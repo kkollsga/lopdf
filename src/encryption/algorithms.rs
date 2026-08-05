@@ -823,6 +823,13 @@ impl PasswordAlgorithm {
     where
         O: AsRef<[u8]>,
     {
+        self.recover_user_password_r4(file_id, owner_password).map(|_| ())
+    }
+
+    fn recover_user_password_r4<O>(&self, file_id: &[u8], owner_password: O) -> Result<Vec<u8>, DecryptionError>
+    where
+        O: AsRef<[u8]>,
+    {
         // Pad or truncate the owner string. If there is no owner password, use the user password
         // instead.
         let password = owner_password.as_ref();
@@ -900,7 +907,8 @@ impl PasswordAlgorithm {
         // The result of the previous step purports to be the user password. Authenticate this user
         // password using Algorithm 5. If it is correct, the password supplied is the correct owner
         // password.
-        self.authenticate_user_password_r4(file_id, &result)
+        self.authenticate_user_password_r4(file_id, &result)?;
+        Ok(result)
     }
 
     /// Compute the encryption dictionary's U-entry value (revision 6).
@@ -1244,6 +1252,20 @@ impl PasswordAlgorithm {
                 self.authenticate_owner_password_r4(file_id.ok_or(DecryptionError::MissingFileID)?, owner_password)
             }
             5..=6 => self.authenticate_owner_password_r6(owner_password),
+            _ => Err(DecryptionError::UnsupportedRevision),
+        }
+    }
+
+    /// Authenticate a revision 2–4 owner password and recover the padded user
+    /// password bytes needed to derive that document's file encryption key.
+    pub(crate) fn recover_user_password_with_file_id<O>(
+        &self, file_id: Option<&[u8]>, owner_password: O,
+    ) -> Result<Vec<u8>, DecryptionError>
+    where
+        O: AsRef<[u8]>,
+    {
+        match self.revision {
+            2..=4 => self.recover_user_password_r4(file_id.ok_or(DecryptionError::MissingFileID)?, owner_password),
             _ => Err(DecryptionError::UnsupportedRevision),
         }
     }

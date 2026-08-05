@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
 use crate::source::{RandomAccessSource, SourceError};
 use crate::{Dictionary, Object, ObjectStream, Stream};
 
@@ -102,6 +103,20 @@ pub(crate) enum IndexError {
         #[source]
         source: crate::Error,
     },
+    #[error("encrypted PDF requires a password")]
+    PasswordRequired,
+    #[error("invalid password for encrypted PDF")]
+    InvalidPassword,
+    #[error("invalid encryption bootstrap")]
+    Encryption(#[source] crate::Error),
+    #[error("the trailer /Encrypt value does not resolve to a dictionary")]
+    InvalidEncryptDictionary,
+    #[error("failed to decrypt object {id:?}")]
+    ObjectDecryption {
+        id: crate::ObjectId,
+        #[source]
+        source: crate::encryption::DecryptionError,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +144,8 @@ pub(crate) struct PdfIndex {
     pub(crate) declared_size: u64,
     pub(crate) locations: BTreeMap<u32, ObjectLocation64>,
     pub(crate) trailer: Dictionary,
+    pub(crate) encryption_state: Option<EncryptionState>,
+    pub(crate) encrypt_object_id: Option<crate::ObjectId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,8 +175,16 @@ pub(crate) struct IndexedReader {
 
 impl IndexedReader {
     pub(crate) fn open(source: Arc<dyn RandomAccessSource>, limits: ResolverLimits) -> IndexResult<Self> {
+        Self::open_with_password(source, limits, None)
+    }
+
+    pub(crate) fn open_with_password(
+        source: Arc<dyn RandomAccessSource>, limits: ResolverLimits, password: Option<&[u8]>,
+    ) -> IndexResult<Self> {
         let index = PdfIndex::open(Arc::clone(&source))?;
-        Ok(Self { source, index, limits })
+        let mut reader = Self { source, index, limits };
+        reader.initialize_encryption(password)?;
+        Ok(reader)
     }
 
     pub(crate) fn resolve(&self, id: crate::ObjectId) -> IndexResult<Object> {
@@ -227,6 +252,17 @@ impl IndexedReader {
     }
 
     fn resolve_normal(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
+        let mut object = self.resolve_normal_plain(id, state)?;
+        if self.index.encrypt_object_id != Some(id)
+            && let Some(encryption_state) = &self.index.encryption_state
+        {
+            encryption::decrypt_object(encryption_state, id, &mut object)
+                .map_err(|source| IndexError::ObjectDecryption { id, source })?;
+        }
+        Ok(object)
+    }
+
+    fn resolve_normal_plain(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
         let location = self
             .index
             .locations
@@ -262,6 +298,47 @@ impl IndexedReader {
             .checked_add(header_bytes)
             .ok_or(IndexError::InvalidIndirectObject { id, offset })?;
         self.resolve_body(id, body_offset, source_len, state)
+    }
+
+    fn initialize_encryption(&mut self, password: Option<&[u8]>) -> IndexResult<()> {
+        let Ok(encrypt) = self.index.trailer.get(b"Encrypt") else {
+            return Ok(());
+        };
+        let (dictionary, encrypt_object_id) = if let Ok(dictionary) = encrypt.as_dict() {
+            (dictionary.clone(), None)
+        } else if let Ok(id) = encrypt.as_reference() {
+            let mut state = ResolutionState::default();
+            let object = self.resolve_normal_plain(id, &mut state)?;
+            let dictionary = object
+                .as_dict()
+                .map_err(|_| IndexError::InvalidEncryptDictionary)?
+                .clone();
+            (dictionary, Some(id))
+        } else {
+            return Err(IndexError::InvalidEncryptDictionary);
+        };
+        let file_id = self
+            .index
+            .trailer
+            .get(b"ID")
+            .ok()
+            .and_then(|id| id.as_array().ok())
+            .and_then(|ids| ids.first())
+            .and_then(|id| id.as_str().ok());
+        let algorithm = PasswordAlgorithm::try_from(&dictionary).map_err(IndexError::Encryption)?;
+
+        let selected = if let Some(selected) = authenticate_password(&algorithm, file_id, b"")? {
+            selected
+        } else if let Some(password) = password {
+            authenticate_password(&algorithm, file_id, password)?.ok_or(IndexError::InvalidPassword)?
+        } else {
+            return Err(IndexError::PasswordRequired);
+        };
+        let state =
+            EncryptionState::decode_from_dictionary(&dictionary, file_id, &selected).map_err(IndexError::Encryption)?;
+        self.index.encryption_state = Some(state);
+        self.index.encrypt_object_id = encrypt_object_id;
+        Ok(())
     }
 
     fn resolve_body(
@@ -457,6 +534,37 @@ struct ResolutionState {
     depth: usize,
 }
 
+fn authenticate_password(
+    algorithm: &PasswordAlgorithm, file_id: Option<&[u8]>, password: &[u8],
+) -> IndexResult<Option<Vec<u8>>> {
+    let user = algorithm.authenticate_user_password_with_file_id(file_id, password);
+    if user.is_ok() {
+        return Ok(Some(password.to_vec()));
+    }
+    let owner = if (2..=4).contains(&algorithm.revision) {
+        algorithm.recover_user_password_with_file_id(file_id, password)
+    } else {
+        algorithm
+            .authenticate_owner_password_with_file_id(file_id, password)
+            .map(|()| password.to_vec())
+    };
+    match owner {
+        Ok(password) => Ok(Some(password)),
+        Err(owner_error) => match user {
+            Err(crate::encryption::DecryptionError::IncorrectPassword)
+                if matches!(owner_error, crate::encryption::DecryptionError::IncorrectPassword) =>
+            {
+                Ok(None)
+            }
+            Err(crate::encryption::DecryptionError::IncorrectPassword) => {
+                Err(IndexError::Encryption(crate::Error::Decryption(owner_error)))
+            }
+            Err(user_error) => Err(IndexError::Encryption(crate::Error::Decryption(user_error))),
+            Ok(()) => unreachable!(),
+        },
+    }
+}
+
 struct ParsedObject {
     object: Object,
     consumed: usize,
@@ -527,6 +635,8 @@ impl PdfIndex {
             declared_size,
             locations,
             trailer,
+            encryption_state: None,
+            encrypt_object_id: None,
         })
     }
 }
@@ -2026,9 +2136,11 @@ fn validate_endstream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Document;
+    use crate::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
     use crate::source::BytesSource;
+    use crate::writer::Writer;
     use crate::xref::XrefEntry;
+    use crate::{Document, EncryptionState, EncryptionVersion, Permissions, StringFormat};
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
     use std::io::Write;
@@ -2110,6 +2222,258 @@ mod tests {
             &format!("<< /Size {} /Root 1 0 R >>", u64::from(max_id) + 1),
         );
         pdf
+    }
+
+    fn encrypted_pdf(revision: u8, owner: &str, user: &str) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::String(b"encrypted string".to_vec(), StringFormat::Literal),
+        );
+        document.objects.insert(
+            (2, 0),
+            Object::Stream(Stream::new(dictionary! {}, b"encrypted stream".to_vec())),
+        );
+        document.objects.insert(
+            (3, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Sentinel" => Object::Reference((1, 0)) }),
+        );
+        document.max_id = 3;
+        document.trailer.set("Root", Object::Reference((3, 0)));
+        let id = vec![0x42; 16];
+        document.trailer.set(
+            "ID",
+            Object::Array(vec![
+                Object::String(id.clone(), StringFormat::Literal),
+                Object::String(id, StringFormat::Literal),
+            ]),
+        );
+
+        let aes128: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+        let aes256: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+        let file_key = [0x5a; 32];
+        let state = match revision {
+            2 => EncryptionState::try_from(EncryptionVersion::V1 {
+                document: &document,
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            3 => EncryptionState::try_from(EncryptionVersion::V2 {
+                document: &document,
+                owner_password: owner,
+                user_password: user,
+                key_length: 128,
+                permissions: Permissions::PRINTABLE,
+            }),
+            4 => EncryptionState::try_from(EncryptionVersion::V4 {
+                document: &document,
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes128)]),
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            #[allow(deprecated)]
+            5 => EncryptionState::try_from(EncryptionVersion::R5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256.clone())]),
+                file_encryption_key: &file_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            6 => EncryptionState::try_from(EncryptionVersion::V5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256)]),
+                file_encryption_key: &file_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        document.encrypt(&state).unwrap();
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    fn inline_encrypt_dictionary(mut pdf: Vec<u8>) -> Vec<u8> {
+        let trailer_encrypt = rfind(&pdf, b"/Encrypt ").unwrap() + b"/Encrypt ".len();
+        let mut cursor = TokenCursor::new(&pdf[trailer_encrypt..]);
+        let id = u32::try_from(cursor.unsigned().unwrap()).unwrap();
+        let generation = u16::try_from(cursor.unsigned().unwrap()).unwrap();
+        cursor.expect(b"R").unwrap();
+        let reference_len = pdf[trailer_encrypt..].len() - cursor.remaining().len();
+        let header = format!("{id} {generation} obj\n");
+        let start = pdf
+            .windows(header.len())
+            .position(|window| window == header.as_bytes())
+            .unwrap()
+            + header.len();
+        let end = start
+            + pdf[start..]
+                .windows(b"\nendobj".len())
+                .position(|w| w == b"\nendobj")
+                .unwrap();
+        let dictionary = pdf[start..end].to_vec();
+        pdf.splice(trailer_encrypt..trailer_encrypt + reference_len, dictionary);
+        pdf
+    }
+
+    fn encrypted_object_stream_pdf() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        const CONTAINER_ID: u32 = 5;
+        const IMAGE_ID: u32 = 20;
+        const STRING_ID: u32 = 21;
+        const ENCRYPT_ID: u32 = 30;
+        const XREF_ID: u32 = 31;
+
+        let mut document = Document::with_version("1.7");
+        let file_id = vec![0x24; 16];
+        document.trailer.set(
+            "ID",
+            Object::Array(vec![
+                Object::String(file_id.clone(), StringFormat::Literal),
+                Object::String(file_id.clone(), StringFormat::Literal),
+            ]),
+        );
+        let aes128: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+        let state = EncryptionState::try_from(EncryptionVersion::V4 {
+            document: &document,
+            encrypt_metadata: true,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes128)]),
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password: "user",
+            permissions: Permissions::PRINTABLE,
+        })
+        .unwrap();
+
+        let (first, content) = object_stream_content(&[(
+            10,
+            b"<< /Type /Catalog /Text (member secret) /Image 20 0 R >>".as_slice(),
+        )]);
+        let mut container = Object::Stream(Stream::new(
+            Dictionary::from_iter([
+                (b"Type".to_vec(), Object::Name(b"ObjStm".to_vec())),
+                (b"N".to_vec(), Object::Integer(1)),
+                (b"First".to_vec(), Object::Integer(i64::try_from(first).unwrap())),
+            ]),
+            content,
+        ));
+        encryption::encrypt_object(&state, (CONTAINER_ID, 0), &mut container).unwrap();
+
+        let image_plaintext = b"shared encrypted image".to_vec();
+        let mut image = Object::Stream(Stream::new(
+            Dictionary::from_iter([
+                (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
+                (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
+            ]),
+            image_plaintext.clone(),
+        ));
+        encryption::encrypt_object(&state, (IMAGE_ID, 0), &mut image).unwrap();
+        let mut string = Object::String(b"normal secret".to_vec(), StringFormat::Literal);
+        encryption::encrypt_object(&state, (STRING_ID, 0), &mut string).unwrap();
+        let encrypt = Object::Dictionary(state.encode().unwrap());
+
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (id, object) in [
+            (CONTAINER_ID, container),
+            (IMAGE_ID, image),
+            (STRING_ID, string),
+            (ENCRYPT_ID, encrypt),
+        ] {
+            let offset = u64::try_from(pdf.len()).unwrap();
+            pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            Writer::write_object(&mut pdf, &object).unwrap();
+            pdf.extend_from_slice(b"\nendobj\n");
+            offsets.insert(id, offset);
+        }
+
+        let xref_offset = u64::try_from(pdf.len()).unwrap();
+        let mut xref_content = Vec::new();
+        for id in 0..=XREF_ID {
+            if id == 10 {
+                encode_field(2, 1, &mut xref_content);
+                encode_field(u64::from(CONTAINER_ID), 8, &mut xref_content);
+                encode_field(0, 4, &mut xref_content);
+            } else if id == XREF_ID {
+                encode_field(1, 1, &mut xref_content);
+                encode_field(xref_offset, 8, &mut xref_content);
+                encode_field(0, 4, &mut xref_content);
+            } else if let Some(offset) = offsets.get(&id) {
+                encode_field(1, 1, &mut xref_content);
+                encode_field(*offset, 8, &mut xref_content);
+                encode_field(0, 4, &mut xref_content);
+            } else {
+                encode_field(0, 1, &mut xref_content);
+                encode_field(0, 8, &mut xref_content);
+                encode_field(0, 4, &mut xref_content);
+            }
+        }
+        let xref = Object::Stream(Stream::new(
+            Dictionary::from_iter([
+                (b"Type".to_vec(), Object::Name(b"XRef".to_vec())),
+                (b"Size".to_vec(), Object::Integer(i64::from(XREF_ID + 1))),
+                (b"Root".to_vec(), Object::Reference((10, 0))),
+                (b"Encrypt".to_vec(), Object::Reference((ENCRYPT_ID, 0))),
+                (
+                    b"ID".to_vec(),
+                    Object::Array(vec![
+                        Object::String(file_id.clone(), StringFormat::Literal),
+                        Object::String(file_id, StringFormat::Literal),
+                    ]),
+                ),
+                (
+                    b"W".to_vec(),
+                    Object::Array(vec![Object::Integer(1), Object::Integer(8), Object::Integer(4)]),
+                ),
+            ]),
+            xref_content.clone(),
+        ));
+        pdf.extend_from_slice(format!("{XREF_ID} 0 obj\n").as_bytes());
+        Writer::write_object(&mut pdf, &xref).unwrap();
+        pdf.extend_from_slice(format!("\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        (pdf, image_plaintext, xref_content)
+    }
+
+    fn open_encrypted(pdf: &[u8], password: Option<&[u8]>) -> IndexResult<IndexedReader> {
+        IndexedReader::open_with_password(
+            Arc::new(BytesSource::from(pdf.to_vec())),
+            ResolverLimits::default(),
+            password,
+        )
+    }
+
+    fn assert_encrypted_fixture_plaintext(reader: &IndexedReader) {
+        assert_eq!(
+            reader.resolve((1, 0)).unwrap(),
+            Object::String(b"encrypted string".to_vec(), StringFormat::Literal)
+        );
+        assert_eq!(
+            reader.resolve((2, 0)).unwrap().as_stream().unwrap().content,
+            b"encrypted stream"
+        );
+        assert_eq!(
+            reader
+                .resolve((3, 0))
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Sentinel")
+                .unwrap(),
+            &Object::Reference((1, 0))
+        );
     }
 
     fn open_reader(pdf: &[u8], limits: ResolverLimits) -> IndexedReader {
@@ -2272,6 +2636,98 @@ mod tests {
         assert_eq!(index.xref_type, IndexXrefType::Table);
         assert_eq!(index.source_origin, 0);
         assert_eager_normal_fingerprint(&pdf, &index);
+    }
+
+    #[test]
+    fn encrypted_revisions_accept_user_and_owner_passwords_and_reject_missing_or_wrong() {
+        for revision in 2..=6 {
+            let pdf = encrypted_pdf(revision, "owner", "user");
+
+            assert!(matches!(open_encrypted(&pdf, None), Err(IndexError::PasswordRequired)));
+            let wrong_a = open_encrypted(&pdf, Some(b"wrong")).err().unwrap();
+            let wrong_b = open_encrypted(&pdf, Some(b"wrong")).err().unwrap();
+            assert!(matches!(wrong_a, IndexError::InvalidPassword));
+            assert_eq!(format!("{wrong_a:?}"), format!("{wrong_b:?}"));
+
+            let user = open_encrypted(&pdf, Some(b"user")).unwrap();
+            assert_encrypted_fixture_plaintext(&user);
+            let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
+            for id in [(1, 0), (2, 0), (3, 0)] {
+                assert_eq!(user.resolve(id).unwrap(), eager.get_object(id).unwrap().clone());
+            }
+
+            let encrypt_id = user.index.encrypt_object_id.unwrap();
+            assert_eq!(
+                user.resolve(encrypt_id)
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Filter")
+                    .unwrap()
+                    .as_name()
+                    .unwrap(),
+                b"Standard"
+            );
+
+            let owner = open_encrypted(&pdf, Some(b"owner")).unwrap();
+            assert_encrypted_fixture_plaintext(&owner);
+        }
+    }
+
+    #[test]
+    fn empty_user_password_and_inline_encrypt_dictionary_open_without_materializing_document() {
+        for revision in 2..=6 {
+            let pdf = encrypted_pdf(revision, "owner", "");
+            let reader = open_encrypted(&pdf, None).unwrap();
+            assert_encrypted_fixture_plaintext(&reader);
+        }
+
+        let pdf = inline_encrypt_dictionary(encrypted_pdf(3, "owner", ""));
+        let reader = open_encrypted(&pdf, None).unwrap();
+        assert!(reader.index.encryption_state.is_some());
+        assert_eq!(reader.index.encrypt_object_id, None);
+        assert_encrypted_fixture_plaintext(&reader);
+    }
+
+    #[test]
+    fn encrypted_object_stream_container_is_decrypted_once_and_xref_stays_plain() {
+        let (pdf, image_plaintext, xref_plaintext) = encrypted_object_stream_pdf();
+        let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+
+        let member = reader.resolve((10, 0)).unwrap();
+        let member = member.as_dict().unwrap();
+        assert_eq!(
+            member.get(b"Text").unwrap(),
+            &Object::String(b"member secret".to_vec(), StringFormat::Literal)
+        );
+        assert_eq!(member.get(b"Image").unwrap(), &Object::Reference((20, 0)));
+
+        for _ in 0..2 {
+            assert_eq!(
+                reader.resolve((20, 0)).unwrap().as_stream().unwrap().content,
+                image_plaintext
+            );
+        }
+        assert_eq!(
+            reader.resolve((21, 0)).unwrap(),
+            Object::String(b"normal secret".to_vec(), StringFormat::Literal)
+        );
+        assert_eq!(
+            reader.resolve((31, 0)).unwrap().as_stream().unwrap().content,
+            xref_plaintext
+        );
+        assert_eq!(
+            reader
+                .resolve((30, 0))
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Filter")
+                .unwrap()
+                .as_name()
+                .unwrap(),
+            b"Standard"
+        );
     }
 
     #[test]
@@ -3193,6 +3649,40 @@ mod tests {
         );
         let total: usize = requests.iter().map(|(_, length)| *length).sum();
         assert!(u64::try_from(total).unwrap() < len / 100);
+    }
+
+    #[test]
+    fn encrypted_open_and_resolution_are_bounded_on_a_sparse_hundred_megabyte_source() {
+        let pdf = encrypted_pdf(4, "owner", "user");
+        let pdf_source = BytesSource::from(pdf.clone());
+        let pdf_len = u64::try_from(pdf.len()).unwrap();
+        let xref = read_startxref(&pdf_source, pdf_len).unwrap();
+        let len = 100_u64 * 1_024 * 1_024;
+        let tail = format!("startxref\n{xref}\n%%EOF\n").into_bytes();
+        let tail_offset = len - u64::try_from(tail.len()).unwrap();
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![(0, pdf), (tail_offset, tail)],
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let reader =
+            IndexedReader::open_with_password(source.clone(), ResolverLimits::default(), Some(b"user")).unwrap();
+        assert_encrypted_fixture_plaintext(&reader);
+
+        let requests = source.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|(_, length)| u64::try_from(*length).unwrap() <= TAIL_SCAN_LIMIT)
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|(offset, length)| { *offset == 0 && u64::try_from(*length).unwrap_or(u64::MAX) == len })
+        );
+        let total: usize = requests.iter().map(|(_, length)| *length).sum();
+        assert!(u64::try_from(total).unwrap() < 1_024 * 1_024);
     }
 
     #[test]
