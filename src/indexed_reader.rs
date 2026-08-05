@@ -8,7 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::source::{RandomAccessSource, SourceError};
-use crate::{Dictionary, Object, Stream};
+use crate::{Dictionary, Object, ObjectStream, Stream};
 
 const HEADER_SCAN_LIMIT: u64 = 1_024;
 const HEADER_PARSE_OVERLAP: u64 = 64;
@@ -89,6 +89,19 @@ pub(crate) enum IndexError {
     ResolutionCycle { id: crate::ObjectId },
     #[error("object-resolution depth exceeds the {limit}-object limit")]
     ResolutionDepthExceeded { limit: usize },
+    #[error("object-stream container {container:?} for object {id:?} is not a stream")]
+    ObjectStreamContainerNotStream {
+        id: crate::ObjectId,
+        container: crate::ObjectId,
+    },
+    #[error("failed to resolve object {id:?} from object-stream container {container:?} at member index {index}")]
+    ObjectStreamMember {
+        id: crate::ObjectId,
+        container: crate::ObjectId,
+        index: u32,
+        #[source]
+        source: crate::Error,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,10 +177,53 @@ impl IndexedReader {
             return Err(IndexError::ResolutionCycle { id });
         }
         state.depth += 1;
-        let result = self.resolve_normal(id, state);
+        let result = match self.index.locations.get(&id.0).cloned() {
+            Some(ObjectLocation64::Normal { .. }) => self.resolve_normal(id, state),
+            Some(ObjectLocation64::Compressed { container, index }) => {
+                self.resolve_compressed(id, container, index, state)
+            }
+            Some(ObjectLocation64::Free { .. }) | None => Err(IndexError::MissingNormalObject { id }),
+        };
         state.depth -= 1;
         state.active.remove(&id);
         result
+    }
+
+    fn resolve_compressed(
+        &self, id: crate::ObjectId, container: u32, index: u32, state: &mut ResolutionState,
+    ) -> IndexResult<Object> {
+        if id.1 != 0 {
+            return Err(IndexError::GenerationMismatch { id, indexed: 0 });
+        }
+        let container = (container, 0);
+        if state.depth >= self.limits.max_length_depth {
+            return Err(IndexError::ResolutionDepthExceeded {
+                limit: self.limits.max_length_depth,
+            });
+        }
+        if !state.active.insert(container) {
+            return Err(IndexError::ResolutionCycle { id: container });
+        }
+        state.depth += 1;
+        // Object streams must themselves be ordinary, generation-zero indirect
+        // objects. Do not recursively accept a compressed container here.
+        let resolved = self.resolve_normal(container, state);
+        state.depth -= 1;
+        state.active.remove(&container);
+
+        let object = resolved?;
+        let Object::Stream(stream) = object else {
+            return Err(IndexError::ObjectStreamContainerNotStream { id, container });
+        };
+        let limit = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
+        ObjectStream::parse_selected_member_with_limit(&stream, id, index, Some(limit)).map_err(|source| {
+            IndexError::ObjectStreamMember {
+                id,
+                container,
+                index,
+                source,
+            }
+        })
     }
 
     fn resolve_normal(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
@@ -2009,6 +2065,88 @@ mod tests {
         pdf
     }
 
+    struct ObjectStreamFixture {
+        pdf: Vec<u8>,
+        container_stream_start: u64,
+        container_stream_length: u64,
+    }
+
+    fn object_stream_content(members: &[(u32, &[u8])]) -> (usize, Vec<u8>) {
+        let mut header = Vec::new();
+        let mut bodies = Vec::new();
+        for (id, body) in members {
+            header.extend_from_slice(format!("{id} {} ", bodies.len()).as_bytes());
+            bodies.extend_from_slice(body);
+            bodies.push(b'\n');
+        }
+        let first = header.len();
+        header.extend_from_slice(&bodies);
+        (first, header)
+    }
+
+    fn object_stream_fixture(
+        dictionary: &str, content: &[u8], compressed_entries: &[(u32, u32)],
+    ) -> ObjectStreamFixture {
+        const CONTAINER_ID: u32 = 5;
+        const XREF_ID: u32 = 6;
+
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let container_offset = u64::try_from(pdf.len()).unwrap();
+        let prefix = format!(
+            "{CONTAINER_ID} 0 obj\n<< {dictionary} /Length {} >>\nstream\n",
+            content.len()
+        );
+        pdf.extend_from_slice(prefix.as_bytes());
+        let container_stream_start = u64::try_from(pdf.len()).unwrap();
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = u64::try_from(pdf.len()).unwrap();
+        let size = compressed_entries
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .unwrap_or(XREF_ID)
+            .max(XREF_ID)
+            + 1;
+        let mut xref_content = Vec::new();
+        for id in 0..size {
+            if id == CONTAINER_ID {
+                encode_field(1, 1, &mut xref_content);
+                encode_field(container_offset, 8, &mut xref_content);
+                encode_field(0, 4, &mut xref_content);
+            } else if id == XREF_ID {
+                encode_field(1, 1, &mut xref_content);
+                encode_field(xref_offset, 8, &mut xref_content);
+                encode_field(0, 4, &mut xref_content);
+            } else if let Some((_, index)) = compressed_entries.iter().find(|(target, _)| *target == id) {
+                encode_field(2, 1, &mut xref_content);
+                encode_field(u64::from(CONTAINER_ID), 8, &mut xref_content);
+                encode_field(u64::from(*index), 4, &mut xref_content);
+            } else {
+                encode_field(0, 1, &mut xref_content);
+                encode_field(0, 8, &mut xref_content);
+                encode_field(0, 4, &mut xref_content);
+            }
+        }
+        let root = compressed_entries.first().map(|(id, _)| *id).unwrap_or(CONTAINER_ID);
+        pdf.extend_from_slice(
+            format!(
+                "{XREF_ID} 0 obj\n<< /Type /XRef /Size {size} /Root {root} 0 R /W [1 8 4] /Length {} >>\nstream\n",
+                xref_content.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&xref_content);
+        pdf.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        ObjectStreamFixture {
+            pdf,
+            container_stream_start,
+            container_stream_length: u64::try_from(content.len()).unwrap(),
+        }
+    }
+
     fn open_bytes(pdf: &[u8]) -> PdfIndex {
         PdfIndex::open(Arc::new(BytesSource::from(pdf.to_vec()))).unwrap()
     }
@@ -2328,6 +2466,147 @@ mod tests {
             assert_eq!(
                 format!("{:?}", reader.resolve(id).unwrap()),
                 format!("{:?}", eager.get_object(id).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn declared_compressed_objects_match_eager_values() {
+        let members = [
+            (10, b"<< /Type /Catalog /Pages 11 0 R >>".as_slice()),
+            (11, b"<< /Type /Pages /Count 0 /Kids [] >>".as_slice()),
+            (12, b"[1 (two) << /Flag true >>]".as_slice()),
+        ];
+        let (first, plain) = object_stream_content(&members);
+        for compressed in [false, true] {
+            let (content, filter) = if compressed {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+                encoder.write_all(&plain).unwrap();
+                (encoder.finish().unwrap(), " /Filter /FlateDecode")
+            } else {
+                (plain.clone(), "")
+            };
+            let fixture = object_stream_fixture(
+                &format!("/Type /ObjStm /N {} /First {first}{filter}", members.len()),
+                &content,
+                &[(10, 0), (11, 1), (12, 2)],
+            );
+            let reader = open_reader(&fixture.pdf, ResolverLimits::default());
+            let eager = Document::load_mem(&fixture.pdf).unwrap();
+
+            for id in [(10, 0), (11, 0), (12, 0)] {
+                assert_eq!(reader.resolve(id).unwrap(), eager.get_object(id).unwrap().clone());
+            }
+            assert_eq!(reader.resolve((999, 0)).is_err(), eager.get_object((999, 0)).is_err());
+        }
+    }
+
+    #[test]
+    fn compressed_member_enforces_container_index_id_generation_and_shape() {
+        let (first, content) = object_stream_content(&[(10, b"(ten)"), (11, b"(eleven)")]);
+        let wrong_index = object_stream_fixture(&format!("/Type /ObjStm /N 2 /First {first}"), &content, &[(10, 1)]);
+        let reader = open_reader(&wrong_index.pdf, ResolverLimits::default());
+        assert!(matches!(
+            reader.resolve((10, 0)),
+            Err(IndexError::ObjectStreamMember {
+                id: (10, 0),
+                container: (5, 0),
+                index: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reader.resolve((10, 1)),
+            Err(IndexError::GenerationMismatch {
+                id: (10, 1),
+                indexed: 0
+            })
+        ));
+
+        let ordinary = object_pdf(&[ObjectDef {
+            id: 5,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Not /AStream >>",
+        }]);
+        let mut reader = open_reader(&ordinary, ResolverLimits::default());
+        reader
+            .index
+            .locations
+            .insert(10, ObjectLocation64::Compressed { container: 5, index: 0 });
+        assert!(matches!(
+            reader.resolve((10, 0)),
+            Err(IndexError::ObjectStreamContainerNotStream {
+                id: (10, 0),
+                container: (5, 0)
+            })
+        ));
+    }
+
+    #[test]
+    fn malformed_and_bounded_compressed_members_fail_without_eager_fallback() {
+        let malformed = [
+            ("/Type /ObjStm /N 2 /First 5", b"10 0 (ten)".as_slice()),
+            ("/Type /ObjStm /N 1 /First 1", b"10 0 (ten)".as_slice()),
+            ("/Type /ObjStm /N 2 /First 10", b"10 0 11 0 (ten) (eleven)".as_slice()),
+            ("/Type /ObjStm /N 1 /First 5", b"10 0 << /Broken".as_slice()),
+        ];
+        for (dictionary, content) in malformed {
+            let fixture = object_stream_fixture(dictionary, content, &[(10, 0)]);
+            assert!(matches!(
+                open_reader(&fixture.pdf, ResolverLimits::default()).resolve((10, 0)),
+                Err(IndexError::ObjectStreamMember { .. })
+            ));
+        }
+
+        let large = format!("({})", "x".repeat(16 * 1_024));
+        let (first, decoded) = object_stream_content(&[(10, large.as_bytes())]);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&decoded).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < 1_024);
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 1 /First {first} /Filter /FlateDecode"),
+            &compressed,
+            &[(10, 0)],
+        );
+        let reader = open_reader(
+            &fixture.pdf,
+            ResolverLimits {
+                max_stream_bytes: 1_024,
+                ..ResolverLimits::default()
+            },
+        );
+        assert!(matches!(
+            reader.resolve((10, 0)),
+            Err(IndexError::ObjectStreamMember { .. })
+        ));
+    }
+
+    #[test]
+    fn fw9_style_compressed_fingerprint_matches_eager() {
+        let bodies: Vec<_> = (10..110)
+            .map(|id| format!("<< /T (field-{id}) /V ({}) /Rect [0 0 100 20] >>", id * 17))
+            .collect();
+        let members: Vec<_> = bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| (u32::try_from(index).unwrap() + 10, body.as_bytes()))
+            .collect();
+        let (first, plain) = object_stream_content(&members);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&plain).unwrap();
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 100 /First {first} /Filter /FlateDecode"),
+            &encoder.finish().unwrap(),
+            &(10..110).map(|id| (id, id - 10)).collect::<Vec<_>>(),
+        );
+        let reader = open_reader(&fixture.pdf, ResolverLimits::default());
+        let eager = Document::load_mem(&fixture.pdf).unwrap();
+        for id in 10..110 {
+            assert_eq!(
+                reader.resolve((id, 0)).unwrap(),
+                eager.get_object((id, 0)).unwrap().clone()
             );
         }
     }
@@ -2679,6 +2958,74 @@ mod tests {
         len: u64,
         regions: Vec<(u64, Vec<u8>)>,
         requests: Mutex<Vec<(u64, usize)>>,
+    }
+
+    struct TracingBytesSource {
+        bytes: Vec<u8>,
+        requests: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl RandomAccessSource for TracingBytesSource {
+        fn len(&self) -> Result<u64, SourceError> {
+            Ok(u64::try_from(self.bytes.len()).unwrap())
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<usize, SourceError> {
+            self.requests.lock().unwrap().push((offset, output.len()));
+            let offset = usize::try_from(offset).map_err(|_| SourceError::OutOfBounds {
+                offset,
+                length: u64::try_from(output.len()).unwrap_or(u64::MAX),
+                source_len: u64::try_from(self.bytes.len()).unwrap(),
+            })?;
+            if offset > self.bytes.len() {
+                return Ok(0);
+            }
+            let length = output.len().min(self.bytes.len() - offset);
+            output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn large_object_stream_is_call_local_owned_and_uncached() {
+        let large = format!("({})", "z".repeat(4 * 1_024 * 1_024));
+        let (first, content) = object_stream_content(&[(10, b"(tiny)"), (11, large.as_bytes())]);
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 2 /First {first}"),
+            &content,
+            &[(10, 0), (11, 1)],
+        );
+        let source = Arc::new(TracingBytesSource {
+            bytes: fixture.pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+
+        let first_value = reader.resolve((10, 0)).unwrap();
+        let second_value = reader.resolve((10, 0)).unwrap();
+        assert_eq!(first_value, Object::string_literal("tiny"));
+        assert_eq!(second_value, first_value);
+        let requests = source.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(offset, length)| {
+                    *offset == fixture.container_stream_start
+                        && u64::try_from(*length).unwrap() == fixture.container_stream_length
+                })
+                .count(),
+            2
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|(_, length)| u64::try_from(*length).unwrap() <= fixture.container_stream_length)
+        );
+        drop(requests);
+        drop(reader);
+        drop(source);
+        assert_eq!(first_value, Object::string_literal("tiny"));
     }
 
     impl RandomAccessSource for OverlaySource {
