@@ -1690,8 +1690,9 @@ impl DirectObjectFramer {
                 };
             } else {
                 // A generation cannot exceed u16. Stop the speculative
-                // reference probe immediately so replay is fixed-size.
-                self.fallback_integer(scalar_completion);
+                // reference probe immediately and continue the already-scanned
+                // integer without replaying its potentially long zero prefix.
+                self.continue_second_integer(scalar_completion);
             }
         } else {
             self.lex = FrameLex::ReferenceTail {
@@ -1779,6 +1780,23 @@ impl DirectObjectFramer {
             dot: true,
             digits: true,
             unsigned: false,
+        };
+    }
+
+    fn continue_second_integer(&mut self, second_token_start: usize) {
+        if self.container_depth == 0 {
+            self.fallback_integer(second_token_start);
+            return;
+        }
+        self.finish_value(false);
+        if self.status != FrameStatus::NeedMore {
+            return;
+        }
+        self.lex = FrameLex::Number {
+            start: second_token_start,
+            dot: false,
+            digits: true,
+            unsigned: true,
         };
     }
 
@@ -4362,6 +4380,50 @@ mod tests {
                 framer.scanned_work,
                 body.len()
             );
+        }
+    }
+
+    #[test]
+    fn zero_padded_generation_boundary_continues_numbers_without_replay() {
+        let cases = [
+            (b"65535".as_slice(), Object::Integer(65_535)),
+            (b"65535.3".as_slice(), Object::Real(65_535.3)),
+            (b"65536".as_slice(), Object::Integer(65_536)),
+            (b"65536.3".as_slice(), Object::Real(65_536.3)),
+            (b"-65536.3".as_slice(), Object::Real(-65_536.3)),
+            (b"+65536.3".as_slice(), Object::Real(65_536.3)),
+        ];
+
+        for (suffix, value) in cases {
+            let mut body = b"[1 ".to_vec();
+            let sign = suffix.first().copied().filter(|byte| matches!(byte, b'+' | b'-'));
+            if let Some(sign) = sign {
+                body.push(sign);
+            }
+            body.extend(std::iter::repeat_n(b'0', 256 * 1_024));
+            body.extend_from_slice(&suffix[usize::from(sign.is_some())..]);
+            body.extend_from_slice(b"] ");
+            let expected = Object::Array(vec![Object::Integer(1), value]);
+            assert_eq!(crate::parser::direct_object_with_consumed(&body).unwrap().1, expected);
+
+            let number_end = body.len() - 2;
+            let mut splits: Vec<_> = (OBJECT_GROWTH_CHUNK as usize..body.len())
+                .step_by(OBJECT_GROWTH_CHUNK as usize)
+                .collect();
+            splits.extend(number_end.saturating_sub(8)..=number_end);
+            splits.sort_unstable();
+            splits.dedup();
+            for split in splits {
+                let mut framer = DirectObjectFramer::new();
+                assert_ne!(framer.advance(&body[..split]), FrameStatus::Invalid, "split {split}");
+                assert_eq!(framer.advance(&body), FrameStatus::Ready, "split {split}");
+                assert!(
+                    framer.scanned_work <= body.len() + 6,
+                    "suffix={suffix:?} split={split} work={} input={}",
+                    framer.scanned_work,
+                    body.len()
+                );
+            }
         }
     }
 
