@@ -233,9 +233,14 @@ impl Default for PageMapLimits {
 struct PageMapBuilder<'a> {
     reader: &'a IndexedReader,
     limits: PageMapLimits,
-    active: HashSet<crate::ObjectId>,
     remaining_work: usize,
     consumed_work: usize,
+}
+
+struct PageTreeFrame {
+    kids: std::vec::IntoIter<Object>,
+    inherited: InheritedPageAttributeOwners,
+    depth: usize,
 }
 
 impl PageMap {
@@ -268,7 +273,6 @@ impl PageMap {
         let mut builder = PageMapBuilder {
             reader,
             limits,
-            active: HashSet::new(),
             remaining_work: reader
                 .index
                 .locations
@@ -277,47 +281,53 @@ impl PageMap {
                 .count(),
             consumed_work: 0,
         };
-        builder.walk_node(
-            &mut page_map,
-            pages_id,
-            false,
-            0,
-            InheritedPageAttributeOwners::default(),
-            false,
-        )?;
+        builder.walk_page_tree(&mut page_map, pages_id)?;
         Ok((page_map, builder.consumed_work))
     }
 }
 
 impl PageMapBuilder<'_> {
-    fn walk_node(
-        &mut self, page_map: &mut PageMap, id: crate::ObjectId, check_type: bool, depth: usize,
-        inherited: InheritedPageAttributeOwners, count_work: bool,
-    ) -> IndexResult<()> {
-        if count_work {
+    fn walk_page_tree(&mut self, page_map: &mut PageMap, root_id: crate::ObjectId) -> IndexResult<()> {
+        let Some(root) = self.reader.resolve_dictionary_deref(root_id)? else {
+            return Ok(());
+        };
+        let inherited = InheritedPageAttributeOwners::default().updated(root_id, &root);
+        let Some(kids) = self.reader.resolve_array_value(root.get(b"Kids").ok().cloned())? else {
+            return Ok(());
+        };
+        let mut stack = vec![PageTreeFrame {
+            kids: kids.into_iter(),
+            inherited,
+            depth: 0,
+        }];
+
+        while !stack.is_empty() {
+            let next = stack.last_mut().and_then(|frame| frame.kids.next());
+            let Some(kid) = next else {
+                stack.pop();
+                continue;
+            };
+
             if self.remaining_work == 0 {
-                return Ok(());
+                break;
             }
             self.remaining_work -= 1;
             self.consumed_work += 1;
-        }
-        if depth > self.limits.max_depth || !self.active.insert(id) {
-            return Ok(());
-        }
-        let result = self.walk_active_node(page_map, id, check_type, depth, inherited);
-        self.active.remove(&id);
-        result
-    }
 
-    fn walk_active_node(
-        &mut self, page_map: &mut PageMap, id: crate::ObjectId, check_type: bool, depth: usize,
-        inherited: InheritedPageAttributeOwners,
-    ) -> IndexResult<()> {
-        let Some(dictionary) = self.reader.resolve_dictionary_deref(id)? else {
-            return Ok(());
-        };
-        let inherited = inherited.updated(id, &dictionary);
-        if check_type {
+            let Ok(id) = kid.as_reference() else {
+                continue;
+            };
+            let Some(parent) = stack.last() else {
+                break;
+            };
+            let depth = parent.depth + 1;
+            if depth > self.limits.max_depth {
+                continue;
+            }
+            let Some(dictionary) = self.reader.resolve_dictionary_deref(id)? else {
+                continue;
+            };
+            let inherited = parent.inherited.updated(id, &dictionary);
             match dictionary.get_type() {
                 Ok(b"Page") => {
                     if page_map.pages.len() >= self.limits.max_pages {
@@ -326,19 +336,17 @@ impl PageMapBuilder<'_> {
                         });
                     }
                     page_map.pages.push(PageMapEntry { id, inherited });
-                    return Ok(());
                 }
-                Ok(b"Pages") => {}
-                _ => return Ok(()),
-            }
-        }
-
-        let Some(kids) = self.reader.resolve_array_value(dictionary.get(b"Kids").ok().cloned())? else {
-            return Ok(());
-        };
-        for kid in kids {
-            if let Ok(kid_id) = kid.as_reference() {
-                self.walk_node(page_map, kid_id, true, depth + 1, inherited, true)?;
+                Ok(b"Pages") => {
+                    if let Some(kids) = self.reader.resolve_array_value(dictionary.get(b"Kids").ok().cloned())? {
+                        stack.push(PageTreeFrame {
+                            kids: kids.into_iter(),
+                            inherited,
+                            depth,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -404,6 +412,13 @@ impl IndexedReader {
         match self.resolve(id) {
             Ok(object) => Ok(Some(object)),
             Err(
+                error @ IndexError::ObjectStreamMember {
+                    source:
+                        crate::Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }) | crate::Error::IO(_),
+                    ..
+                },
+            ) => Err(error),
+            Err(
                 IndexError::MissingNormalObject { .. }
                 | IndexError::GenerationMismatch { .. }
                 | IndexError::IndirectObjectMismatch { .. }
@@ -412,7 +427,8 @@ impl IndexedReader {
                 | IndexError::NegativeStreamLength { .. }
                 | IndexError::MissingEndstream { .. }
                 | IndexError::ResolutionCycle { .. }
-                | IndexError::ObjectStreamContainerNotStream { .. },
+                | IndexError::ObjectStreamContainerNotStream { .. }
+                | IndexError::ObjectStreamMember { .. },
             ) => Ok(None),
             Err(error) => Err(error),
         }
@@ -3199,15 +3215,14 @@ mod tests {
             },
         ]);
         let reader = open_reader(&cyclic, ResolverLimits::default());
+        let eager = Document::load_mem(&cyclic).unwrap();
+        let eager_pages: Vec<_> = eager.page_iter().collect();
+        let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
         assert_eq!(
-            PageMap::from_reader(&reader)
-                .unwrap()
-                .pages
-                .iter()
-                .map(|page| page.id)
-                .collect::<Vec<_>>(),
-            vec![(5, 0), (4, 0)]
+            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            eager_pages
         );
+        assert_eq!(work, eager.objects.len());
 
         let depth_limited = PageMap::from_reader_with_limits(
             &reader,
@@ -3219,6 +3234,8 @@ mod tests {
         .unwrap();
         assert!(depth_limited.pages.is_empty());
 
+        let two_pages = generated_page_tree_pdf(2, 1);
+        let reader = open_reader(&two_pages, ResolverLimits::default());
         assert!(matches!(
             PageMap::from_reader_with_limits(
                 &reader,
@@ -3262,6 +3279,98 @@ mod tests {
         assert_eq!(eager_pages.len(), 3);
         assert_eq!(work, eager.objects.len());
         assert!(source.requests.lock().unwrap().len() <= (work + 2) * 4);
+    }
+
+    #[test]
+    fn page_map_work_budget_counts_non_reference_kids_like_eager() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Catalog /Pages 2 0 R >>",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Kids [null 3 0 R 17 (bad)] /Count 1 >>",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+        ]);
+        let eager = Document::load_mem(&pdf).unwrap();
+        let eager_pages: Vec<_> = eager.page_iter().collect();
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
+
+        assert_eq!(
+            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            eager_pages
+        );
+        assert_eq!(eager_pages, vec![(3, 0)]);
+        assert_eq!(work, eager.objects.len());
+    }
+
+    #[test]
+    fn page_map_degrades_semantic_object_stream_members_but_propagates_memory_limits() {
+        let malformed_members = [
+            (10, b"<< /Type /Catalog /Pages 11 0 R >>".as_slice()),
+            (11, b"<< /Type /Pages /Kids [12 0 R]".as_slice()),
+            (12, b"<< /Type /Page >>".as_slice()),
+        ];
+        let (first, malformed_content) = object_stream_content(&malformed_members);
+        let malformed = object_stream_fixture(
+            &format!("/Type /ObjStm /N 3 /First {first}"),
+            &malformed_content,
+            &[(10, 0), (11, 1), (12, 2)],
+        );
+        let eager = Document::load_mem(&malformed.pdf).unwrap();
+        let eager_pages: Vec<_> = eager.page_iter().collect();
+        let reader = open_reader(&malformed.pdf, ResolverLimits::default());
+        let page_map = PageMap::from_reader(&reader).unwrap();
+        assert_eq!(
+            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            eager_pages
+        );
+        assert!(page_map.pages.is_empty());
+
+        let valid_members = [
+            (10, b"<< /Type /Catalog /Pages 11 0 R >>".as_slice()),
+            (11, b"<< /Type /Pages /Kids [12 0 R] /Count 1 >>".as_slice()),
+            (12, b"<< /Type /Page >>".as_slice()),
+        ];
+        let (first, decoded) = object_stream_content(&valid_members);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&decoded).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < decoded.len());
+        let limited = object_stream_fixture(
+            &format!("/Type /ObjStm /N 3 /First {first} /Filter /FlateDecode"),
+            &compressed,
+            &[(10, 0), (11, 1), (12, 2)],
+        );
+        let limit = compressed.len();
+        let reader = open_reader(
+            &limited.pdf,
+            ResolverLimits {
+                max_stream_bytes: u64::try_from(limit).unwrap(),
+                ..ResolverLimits::default()
+            },
+        );
+        assert!(matches!(
+            PageMap::from_reader(&reader),
+            Err(IndexError::ObjectStreamMember {
+                source: crate::Error::Decompress(crate::DecompressError::MemoryLimitExceeded {
+                    limit: actual
+                }),
+                ..
+            }) if actual == limit
+        ));
     }
 
     #[test]
