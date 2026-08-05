@@ -27,6 +27,19 @@ use crate::parser;
 use crate::xref::{Xref, XrefEntry};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
+type ObjectStreamBatch = (u32, BTreeMap<ObjectId, Object>);
+
+/// Merge eagerly parsed object-stream members in the same order as the serial
+/// outer xref walk, independently of worker completion order.
+fn merge_object_stream_batches(objects: &mut BTreeMap<ObjectId, Object>, mut batches: Vec<ObjectStreamBatch>) {
+    batches.sort_by_key(|(xref_key, _)| *xref_key);
+    for (_, batch) in batches {
+        for (id, object) in batch {
+            objects.entry(id).or_insert(object);
+        }
+    }
+}
+
 #[cfg(not(feature = "async"))]
 impl Document {
     /// Load a PDF document from a specified file path.
@@ -969,7 +982,7 @@ impl Reader<'_> {
             })
             .collect();
 
-        let entries_filter_map = |(_, entry): (&_, &_)| {
+        let entries_filter_map = |(xref_key, entry): (&_, &_)| {
             if let XrefEntry::Normal { offset, .. } = *entry {
                 // read_object now handles decryption internally
                 let result = self.read_object(offset as usize, None, &mut HashSet::new());
@@ -994,8 +1007,7 @@ impl Reader<'_> {
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
                         let obj_stream = ObjectStream::new_with_limit(stream, self.max_decompressed_size).ok()?;
                         let container_id = object_id.0;
-                        let mut object_streams = object_streams.lock().unwrap();
-                        if let Some(filter_func) = filter_func {
+                        let objects = if let Some(filter_func) = filter_func {
                             let objects: BTreeMap<(u32, u16), Object> = obj_stream
                                 .objects
                                 .into_iter()
@@ -1006,13 +1018,20 @@ impl Reader<'_> {
                                 })
                                 .filter_map(|(object_id, mut object)| filter_func(object_id, &mut object))
                                 .collect();
-                            object_streams.extend(objects);
+                            objects
                         } else {
-                            object_streams.extend(obj_stream.objects.into_iter().filter(|((obj_num, _), _)| {
-                                compressed_obj_containers
-                                    .get(obj_num)
-                                    .is_none_or(|&c| c == container_id)
-                            }));
+                            obj_stream
+                                .objects
+                                .into_iter()
+                                .filter(|((obj_num, _), _)| {
+                                    compressed_obj_containers
+                                        .get(obj_num)
+                                        .is_none_or(|&c| c == container_id)
+                                })
+                                .collect()
+                        };
+                        if !objects.is_empty() {
+                            object_streams.lock().unwrap().push((*xref_key, objects));
                         }
                     } else if stream.content.is_empty() {
                         let mut zero_length_streams = zero_length_streams.lock().unwrap();
@@ -1047,10 +1066,10 @@ impl Reader<'_> {
                 .collect();
         }
 
-        // Only add entries, but never replace entries
-        for (id, entry) in object_streams.into_inner().unwrap() {
-            self.document.objects.entry(id).or_insert(entry);
-        }
+        // Direct/normal objects already in the map always win. Among duplicate
+        // unindexed ObjStm members, preserve the serial BTreeMap xref traversal
+        // rather than whichever parallel worker happened to finish first.
+        merge_object_stream_batches(&mut self.document.objects, object_streams.into_inner().unwrap());
 
         for object_id in zero_length_streams.into_inner().unwrap() {
             let _ = self.read_stream_content(object_id);
@@ -1496,4 +1515,27 @@ fn get_xref_start_ignores_startxref_past_eof() {
     assert_eq!(result, xref_offset);
     // Verify it did NOT pick up 999 from the corrupted revision
     assert_ne!(result, 999);
+}
+
+#[test]
+fn object_stream_batch_merge_is_independent_of_completion_order_and_preserves_direct_objects() {
+    fn batch(value: &'static [u8], direct_collision: bool) -> BTreeMap<ObjectId, Object> {
+        let mut objects = BTreeMap::from([((5, 0), Object::Name(value.to_vec()))]);
+        if direct_collision {
+            objects.insert((9, 0), Object::Name(b"compressed".to_vec()));
+        }
+        objects
+    }
+
+    let merge = |batches| {
+        let mut objects = BTreeMap::from([((9, 0), Object::Name(b"direct".to_vec()))]);
+        merge_object_stream_batches(&mut objects, batches);
+        objects
+    };
+    let completion_order = merge(vec![(40, batch(b"later", true)), (10, batch(b"earlier", false))]);
+    let xref_order = merge(vec![(10, batch(b"earlier", false)), (40, batch(b"later", true))]);
+
+    assert_eq!(completion_order, xref_order);
+    assert_eq!(completion_order.get(&(5, 0)), Some(&Object::Name(b"earlier".to_vec())));
+    assert_eq!(completion_order.get(&(9, 0)), Some(&Object::Name(b"direct".to_vec())));
 }
