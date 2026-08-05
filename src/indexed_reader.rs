@@ -234,6 +234,8 @@ struct PageMapBuilder<'a> {
     reader: &'a IndexedReader,
     limits: PageMapLimits,
     active: HashSet<crate::ObjectId>,
+    remaining_work: usize,
+    consumed_work: usize,
 }
 
 impl PageMap {
@@ -242,6 +244,10 @@ impl PageMap {
     }
 
     fn from_reader_with_limits(reader: &IndexedReader, limits: PageMapLimits) -> IndexResult<Self> {
+        Self::from_reader_with_limits_and_work(reader, limits).map(|(page_map, _)| page_map)
+    }
+
+    fn from_reader_with_limits_and_work(reader: &IndexedReader, limits: PageMapLimits) -> IndexResult<(Self, usize)> {
         let Some(root_id) = reader
             .index
             .trailer
@@ -249,13 +255,13 @@ impl PageMap {
             .ok()
             .and_then(|root| root.as_reference().ok())
         else {
-            return Ok(Self::default());
+            return Ok((Self::default(), 0));
         };
-        let Some(catalog) = reader.resolve_dictionary_deref(root_id) else {
-            return Ok(Self::default());
+        let Some(catalog) = reader.resolve_dictionary_deref(root_id)? else {
+            return Ok((Self::default(), 0));
         };
         let Some(pages_id) = catalog.get(b"Pages").ok().and_then(|pages| pages.as_reference().ok()) else {
-            return Ok(Self::default());
+            return Ok((Self::default(), 0));
         };
 
         let mut page_map = Self::default();
@@ -263,6 +269,13 @@ impl PageMap {
             reader,
             limits,
             active: HashSet::new(),
+            remaining_work: reader
+                .index
+                .locations
+                .values()
+                .filter(|location| !matches!(location, ObjectLocation64::Free { .. }))
+                .count(),
+            consumed_work: 0,
         };
         builder.walk_node(
             &mut page_map,
@@ -270,16 +283,24 @@ impl PageMap {
             false,
             0,
             InheritedPageAttributeOwners::default(),
+            false,
         )?;
-        Ok(page_map)
+        Ok((page_map, builder.consumed_work))
     }
 }
 
 impl PageMapBuilder<'_> {
     fn walk_node(
         &mut self, page_map: &mut PageMap, id: crate::ObjectId, check_type: bool, depth: usize,
-        inherited: InheritedPageAttributeOwners,
+        inherited: InheritedPageAttributeOwners, count_work: bool,
     ) -> IndexResult<()> {
+        if count_work {
+            if self.remaining_work == 0 {
+                return Ok(());
+            }
+            self.remaining_work -= 1;
+            self.consumed_work += 1;
+        }
         if depth > self.limits.max_depth || !self.active.insert(id) {
             return Ok(());
         }
@@ -292,7 +313,7 @@ impl PageMapBuilder<'_> {
         &mut self, page_map: &mut PageMap, id: crate::ObjectId, check_type: bool, depth: usize,
         inherited: InheritedPageAttributeOwners,
     ) -> IndexResult<()> {
-        let Some(dictionary) = self.reader.resolve_dictionary_deref(id) else {
+        let Some(dictionary) = self.reader.resolve_dictionary_deref(id)? else {
             return Ok(());
         };
         let inherited = inherited.updated(id, &dictionary);
@@ -312,12 +333,12 @@ impl PageMapBuilder<'_> {
             }
         }
 
-        let Some(kids) = self.reader.resolve_array_value(dictionary.get(b"Kids").ok().cloned()) else {
+        let Some(kids) = self.reader.resolve_array_value(dictionary.get(b"Kids").ok().cloned())? else {
             return Ok(());
         };
         for kid in kids {
             if let Ok(kid_id) = kid.as_reference() {
-                self.walk_node(page_map, kid_id, true, depth + 1, inherited)?;
+                self.walk_node(page_map, kid_id, true, depth + 1, inherited, true)?;
             }
         }
         Ok(())
@@ -343,31 +364,58 @@ impl IndexedReader {
         self.resolve_inner(id, &mut state)
     }
 
-    fn resolve_dictionary_deref(&self, id: crate::ObjectId) -> Option<Dictionary> {
-        match self.resolve_deref_value(self.resolve(id).ok()?)? {
-            Object::Dictionary(dictionary) => Some(dictionary),
+    fn resolve_dictionary_deref(&self, id: crate::ObjectId) -> IndexResult<Option<Dictionary>> {
+        let Some(object) = self.resolve_page_tree_object(id)? else {
+            return Ok(None);
+        };
+        Ok(match self.resolve_deref_value(object)? {
+            Some(Object::Dictionary(dictionary)) => Some(dictionary),
             _ => None,
-        }
+        })
     }
 
-    fn resolve_array_value(&self, value: Option<Object>) -> Option<Vec<Object>> {
-        match self.resolve_deref_value(value?)? {
-            Object::Array(array) => Some(array),
+    fn resolve_array_value(&self, value: Option<Object>) -> IndexResult<Option<Vec<Object>>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        Ok(match self.resolve_deref_value(value)? {
+            Some(Object::Array(array)) => Some(array),
             _ => None,
-        }
+        })
     }
 
-    fn resolve_deref_value(&self, mut object: Object) -> Option<Object> {
+    fn resolve_deref_value(&self, mut object: Object) -> IndexResult<Option<Object>> {
         let mut seen = HashSet::new();
         let mut dereferences = 0;
         while let Object::Reference(id) = object {
             if dereferences >= PAGE_TREE_DEREFERENCE_LIMIT || !seen.insert(id) {
-                return None;
+                return Ok(None);
             }
-            object = self.resolve(id).ok()?;
+            let Some(resolved) = self.resolve_page_tree_object(id)? else {
+                return Ok(None);
+            };
+            object = resolved;
             dereferences += 1;
         }
-        Some(object)
+        Ok(Some(object))
+    }
+
+    fn resolve_page_tree_object(&self, id: crate::ObjectId) -> IndexResult<Option<Object>> {
+        match self.resolve(id) {
+            Ok(object) => Ok(Some(object)),
+            Err(
+                IndexError::MissingNormalObject { .. }
+                | IndexError::GenerationMismatch { .. }
+                | IndexError::IndirectObjectMismatch { .. }
+                | IndexError::InvalidIndirectObject { .. }
+                | IndexError::IncompleteObject { .. }
+                | IndexError::NegativeStreamLength { .. }
+                | IndexError::MissingEndstream { .. }
+                | IndexError::ResolutionCycle { .. }
+                | IndexError::ObjectStreamContainerNotStream { .. },
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn resolve_inner(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
@@ -2341,6 +2389,7 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use std::io::Write;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     type ClassicEntry = (u64, u16, bool);
     type ClassicSection = (u32, Vec<ClassicEntry>);
@@ -2759,6 +2808,35 @@ mod tests {
         pdf
     }
 
+    fn repeated_page_dag_pdf(levels: u32) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        for level in 0..levels {
+            let id = level + 2;
+            let child = (id + 1, 0);
+            document.objects.insert(
+                (id, 0),
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![Object::Reference(child), Object::Reference(child)],
+                    "Count" => 1_i64 << levels.min(30),
+                }),
+            );
+        }
+        let leaf = (levels + 2, 0);
+        document
+            .objects
+            .insert(leaf, Object::Dictionary(dictionary! { "Type" => "Page" }));
+        document.max_id = leaf.0;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
     fn open_encrypted(pdf: &[u8], password: Option<&[u8]>) -> IndexResult<IndexedReader> {
         IndexedReader::open_with_password(
             Arc::new(BytesSource::from(pdf.to_vec())),
@@ -3162,6 +3240,28 @@ mod tests {
         let over_limit = generated_deep_page_tree_pdf(DEFAULT_PAGE_TREE_DEPTH_LIMIT + 1);
         let reader = open_reader(&over_limit, ResolverLimits::default());
         assert!(PageMap::from_reader(&reader).unwrap().pages.is_empty());
+    }
+
+    #[test]
+    fn repeated_page_dag_uses_eager_global_work_budget() {
+        let pdf = repeated_page_dag_pdf(15);
+        let eager = Document::load_mem(&pdf).unwrap();
+        let eager_pages: Vec<_> = eager.page_iter().collect();
+        let source = Arc::new(TracingBytesSource {
+            bytes: pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+
+        let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
+        assert_eq!(
+            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            eager_pages
+        );
+        assert_eq!(eager_pages.len(), 3);
+        assert_eq!(work, eager.objects.len());
+        assert!(source.requests.lock().unwrap().len() <= (work + 2) * 4);
     }
 
     #[test]
@@ -4041,6 +4141,33 @@ mod tests {
         requests: Mutex<Vec<(u64, usize)>>,
     }
 
+    struct SwitchableFailureSource {
+        bytes: Vec<u8>,
+        mode: AtomicU8,
+    }
+
+    impl RandomAccessSource for SwitchableFailureSource {
+        fn len(&self) -> Result<u64, SourceError> {
+            Ok(u64::try_from(self.bytes.len()).unwrap())
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<usize, SourceError> {
+            match self.mode.load(Ordering::SeqCst) {
+                1 => {
+                    return Err(SourceError::Io(std::io::Error::other(
+                        "injected positional read failure",
+                    )));
+                }
+                2 => return Ok(0),
+                _ => {}
+            }
+            let offset = usize::try_from(offset).unwrap();
+            let read = output.len().min(self.bytes.len().saturating_sub(offset));
+            output[..read].copy_from_slice(&self.bytes[offset..offset + read]);
+            Ok(read)
+        }
+    }
+
     impl RandomAccessSource for TracingBytesSource {
         fn len(&self) -> Result<u64, SourceError> {
             Ok(u64::try_from(self.bytes.len()).unwrap())
@@ -4060,6 +4187,32 @@ mod tests {
             output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
             Ok(length)
         }
+    }
+
+    #[test]
+    fn page_map_propagates_source_and_resource_failures() {
+        for mode in [1, 2] {
+            let source = Arc::new(SwitchableFailureSource {
+                bytes: classic_pdf(),
+                mode: AtomicU8::new(0),
+            });
+            let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+            source.mode.store(mode, Ordering::SeqCst);
+            assert!(matches!(PageMap::from_reader(&reader), Err(IndexError::Source(_))));
+        }
+
+        let reader = IndexedReader::open(
+            Arc::new(BytesSource::from(classic_pdf())),
+            ResolverLimits {
+                max_object_bytes: 8,
+                ..ResolverLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            PageMap::from_reader(&reader),
+            Err(IndexError::ObjectLimitExceeded { limit: 8, .. })
+        ));
     }
 
     #[test]
