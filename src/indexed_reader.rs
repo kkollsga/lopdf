@@ -30,6 +30,8 @@ pub(crate) enum IndexError {
     InvalidStartXref { limit: u64 },
     #[error("invalid cross-reference structure at offset {offset}")]
     InvalidXref { offset: u64 },
+    #[error("incomplete cross-reference structure at offset {offset}")]
+    IncompleteXref { offset: u64 },
     #[error("invalid trailer at offset {offset}")]
     InvalidTrailer { offset: u64 },
     #[error("{structure} exceeds its {limit}-byte bounded parser window")]
@@ -215,15 +217,18 @@ fn read_xref_section(
         };
         match result {
             Ok(section) => return Ok(section),
-            Err(error) if length < maximum && is_incomplete_xref_error(&error) => {
+            Err(IndexError::IncompleteXref { .. }) if length < maximum => {
                 length = length.saturating_mul(2).min(maximum);
             }
-            Err(IndexError::InvalidXref { .. } | IndexError::InvalidTrailer { .. })
-                if remaining > XREF_WINDOW_LIMIT =>
-            {
+            Err(IndexError::IncompleteXref { .. }) if remaining > XREF_WINDOW_LIMIT => {
                 return Err(IndexError::StructureLimitExceeded {
                     structure: "cross-reference section",
                     limit: XREF_WINDOW_LIMIT,
+                });
+            }
+            Err(IndexError::IncompleteXref { .. }) => {
+                return Err(IndexError::InvalidXref {
+                    offset: physical_offset,
                 });
             }
             Err(error) => return Err(error),
@@ -231,28 +236,28 @@ fn read_xref_section(
     }
 }
 
-fn is_incomplete_xref_error(error: &IndexError) -> bool {
-    matches!(
-        error,
-        IndexError::InvalidXref { .. } | IndexError::InvalidTrailer { .. } | IndexError::StructureLimitExceeded { .. }
-    )
-}
-
 fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> {
     let mut cursor = TokenCursor::new(window);
-    cursor.expect(b"xref").ok_or(IndexError::InvalidXref { offset })?;
+    required_xref_token(&mut cursor, b"xref", offset)?;
     let mut entries = BTreeMap::new();
     let mut entry_count = 0_u64;
 
     loop {
+        cursor.skip_space();
+        if cursor.remaining().is_empty()
+            || (cursor.remaining().len() < b"trailer".len() && b"trailer".starts_with(cursor.remaining()))
+        {
+            return Err(IndexError::IncompleteXref { offset });
+        }
         if cursor.consume(b"trailer") {
-            let trailer = cursor
-                .direct_object()
-                .and_then(|object| match object {
-                    Object::Dictionary(dictionary) => Some(dictionary),
-                    _ => None,
-                })
-                .ok_or(IndexError::InvalidTrailer { offset })?;
+            let trailer = match cursor.direct_object() {
+                Some(Object::Dictionary(dictionary)) => dictionary,
+                Some(_) => return Err(IndexError::InvalidTrailer { offset }),
+                None if dictionary_may_be_truncated(cursor.remaining()) => {
+                    return Err(IndexError::IncompleteXref { offset });
+                }
+                None => return Err(IndexError::InvalidTrailer { offset }),
+            };
             return Ok(XrefSection64 {
                 kind: IndexXrefType::Table,
                 entries,
@@ -260,8 +265,8 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> 
             });
         }
 
-        let start = cursor.unsigned().ok_or(IndexError::InvalidXref { offset })?;
-        let count = cursor.unsigned().ok_or(IndexError::InvalidXref { offset })?;
+        let start = required_xref_unsigned(&mut cursor, offset)?;
+        let count = required_xref_unsigned(&mut cursor, offset)?;
         entry_count = entry_count.checked_add(count).ok_or(IndexError::EntryLimitExceeded {
             count: u64::MAX,
             limit: MAX_XREF_ENTRIES,
@@ -271,9 +276,13 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> 
         for index in 0..count {
             let object_number = start.checked_add(index).ok_or(IndexError::InvalidXref { offset })?;
             let object_number = u32::try_from(object_number).map_err(|_| IndexError::InvalidXref { offset })?;
-            let field = cursor.unsigned().ok_or(IndexError::InvalidXref { offset })?;
-            let generation = cursor.unsigned().ok_or(IndexError::InvalidXref { offset })?;
+            let field = required_xref_unsigned(&mut cursor, offset)?;
+            let generation = required_xref_unsigned(&mut cursor, offset)?;
             let generation = u16::try_from(generation).map_err(|_| IndexError::InvalidXref { offset })?;
+            cursor.skip_space();
+            if cursor.remaining().is_empty() {
+                return Err(IndexError::IncompleteXref { offset });
+            }
             let state = cursor.token().ok_or(IndexError::InvalidXref { offset })?;
             let location = match state {
                 b"n" => ObjectLocation64::Normal {
@@ -293,18 +302,25 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> 
 
 fn parse_xref_stream(window: &[u8], offset: u64) -> IndexResult<XrefSection64> {
     let mut cursor = TokenCursor::new(window);
-    cursor.unsigned().ok_or(IndexError::InvalidXref { offset })?;
-    cursor.unsigned().ok_or(IndexError::InvalidXref { offset })?;
-    cursor.expect(b"obj").ok_or(IndexError::InvalidXref { offset })?;
-    let dictionary = cursor
-        .direct_object()
-        .and_then(|object| match object {
-            Object::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        })
-        .ok_or(IndexError::InvalidTrailer { offset })?;
-    cursor.expect(b"stream").ok_or(IndexError::InvalidXref { offset })?;
-    cursor.consume_stream_eol().ok_or(IndexError::InvalidXref { offset })?;
+    required_xref_unsigned(&mut cursor, offset)?;
+    required_xref_unsigned(&mut cursor, offset)?;
+    required_xref_token(&mut cursor, b"obj", offset)?;
+    let dictionary = match cursor.direct_object() {
+        Some(Object::Dictionary(dictionary)) => dictionary,
+        Some(_) => return Err(IndexError::InvalidTrailer { offset }),
+        None if dictionary_may_be_truncated(cursor.remaining()) => {
+            return Err(IndexError::IncompleteXref { offset });
+        }
+        None => return Err(IndexError::InvalidTrailer { offset }),
+    };
+    required_xref_token(&mut cursor, b"stream", offset)?;
+    if cursor.consume_stream_eol().is_none() {
+        return if cursor.remaining().is_empty() {
+            Err(IndexError::IncompleteXref { offset })
+        } else {
+            Err(IndexError::InvalidXref { offset })
+        };
+    }
 
     let stream_len = trailer_unsigned(&dictionary, b"Length").ok_or(IndexError::InvalidTrailer { offset })?;
     let stream_len = usize::try_from(stream_len).map_err(|_| IndexError::StructureLimitExceeded {
@@ -312,18 +328,22 @@ fn parse_xref_stream(window: &[u8], offset: u64) -> IndexResult<XrefSection64> {
         limit: XREF_WINDOW_LIMIT,
     })?;
     if stream_len > cursor.remaining().len() {
-        return Err(IndexError::StructureLimitExceeded {
-            structure: "cross-reference stream",
-            limit: XREF_WINDOW_LIMIT,
-        });
+        return Err(IndexError::IncompleteXref { offset });
     }
     let content = cursor
         .take(stream_len)
-        .ok_or(IndexError::InvalidXref { offset })?
+        .ok_or(IndexError::IncompleteXref { offset })?
         .to_vec();
     cursor.consume_optional_eol();
-    cursor.expect(b"endstream").ok_or(IndexError::InvalidXref { offset })?;
-    cursor.expect(b"endobj").ok_or(IndexError::InvalidXref { offset })?;
+    if !cursor.consume_exact(b"endstream") {
+        return if cursor.remaining().is_empty()
+            || (cursor.remaining().len() < b"endstream".len() && b"endstream".starts_with(cursor.remaining()))
+        {
+            Err(IndexError::IncompleteXref { offset })
+        } else {
+            Err(IndexError::InvalidXref { offset })
+        };
+    }
     let mut stream = Stream::new(dictionary.clone(), content);
     if stream.is_compressed() {
         stream
@@ -459,6 +479,111 @@ fn trailer_offset(dictionary: &Dictionary, key: &[u8], name: &'static str) -> In
     }
 }
 
+fn required_xref_token(cursor: &mut TokenCursor<'_>, expected: &[u8], offset: u64) -> IndexResult<()> {
+    cursor.skip_space();
+    if cursor.remaining().is_empty()
+        || (cursor.remaining().len() < expected.len() && expected.starts_with(cursor.remaining()))
+    {
+        return Err(IndexError::IncompleteXref { offset });
+    }
+    cursor.expect(expected).ok_or(IndexError::InvalidXref { offset })
+}
+
+fn required_xref_unsigned(cursor: &mut TokenCursor<'_>, offset: u64) -> IndexResult<u64> {
+    cursor.skip_space();
+    if cursor.remaining().is_empty() {
+        return Err(IndexError::IncompleteXref { offset });
+    }
+    let token = cursor.token().ok_or(IndexError::InvalidXref { offset })?;
+    if !token.iter().all(u8::is_ascii_digit) {
+        return Err(IndexError::InvalidXref { offset });
+    }
+    std::str::from_utf8(token)
+        .ok()
+        .and_then(|token| token.parse().ok())
+        .ok_or(IndexError::InvalidXref { offset })
+}
+
+fn dictionary_may_be_truncated(input: &[u8]) -> bool {
+    if input.is_empty() || (input.len() < 2 && b"<<".starts_with(input)) {
+        return true;
+    }
+    if !input.starts_with(b"<<") {
+        return false;
+    }
+
+    let mut depth = 0_usize;
+    let mut position = 0_usize;
+    while position < input.len() {
+        match input[position] {
+            b'%' => {
+                position += 1;
+                while position < input.len() && !matches!(input[position], b'\r' | b'\n') {
+                    position += 1;
+                }
+            }
+            b'(' => {
+                let Some(end) = literal_string_end(input, position) else {
+                    return true;
+                };
+                position = end;
+            }
+            b'<' if input.get(position + 1) == Some(&b'<') => {
+                depth += 1;
+                position += 2;
+            }
+            b'<' => {
+                let Some(end) = input[position + 1..].iter().position(|byte| *byte == b'>') else {
+                    return true;
+                };
+                position += end + 2;
+            }
+            b'>' if input.get(position + 1) == Some(&b'>') => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+                position += 2;
+                if depth == 0 {
+                    return false;
+                }
+            }
+            _ => position += 1,
+        }
+    }
+    depth != 0
+}
+
+fn literal_string_end(input: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut position = start + 1;
+    while position < input.len() {
+        match input[position] {
+            b'\\' => {
+                position += 1;
+                if input.get(position) == Some(&b'\r') && input.get(position + 1) == Some(&b'\n') {
+                    position += 2;
+                } else if position < input.len() {
+                    position += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                position += 1;
+            }
+            b')' => {
+                depth -= 1;
+                position += 1;
+                if depth == 0 {
+                    return Some(position);
+                }
+            }
+            _ => position += 1,
+        }
+    }
+    None
+}
+
 fn starts_with_token(input: &[u8], token: &[u8]) -> bool {
     let mut cursor = TokenCursor::new(input);
     cursor.consume(token)
@@ -563,6 +688,15 @@ impl<'a> TokenCursor<'a> {
             self.remaining = &self.remaining[2..];
         } else if self.remaining.starts_with(b"\n") || self.remaining.starts_with(b"\r") {
             self.remaining = &self.remaining[1..];
+        }
+    }
+
+    fn consume_exact(&mut self, expected: &[u8]) -> bool {
+        if self.remaining.starts_with(expected) {
+            self.remaining = &self.remaining[expected.len()..];
+            true
+        } else {
+            false
         }
     }
 
@@ -1179,6 +1313,46 @@ mod tests {
         assert_eq!(requests.iter().filter(|(offset, _)| *offset == second).count(), 1);
     }
 
+    #[test]
+    fn semantic_xref_stream_error_stops_after_initial_window() {
+        let len = 100_u64 * 1_024 * 1_024;
+        let xref = 1_024_u64 * 1_024;
+        let xref_bytes =
+            b"1 0 obj\n<< /Type /XRef /Size 0 /Index [0 0] /W [1 9 1] /Length 0 >>\nstream\n\nendstream\nendobj\n"
+                .to_vec();
+        let eof_offset = len - 128;
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![
+                (0, b"%PDF-1.7\n".to_vec()),
+                (xref, xref_bytes),
+                (eof_offset, format!("startxref\n{xref}\n%%EOF\n").into_bytes()),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+
+        assert!(matches!(
+            PdfIndex::open(source.clone()),
+            Err(IndexError::InvalidXref { .. })
+        ));
+        let requests = source.requests.lock().unwrap();
+        let lengths: Vec<_> = requests
+            .iter()
+            .filter_map(|(offset, length)| (*offset == xref).then_some(*length))
+            .collect();
+        assert_eq!(lengths, vec![usize::try_from(XREF_INITIAL_WINDOW).unwrap()]);
+    }
+
+    #[test]
+    fn incomplete_dictionary_probe_tracks_nesting_and_pdf_strings() {
+        assert!(dictionary_may_be_truncated(b"<< /Nested << /Value 1 >>"));
+        assert!(!dictionary_may_be_truncated(b"<< /Nested << /Value 1 >> >>"));
+        assert!(dictionary_may_be_truncated(b"<< /Text (a >> nested \\) value)"));
+        assert!(!dictionary_may_be_truncated(
+            b"<< /Text (a >> nested \\) value) /Hex <3e3e> >>"
+        ));
+    }
+
     fn corrupt_marker(mut pdf: Vec<u8>, marker: &[u8]) -> Vec<u8> {
         let position = rfind(&pdf, marker).unwrap();
         pdf[position..position + marker.len()].fill(b'x');
@@ -1186,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn xref_stream_requires_endstream_and_endobj_terminators() {
+    fn xref_stream_framing_matches_eager_reader() {
         let valid = xref_stream_pdf(true);
         assert!(Document::load_mem(&valid).is_ok());
         assert!(PdfIndex::open(Arc::new(BytesSource::from(valid.clone()))).is_ok());
@@ -1198,10 +1372,30 @@ mod tests {
             Err(IndexError::InvalidXref { .. })
         ));
 
-        let missing_endobj = corrupt_marker(valid, b"endobj");
-        assert!(matches!(
-            PdfIndex::open(Arc::new(BytesSource::from(missing_endobj))),
-            Err(IndexError::InvalidXref { .. })
-        ));
+        let mut missing_endobj = valid.clone();
+        let marker = rfind(&missing_endobj, b"endobj").unwrap();
+        missing_endobj.drain(marker..marker + b"endobj".len());
+        assert!(Document::load_mem(&missing_endobj).is_ok());
+        assert!(PdfIndex::open(Arc::new(BytesSource::from(missing_endobj))).is_ok());
+
+        for replacement in [b"".as_slice(), b"\r\n"] {
+            let mut accepted = valid.clone();
+            let marker = rfind(&accepted, b"endstream").unwrap();
+            assert_eq!(accepted[marker - 1], b'\n');
+            accepted.splice(marker - 1..marker, replacement.iter().copied());
+            assert!(Document::load_mem(&accepted).is_ok());
+            assert!(PdfIndex::open(Arc::new(BytesSource::from(accepted))).is_ok());
+        }
+
+        for replacement in [b" \n".as_slice(), b"\n% gap\n"] {
+            let mut rejected = valid.clone();
+            let marker = rfind(&rejected, b"endstream").unwrap();
+            rejected.splice(marker - 1..marker, replacement.iter().copied());
+            assert!(Document::load_mem(&rejected).is_err());
+            assert!(matches!(
+                PdfIndex::open(Arc::new(BytesSource::from(rejected))),
+                Err(IndexError::InvalidXref { .. })
+            ));
+        }
     }
 }
