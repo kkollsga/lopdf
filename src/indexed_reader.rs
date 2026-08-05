@@ -40,6 +40,9 @@ const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
 /// Result returned by the indexed random-access reader.
 pub type IndexedReaderResult<T> = std::result::Result<T, IndexedReaderError>;
 
+/// Shareable result returned by batched and shared object resolution.
+pub type SharedIndexedReaderResult<T> = std::result::Result<T, Arc<IndexedReaderError>>;
+
 #[cfg(test)]
 thread_local! {
     static OBJECT_BODY_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
@@ -112,6 +115,12 @@ pub enum IndexedReaderError {
         id: crate::ObjectId,
         container: crate::ObjectId,
         index: u32,
+        #[source]
+        source: crate::Error,
+    },
+    #[error("failed to prepare object-stream container {container:?} for batched resolution")]
+    ObjectStreamBatchSetup {
+        container: crate::ObjectId,
         #[source]
         source: crate::Error,
     },
@@ -609,13 +618,14 @@ impl IndexedReader {
 
     /// Resolve one full object id into an owned value.
     pub fn resolve_object(&self, id: crate::ObjectId) -> IndexedReaderResult<Object> {
-        self.resolve_object_shared(id).map(|object| (*object).clone())
+        let mut state = ResolutionState::default();
+        self.resolve_inner(id, &mut state)
     }
 
     /// Resolve one full object id into a shareable owned value.
-    pub fn resolve_object_shared(&self, id: crate::ObjectId) -> IndexedReaderResult<Arc<Object>> {
+    pub fn resolve_object_shared(&self, id: crate::ObjectId) -> SharedIndexedReaderResult<Arc<Object>> {
         let mut state = ResolutionState::default();
-        self.resolve_inner(id, &mut state).map(Arc::new)
+        self.resolve_inner(id, &mut state).map(Arc::new).map_err(Arc::new)
     }
 
     /// Resolve each unique requested id into a shareable owned value.
@@ -627,7 +637,7 @@ impl IndexedReader {
     /// resolved, decoded and header-indexed once for this call.
     pub fn resolve_many_shared(
         &self, ids: &[crate::ObjectId],
-    ) -> Vec<(crate::ObjectId, IndexedReaderResult<Arc<Object>>)> {
+    ) -> Vec<(crate::ObjectId, SharedIndexedReaderResult<Arc<Object>>)> {
         let mut seen = HashSet::with_capacity(ids.len());
         let unique: Vec<_> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
         let mut normal = Vec::new();
@@ -657,7 +667,7 @@ impl IndexedReader {
             .map(|(position, id)| (position, self.resolve_object_shared(id)))
             .collect();
 
-        let mut results: Vec<Option<IndexedReaderResult<Arc<Object>>>> =
+        let mut results: Vec<Option<SharedIndexedReaderResult<Arc<Object>>>> =
             std::iter::repeat_with(|| None).take(unique.len()).collect();
         for (position, result) in normal_results {
             results[position] = Some(result);
@@ -828,7 +838,7 @@ impl IndexedReader {
 
     fn resolve_compressed_group(
         &self, container_number: u32, requests: &[CompressedBatchRequest],
-    ) -> Vec<(usize, IndexedReaderResult<Arc<Object>>)> {
+    ) -> Vec<(usize, SharedIndexedReaderResult<Arc<Object>>)> {
         // Very small depth limits make the active root id observable. Preserve
         // exact scalar behavior rather than sharing container setup there.
         if self.limits.max_length_depth < 2 {
@@ -847,10 +857,10 @@ impl IndexedReader {
                 } else {
                     results.push((
                         request.position,
-                        Err(IndexedReaderError::GenerationMismatch {
+                        Err(Arc::new(IndexedReaderError::GenerationMismatch {
                             id: request.id,
                             indexed: 0,
-                        }),
+                        })),
                     ));
                     false
                 }
@@ -869,14 +879,12 @@ impl IndexedReader {
         };
         let object = match self.resolve_normal(container, &mut state) {
             Ok(object) => object,
-            Err(_) => {
-                // IndexedReaderError is intentionally not Clone. On malformed
-                // shared setup, rerun scalar resolution so every requested id
-                // owns the exact error it would have received independently.
+            Err(error) => {
+                let error = Arc::new(error);
                 results.extend(
                     valid
                         .into_iter()
-                        .map(|request| (request.position, self.resolve_object_shared(request.id))),
+                        .map(|request| (request.position, Err(Arc::clone(&error)))),
                 );
                 return results;
             }
@@ -885,10 +893,10 @@ impl IndexedReader {
             results.extend(valid.into_iter().map(|request| {
                 (
                     request.position,
-                    Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                    Err(Arc::new(IndexedReaderError::ObjectStreamContainerNotStream {
                         id: request.id,
                         container,
-                    }),
+                    })),
                 )
             }));
             return results;
@@ -896,11 +904,12 @@ impl IndexedReader {
         let limit = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
         let selected = match ObjectStream::selected_members_with_limit(&stream, Some(limit)) {
             Ok(selected) => selected,
-            Err(_) => {
+            Err(source) => {
+                let error = Arc::new(IndexedReaderError::ObjectStreamBatchSetup { container, source });
                 results.extend(
                     valid
                         .into_iter()
-                        .map(|request| (request.position, self.resolve_object_shared(request.id))),
+                        .map(|request| (request.position, Err(Arc::clone(&error)))),
                 );
                 return results;
             }
@@ -913,11 +922,13 @@ impl IndexedReader {
                 let result = selected
                     .parse_member(request.id, request.index)
                     .map(Arc::new)
-                    .map_err(|source| IndexedReaderError::ObjectStreamMember {
-                        id: request.id,
-                        container,
-                        index: request.index,
-                        source,
+                    .map_err(|source| {
+                        Arc::new(IndexedReaderError::ObjectStreamMember {
+                            id: request.id,
+                            container,
+                            index: request.index,
+                            source,
+                        })
                     });
                 (request.position, result)
             })
@@ -929,11 +940,13 @@ impl IndexedReader {
                 let result = selected
                     .parse_member(request.id, request.index)
                     .map(Arc::new)
-                    .map_err(|source| IndexedReaderError::ObjectStreamMember {
-                        id: request.id,
-                        container,
-                        index: request.index,
-                        source,
+                    .map_err(|source| {
+                        Arc::new(IndexedReaderError::ObjectStreamMember {
+                            id: request.id,
+                            container,
+                            index: request.index,
+                            source,
+                        })
                     });
                 (request.position, result)
             })
@@ -2888,7 +2901,7 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use std::io::Write;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     type ClassicEntry = (u64, u16, bool);
     type ClassicSection = (u32, Vec<ClassicEntry>);
@@ -4349,13 +4362,13 @@ mod tests {
         );
         assert_eq!(resolved[0].1.as_ref().unwrap().as_array().unwrap().len(), 2);
         assert!(matches!(
-            resolved[1].1,
-            Err(IndexedReaderError::MissingNormalObject { id: (99, 0) })
+            resolved[1].1.as_ref().unwrap_err().as_ref(),
+            IndexedReaderError::MissingNormalObject { id: (99, 0) }
         ));
         assert_eq!(resolved[2].1.as_ref().unwrap().as_str().unwrap(), b"one");
         assert!(matches!(
-            resolved[3].1,
-            Err(IndexedReaderError::GenerationMismatch { id: (1, 1), indexed: 0 })
+            resolved[3].1.as_ref().unwrap_err().as_ref(),
+            IndexedReaderError::GenerationMismatch { id: (1, 1), indexed: 0 }
         ));
         assert!(reader.resolve_many_shared(&[]).is_empty());
     }
@@ -4395,13 +4408,13 @@ mod tests {
         );
         assert_eq!(resolved[1].1.as_ref().unwrap().as_str().unwrap(), b"ten");
         assert!(matches!(
-            resolved[2].1,
-            Err(IndexedReaderError::ObjectStreamMember {
+            resolved[2].1.as_ref().unwrap_err().as_ref(),
+            IndexedReaderError::ObjectStreamMember {
                 id: (13, 0),
                 container: (5, 0),
                 index: 1,
                 ..
-            })
+            }
         ));
         assert_eq!(resolved[3].1.as_ref().unwrap().as_str().unwrap(), b"eleven");
 
@@ -4437,6 +4450,39 @@ mod tests {
         let resolved = reader.resolve_many_shared(&[(10, 0), (10, 0)]);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].1.as_ref().unwrap().as_str().unwrap(), b"two");
+    }
+
+    #[test]
+    fn shared_batch_propagates_one_container_read_failure_once_with_shared_identity() {
+        let members = [
+            (10, b"(ten)".as_slice()),
+            (11, b"(eleven)".as_slice()),
+            (12, b"(twelve)".as_slice()),
+        ];
+        let (first, content) = object_stream_content(&members);
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 3 /First {first}"),
+            &content,
+            &[(10, 0), (11, 1), (12, 2)],
+        );
+        let source = Arc::new(FailOnceSource {
+            bytes: fixture.pdf,
+            armed: AtomicBool::new(false),
+            armed_reads: AtomicUsize::new(0),
+        });
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        source.armed_reads.store(0, Ordering::SeqCst);
+        source.armed.store(true, Ordering::SeqCst);
+
+        let resolved = reader.resolve_many_shared(&[(12, 0), (10, 0), (11, 0)]);
+        let errors: Vec<_> = resolved
+            .iter()
+            .map(|(_, result)| result.as_ref().unwrap_err())
+            .collect();
+        assert!(matches!(errors[0].as_ref(), IndexedReaderError::Source(_)));
+        assert!(Arc::ptr_eq(errors[0], errors[1]));
+        assert!(Arc::ptr_eq(errors[0], errors[2]));
+        assert_eq!(source.armed_reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4501,7 +4547,10 @@ mod tests {
         );
         let batch = reader.resolve_many_shared(&[(11, 0), (10, 0)]);
         for (_, result) in batch {
-            assert!(matches!(result, Err(IndexedReaderError::ObjectStreamMember { .. })));
+            assert!(matches!(
+                result.as_ref().unwrap_err().as_ref(),
+                IndexedReaderError::ObjectStreamBatchSetup { .. }
+            ));
         }
         assert!(matches!(
             reader.resolve_object((11, 0)),
@@ -5090,6 +5139,31 @@ mod tests {
     struct SwitchableFailureSource {
         bytes: Vec<u8>,
         mode: AtomicU8,
+    }
+
+    struct FailOnceSource {
+        bytes: Vec<u8>,
+        armed: AtomicBool,
+        armed_reads: AtomicUsize,
+    }
+
+    impl RandomAccessSource for FailOnceSource {
+        fn len(&self) -> Result<u64, SourceError> {
+            Ok(u64::try_from(self.bytes.len()).unwrap())
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<usize, SourceError> {
+            if self.armed.load(Ordering::SeqCst) {
+                self.armed_reads.fetch_add(1, Ordering::SeqCst);
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    return Err(SourceError::Io(std::io::Error::other("one-shot positional failure")));
+                }
+            }
+            let offset = usize::try_from(offset).unwrap();
+            let length = output.len().min(self.bytes.len().saturating_sub(offset));
+            output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
+            Ok(length)
+        }
     }
 
     impl RandomAccessSource for SwitchableFailureSource {

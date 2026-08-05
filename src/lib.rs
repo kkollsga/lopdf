@@ -53,6 +53,7 @@ pub use incremental_document::IncrementalDocument;
 pub use indexed_reader::{
     IndexedReader, IndexedReaderCacheOptions, IndexedReaderCacheStats, IndexedReaderError, IndexedReaderOptions,
     IndexedReaderResult, IndexedReaderSourceCacheStats, InheritedPageAttributeOwners, PageMap, PageMapEntry,
+    SharedIndexedReaderResult,
 };
 pub use load_options::{FilterFunc, LoadOptions};
 pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
