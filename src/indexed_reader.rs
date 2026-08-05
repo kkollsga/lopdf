@@ -19,6 +19,7 @@ const MAX_XREF_REVISIONS: usize = 1_024;
 const MAX_XREF_FIELD_WIDTH: u64 = 8;
 const INDIRECT_HEADER_LIMIT: u64 = 256;
 const INITIAL_OBJECT_WINDOW: u64 = 4 * 1_024;
+const OBJECT_GROWTH_CHUNK: u64 = 64 * 1_024;
 const DEFAULT_OBJECT_LIMIT: u64 = 4 * 1_024 * 1_024;
 const DEFAULT_STREAM_LIMIT: u64 = 64 * 1_024 * 1_024;
 const DEFAULT_ENDSTREAM_TAIL_LIMIT: u64 = 64;
@@ -209,13 +210,37 @@ impl IndexedReader {
             source_len,
         })?;
         let maximum = remaining.min(self.limits.max_object_bytes);
-        let mut length = maximum.min(INITIAL_OBJECT_WINDOW);
+        let initial_length = maximum.min(INITIAL_OBJECT_WINDOW);
+        let mut window = self.source.read_range(body_offset, initial_length, initial_length)?;
         loop {
-            let window = self.source.read_range(body_offset, length, length)?;
             match parse_object_body(&window, id, body_offset) {
                 Ok(parsed) => return self.finish_object(id, body_offset, source_len, parsed, state),
-                Err(IndexError::IncompleteObject { .. }) if length < maximum => {
-                    length = length.saturating_mul(2).min(maximum);
+                Err(IndexError::IncompleteObject { .. })
+                    if u64::try_from(window.len()).unwrap_or(u64::MAX) < maximum =>
+                {
+                    let current = u64::try_from(window.len()).map_err(|_| IndexError::ObjectLimitExceeded {
+                        id,
+                        limit: self.limits.max_object_bytes,
+                    })?;
+                    // Extend the retained prefix instead of rereading it. A
+                    // fixed upper growth step caps speculative stream-payload
+                    // reads while still doubling small object probes.
+                    let target = current
+                        .saturating_mul(2)
+                        .min(current.saturating_add(OBJECT_GROWTH_CHUNK))
+                        .min(maximum);
+                    let extension_length = target - current;
+                    let extension_offset =
+                        body_offset
+                            .checked_add(current)
+                            .ok_or(IndexError::InvalidIndirectObject {
+                                id,
+                                offset: body_offset,
+                            })?;
+                    let extension = self
+                        .source
+                        .read_range(extension_offset, extension_length, extension_length)?;
+                    window.extend_from_slice(&extension);
                 }
                 Err(IndexError::IncompleteObject { .. }) if remaining > self.limits.max_object_bytes => {
                     return Err(IndexError::ObjectLimitExceeded {
@@ -261,10 +286,21 @@ impl IndexedReader {
             // This matches the eager loader's degradation for a missing,
             // malformed, dangling, cyclic, or over-depth /Length: retain the
             // stream dictionary and expose empty owned content.
-            let stream_start = usize::try_from(stream_start).map_err(|_| IndexError::InvalidIndirectObject {
-                id,
-                offset: stream_start,
-            })?;
+            // Stream positions in eager `Document` objects are relative to the
+            // PDF header, even when transport junk precedes it. The indexed
+            // source offsets are physical, so rebase before exposing parity.
+            let relative_stream_start =
+                stream_start
+                    .checked_sub(self.index.source_origin)
+                    .ok_or(IndexError::InvalidIndirectObject {
+                        id,
+                        offset: stream_start,
+                    })?;
+            let stream_start =
+                usize::try_from(relative_stream_start).map_err(|_| IndexError::InvalidIndirectObject {
+                    id,
+                    offset: stream_start,
+                })?;
             return Ok(Object::Stream(Stream::with_position(dictionary, stream_start)));
         };
         if length < 0 {
@@ -791,6 +827,9 @@ fn dictionary_may_be_truncated(input: &[u8]) -> bool {
     if !input.starts_with(b"<<") {
         return false;
     }
+    if contains_invalid_bare_token(input, b'@') {
+        return false;
+    }
 
     let mut depth = 0_usize;
     let mut position = 0_usize;
@@ -832,6 +871,45 @@ fn dictionary_may_be_truncated(input: &[u8]) -> bool {
         }
     }
     depth != 0
+}
+
+fn contains_invalid_bare_token(input: &[u8], invalid: u8) -> bool {
+    let mut position = 0_usize;
+    while position < input.len() {
+        match input[position] {
+            b'%' => {
+                position += 1;
+                while position < input.len() && !matches!(input[position], b'\r' | b'\n') {
+                    position += 1;
+                }
+            }
+            b'(' => {
+                let Some(end) = literal_string_end(input, position) else {
+                    return false;
+                };
+                position = end;
+            }
+            b'<' if input.get(position + 1) == Some(&b'<') => position += 2,
+            b'<' => {
+                let Some(end) = input[position + 1..].iter().position(|byte| *byte == b'>') else {
+                    return false;
+                };
+                position += end + 2;
+            }
+            b'/' => {
+                position += 1;
+                while position < input.len()
+                    && !is_pdf_whitespace(input[position])
+                    && !is_pdf_delimiter(input[position])
+                {
+                    position += 1;
+                }
+            }
+            byte if byte == invalid => return true,
+            _ => position += 1,
+        }
+    }
+    false
 }
 
 fn literal_string_end(input: &[u8], start: usize) -> Option<usize> {
@@ -1651,6 +1729,41 @@ mod tests {
     }
 
     #[test]
+    fn degraded_stream_position_is_relative_to_pdf_origin() {
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /MissingLength true >>\nstream\nignored\nendstream",
+        }]);
+        let prefix = b"twenty-nine-byte-prefix.....\n";
+        assert_eq!(prefix.len(), 29);
+        let mut prefixed = prefix.to_vec();
+        prefixed.extend_from_slice(&pdf);
+
+        let resolved = open_reader(&prefixed, ResolverLimits::default())
+            .resolve((1, 0))
+            .unwrap();
+        let eager = Document::load_mem(&prefixed)
+            .unwrap()
+            .get_object((1, 0))
+            .unwrap()
+            .clone();
+
+        assert_eq!(resolved, eager);
+        assert!(resolved.as_stream().unwrap().content.is_empty());
+        let physical_stream_start = prefixed
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .unwrap()
+            + b"stream\n".len();
+        assert_eq!(
+            resolved.as_stream().unwrap().start_position.unwrap() + prefix.len(),
+            physical_stream_start
+        );
+    }
+
+    #[test]
     fn xref_and_indirect_header_generations_are_both_validated() {
         let pdf = object_pdf(&[ObjectDef {
             id: 1,
@@ -2023,7 +2136,7 @@ mod tests {
     }
 
     #[test]
-    fn five_kib_stream_dictionary_grows_geometrically_without_large_payload_reread() {
+    fn five_kib_stream_dictionary_extends_without_prefix_or_payload_reread() {
         let len = 100_u64 * 1_024 * 1_024;
         let object_offset = 1_024_u64 * 1_024;
         let stream_length = 8_u64 * 1_024 * 1_024;
@@ -2058,15 +2171,19 @@ mod tests {
         );
 
         let requests = source.requests.lock().unwrap();
-        let body_lengths: Vec<_> = requests
+        let body_requests: Vec<_> = requests
             .iter()
-            .filter_map(|(offset, length)| (*offset == body_offset).then_some(*length))
+            .filter(|(offset, _)| *offset >= body_offset && *offset < stream_start)
+            .copied()
             .collect();
         assert_eq!(
-            body_lengths,
+            body_requests,
             vec![
-                usize::try_from(INITIAL_OBJECT_WINDOW).unwrap(),
-                usize::try_from(2 * INITIAL_OBJECT_WINDOW).unwrap()
+                (body_offset, usize::try_from(INITIAL_OBJECT_WINDOW).unwrap()),
+                (
+                    body_offset + INITIAL_OBJECT_WINDOW,
+                    usize::try_from(INITIAL_OBJECT_WINDOW).unwrap()
+                )
             ]
         );
         assert_eq!(
@@ -2130,6 +2247,96 @@ mod tests {
         );
         let total: u64 = requests.iter().map(|(_, length)| u64::try_from(*length).unwrap()).sum();
         assert!(total <= stream_length + 8 * 1_024);
+    }
+
+    #[test]
+    fn semantic_invalid_object_stops_after_initial_probe() {
+        let len = 100_u64 * 1_024 * 1_024;
+        let object_offset = 1_024_u64 * 1_024;
+        let object_prefix = b"1 0 obj\n<< /Broken @".to_vec();
+        let body_offset = object_offset + u64::try_from(b"1 0 obj\n".len()).unwrap();
+        let xref = len - 512;
+        let xref_bytes = format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .into_bytes();
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![
+                (0, b"%PDF-1.7\n".to_vec()),
+                (object_offset, object_prefix),
+                (xref, xref_bytes),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+
+        let error = reader.resolve((1, 0)).unwrap_err();
+        assert!(
+            matches!(error, IndexError::InvalidIndirectObject { id: (1, 0), .. }),
+            "unexpected error: {error:?}"
+        );
+        let requests = source.requests.lock().unwrap();
+        let body_lengths: Vec<_> = requests
+            .iter()
+            .filter_map(|(offset, length)| (*offset == body_offset).then_some(*length))
+            .collect();
+        assert_eq!(body_lengths, vec![usize::try_from(INITIAL_OBJECT_WINDOW).unwrap()]);
+    }
+
+    #[test]
+    fn multi_megabyte_dictionary_caps_payload_lookahead_then_reads_stream_once() {
+        let len = 100_u64 * 1_024 * 1_024;
+        let object_offset = 1_024_u64 * 1_024;
+        let stream_length = 8_u64 * 1_024 * 1_024;
+        let mut object_prefix = b"1 0 obj\n<< /Pad (".to_vec();
+        object_prefix.resize(object_prefix.len() + 2 * 1_024 * 1_024 + 1, b'x');
+        object_prefix.extend_from_slice(format!(") /Length {stream_length} >>\nstream\n").as_bytes());
+        let stream_start = object_offset + u64::try_from(object_prefix.len()).unwrap();
+        let stream_end = stream_start + stream_length;
+        let xref = len - 512;
+        let xref_bytes = format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .into_bytes();
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![
+                (0, b"%PDF-1.7\n".to_vec()),
+                (object_offset, object_prefix),
+                (stream_end, b"\nendstream\nendobj\n".to_vec()),
+                (xref, xref_bytes),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+
+        let stream = reader.resolve((1, 0)).unwrap();
+        assert_eq!(
+            u64::try_from(stream.as_stream().unwrap().content.len()).unwrap(),
+            stream_length
+        );
+
+        let requests = source.requests.lock().unwrap();
+        let speculative_payload_bytes: u64 = requests
+            .iter()
+            .filter_map(|(offset, length)| {
+                let end = offset.checked_add(u64::try_from(*length).ok()?)?;
+                (*offset < stream_start && end > stream_start).then(|| end - stream_start)
+            })
+            .sum();
+        assert!(speculative_payload_bytes <= OBJECT_GROWTH_CHUNK);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(offset, length)| {
+                    *offset == stream_start && u64::try_from(*length).unwrap() == stream_length
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2300,6 +2507,7 @@ mod tests {
     #[test]
     fn incomplete_dictionary_probe_tracks_nesting_and_pdf_strings() {
         assert!(dictionary_may_be_truncated(b"<< /Nested << /Value 1 >>"));
+        assert!(!dictionary_may_be_truncated(b"<< /Broken @"));
         assert!(!dictionary_may_be_truncated(b"<< /Nested << /Value 1 >> >>"));
         assert!(dictionary_may_be_truncated(b"<< /Text (a >> nested \\) value)"));
         assert!(!dictionary_may_be_truncated(
