@@ -2601,11 +2601,31 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_bounded_compressed_members_fail_without_eager_fallback() {
+    fn malformed_compressed_members_match_eager_and_resource_bounds_still_fail() {
+        for n in [2, -1] {
+            let fixture = object_stream_fixture(&format!("/Type /ObjStm /N {n} /First 5"), b"10 0 (ten)", &[(10, 0)]);
+            let eager = Document::load_mem(&fixture.pdf).unwrap();
+            assert_eq!(
+                open_reader(&fixture.pdf, ResolverLimits::default())
+                    .resolve((10, 0))
+                    .unwrap(),
+                eager.get_object((10, 0)).unwrap().clone()
+            );
+        }
+
+        let equal_offsets = object_stream_fixture(
+            "/Type /ObjStm /N 2 /First 10",
+            b"10 0 11 0 (shared)",
+            &[(10, 0), (11, 1)],
+        );
+        let eager = Document::load_mem(&equal_offsets.pdf).unwrap();
+        let reader = open_reader(&equal_offsets.pdf, ResolverLimits::default());
+        for id in [(10, 0), (11, 0)] {
+            assert_eq!(reader.resolve(id).unwrap(), eager.get_object(id).unwrap().clone());
+        }
+
         let malformed = [
-            ("/Type /ObjStm /N 2 /First 5", b"10 0 (ten)".as_slice()),
             ("/Type /ObjStm /N 1 /First 1", b"10 0 (ten)".as_slice()),
-            ("/Type /ObjStm /N 2 /First 10", b"10 0 11 0 (ten) (eleven)".as_slice()),
             ("/Type /ObjStm /N 1 /First 5", b"10 0 << /Broken".as_slice()),
         ];
         for (dictionary, content) in malformed {
