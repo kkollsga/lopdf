@@ -1205,22 +1205,21 @@ enum FrameLex {
         unsigned: bool,
     },
     ReferenceGap {
-        fallback: usize,
+        scalar_completion: usize,
     },
     ReferenceSecond {
-        fallback: usize,
-        start: usize,
+        scalar_completion: usize,
+        value: u32,
     },
     ReferenceTail {
-        fallback: usize,
+        scalar_completion: usize,
+        second_completion: usize,
     },
     ReferenceComment {
-        fallback: usize,
-        tail: bool,
+        scalar_completion: usize,
+        second_completion: Option<usize>,
     },
-    ReferenceBoundary {
-        fallback: usize,
-    },
+    ReferenceBoundary,
     Literal {
         depth: usize,
         escaped: bool,
@@ -1269,7 +1268,7 @@ struct DirectObjectFramer {
     container_depth: usize,
     lex: FrameLex,
     status: FrameStatus,
-    scanned_bytes: usize,
+    scanned_work: usize,
 }
 
 impl DirectObjectFramer {
@@ -1280,7 +1279,7 @@ impl DirectObjectFramer {
             container_depth: 0,
             lex: FrameLex::Normal,
             status: FrameStatus::NeedMore,
-            scanned_bytes: 0,
+            scanned_work: 0,
         }
     }
 
@@ -1296,6 +1295,7 @@ impl DirectObjectFramer {
 
     fn advance(&mut self, input: &[u8]) -> FrameStatus {
         while self.status == FrameStatus::NeedMore && self.position < input.len() {
+            let position = self.position;
             match self.lex {
                 FrameLex::Normal => self.advance_normal(input),
                 FrameLex::Comment { resume } => self.advance_comment(input, resume),
@@ -1310,11 +1310,20 @@ impl DirectObjectFramer {
                     digits,
                     unsigned,
                 } => self.advance_number(input, start, dot, digits, unsigned),
-                FrameLex::ReferenceGap { fallback } => self.advance_reference_gap(input, fallback),
-                FrameLex::ReferenceSecond { fallback, start } => self.advance_reference_second(input, fallback, start),
-                FrameLex::ReferenceTail { fallback } => self.advance_reference_tail(input, fallback),
-                FrameLex::ReferenceComment { fallback, tail } => self.advance_reference_comment(input, fallback, tail),
-                FrameLex::ReferenceBoundary { fallback } => self.advance_reference_boundary(input, fallback),
+                FrameLex::ReferenceGap { scalar_completion } => self.advance_reference_gap(input, scalar_completion),
+                FrameLex::ReferenceSecond {
+                    scalar_completion,
+                    value,
+                } => self.advance_reference_second(input, scalar_completion, value),
+                FrameLex::ReferenceTail {
+                    scalar_completion,
+                    second_completion,
+                } => self.advance_reference_tail(input, scalar_completion, second_completion),
+                FrameLex::ReferenceComment {
+                    scalar_completion,
+                    second_completion,
+                } => self.advance_reference_comment(input, scalar_completion, second_completion),
+                FrameLex::ReferenceBoundary => self.advance_reference_boundary(input),
                 FrameLex::Literal { depth, escaped } => self.advance_literal(input, depth, escaped),
                 FrameLex::Hex => self.advance_hex(input),
                 FrameLex::LessThan => self.advance_less_than(input),
@@ -1326,7 +1335,7 @@ impl DirectObjectFramer {
                 FrameLex::StreamEol => self.advance_stream_eol(input),
                 FrameLex::StreamEolCr => self.advance_stream_eol_cr(input),
             }
-            self.scanned_bytes = self.scanned_bytes.max(self.position);
+            self.scanned_work += self.position.saturating_sub(position);
         }
         self.status
     }
@@ -1401,7 +1410,10 @@ impl DirectObjectFramer {
         let byte = input[self.position];
         if hash_digits != 0 {
             if !byte.is_ascii_hexdigit() {
-                self.status = FrameStatus::Invalid;
+                // `name` accepts the valid prefix before a malformed escape.
+                // Revisit `#` as the next token when this is nested.
+                self.position -= 1;
+                self.finish_value(false);
                 return;
             }
             self.position += 1;
@@ -1445,10 +1457,8 @@ impl DirectObjectFramer {
                     matched: matched + 1,
                 };
             }
-        } else if is_pdf_whitespace(byte) || is_pdf_delimiter(byte) {
-            self.finish_value(false);
         } else {
-            self.status = FrameStatus::Invalid;
+            self.finish_value(false);
         }
     }
 
@@ -1493,8 +1503,9 @@ impl DirectObjectFramer {
                     })
                     .is_some()
             {
-                let fallback = self.position;
-                self.lex = FrameLex::ReferenceGap { fallback };
+                self.lex = FrameLex::ReferenceGap {
+                    scalar_completion: self.position,
+                };
             } else {
                 self.finish_value(false);
             }
@@ -1505,7 +1516,11 @@ impl DirectObjectFramer {
                 self.finish_value(false);
             }
         } else {
-            self.status = FrameStatus::Invalid;
+            if digits && self.number_is_valid(input, start, dot) {
+                self.finish_value(false);
+            } else {
+                self.status = FrameStatus::Invalid;
+            }
         }
     }
 
@@ -1520,77 +1535,119 @@ impl DirectObjectFramer {
         }
     }
 
-    fn advance_reference_gap(&mut self, input: &[u8], fallback: usize) {
+    fn advance_reference_gap(&mut self, input: &[u8], scalar_completion: usize) {
         match input[self.position] {
-            byte if is_pdf_whitespace(byte) => self.position += 1,
+            byte if is_pdf_whitespace(byte) => {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceGap {
+                    scalar_completion: self.position,
+                };
+            }
             b'%' => {
                 self.position += 1;
-                self.lex = FrameLex::ReferenceComment { fallback, tail: false };
+                self.lex = FrameLex::ReferenceComment {
+                    scalar_completion,
+                    second_completion: None,
+                };
             }
             byte if byte.is_ascii_digit() => {
-                let start = self.position;
                 self.position += 1;
-                self.lex = FrameLex::ReferenceSecond { fallback, start };
+                self.lex = FrameLex::ReferenceSecond {
+                    scalar_completion,
+                    value: u32::from(byte - b'0'),
+                };
             }
-            _ => self.fallback_integer(fallback),
+            _ => self.fallback_integer(scalar_completion),
         }
     }
 
-    fn advance_reference_second(&mut self, input: &[u8], fallback: usize, start: usize) {
+    fn advance_reference_second(&mut self, input: &[u8], scalar_completion: usize, value: u32) {
         let byte = input[self.position];
         if byte.is_ascii_digit() {
-            self.position += 1;
+            let next = value
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u32::from(byte - b'0')));
+            if let Some(next) = next.filter(|value| u16::try_from(*value).is_ok()) {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceSecond {
+                    scalar_completion,
+                    value: next,
+                };
+            } else {
+                // A generation cannot exceed u16. Stop the speculative
+                // reference probe immediately so replay is fixed-size.
+                self.fallback_integer(scalar_completion);
+            }
         } else {
-            let generation = input[start..self.position].iter().try_fold(0_u16, |value, digit| {
-                value.checked_mul(10)?.checked_add(u16::from(*digit - b'0'))
-            });
-            if generation.is_none() {
-                self.fallback_integer(fallback);
-            } else {
-                self.lex = FrameLex::ReferenceTail { fallback };
-            }
-        }
-    }
-
-    fn advance_reference_tail(&mut self, input: &[u8], fallback: usize) {
-        match input[self.position] {
-            byte if is_pdf_whitespace(byte) => self.position += 1,
-            b'%' => {
-                self.position += 1;
-                self.lex = FrameLex::ReferenceComment { fallback, tail: true };
-            }
-            b'R' => {
-                self.position += 1;
-                self.lex = FrameLex::ReferenceBoundary { fallback };
-            }
-            _ => self.fallback_integer(fallback),
-        }
-    }
-
-    fn advance_reference_comment(&mut self, input: &[u8], fallback: usize, tail: bool) {
-        let byte = input[self.position];
-        self.position += 1;
-        if matches!(byte, b'\r' | b'\n') {
-            self.lex = if tail {
-                FrameLex::ReferenceTail { fallback }
-            } else {
-                FrameLex::ReferenceGap { fallback }
+            self.lex = FrameLex::ReferenceTail {
+                scalar_completion,
+                second_completion: self.position,
             };
         }
     }
 
-    fn advance_reference_boundary(&mut self, input: &[u8], fallback: usize) {
-        if is_token_boundary(input.get(self.position).copied()) {
-            self.finish_value(false);
-        } else {
-            let _ = fallback;
-            self.status = FrameStatus::Invalid;
+    fn advance_reference_tail(&mut self, input: &[u8], scalar_completion: usize, second_completion: usize) {
+        match input[self.position] {
+            byte if is_pdf_whitespace(byte) => {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceTail {
+                    scalar_completion,
+                    second_completion: self.position,
+                };
+            }
+            b'%' => {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceComment {
+                    scalar_completion,
+                    second_completion: Some(second_completion),
+                };
+            }
+            b'R' => {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceBoundary;
+            }
+            b'.' => self.fallback_integer(scalar_completion),
+            _ => self.fallback_two_integers(scalar_completion, second_completion),
         }
+    }
+
+    fn advance_reference_comment(&mut self, input: &[u8], scalar_completion: usize, second_completion: Option<usize>) {
+        let byte = input[self.position];
+        self.position += 1;
+        if matches!(byte, b'\r' | b'\n') {
+            self.lex = if second_completion.is_some() {
+                FrameLex::ReferenceTail {
+                    scalar_completion,
+                    second_completion: self.position,
+                }
+            } else {
+                FrameLex::ReferenceGap {
+                    scalar_completion: self.position,
+                }
+            };
+        }
+    }
+
+    fn advance_reference_boundary(&mut self, _input: &[u8]) {
+        // The parser accepts `R` without requiring a token boundary. A nested
+        // caller will validate the following byte as a new token.
+        self.finish_value(false);
     }
 
     fn fallback_integer(&mut self, fallback: usize) {
         self.position = fallback;
         self.lex = FrameLex::Normal;
+        self.finish_value(false);
+    }
+
+    fn fallback_two_integers(&mut self, scalar_completion: usize, second_completion: usize) {
+        let top_level = self.container_depth == 0;
+        self.position = scalar_completion;
+        self.finish_value(false);
+        if top_level || self.status != FrameStatus::NeedMore {
+            return;
+        }
+        self.position = second_completion;
         self.finish_value(false);
     }
 
@@ -1606,7 +1663,7 @@ impl DirectObjectFramer {
                 self.lex = FrameLex::Literal { depth, escaped: true };
             }
             b'(' => {
-                if depth >= crate::reader::MAX_BRACKET {
+                if depth > crate::reader::MAX_BRACKET {
                     self.status = FrameStatus::Invalid;
                     return;
                 }
@@ -3299,7 +3356,7 @@ mod tests {
             let _ = framer.advance(&framed_body[..end]);
         }
         assert_eq!(framer.advance(&framed_body), FrameStatus::Ready);
-        assert!(framer.scanned_bytes <= framed_body.len());
+        assert!(framer.scanned_work <= framed_body.len());
     }
 
     #[test]
@@ -3493,7 +3550,7 @@ mod tests {
                 if first != FrameStatus::Ready {
                     assert_eq!(framer.advance(sample), FrameStatus::Ready, "split {split}: {sample:?}");
                 }
-                assert!(framer.scanned_bytes <= sample.len());
+                assert!(framer.scanned_work <= sample.len());
             }
         }
 
@@ -3506,7 +3563,7 @@ mod tests {
             let mut framer = DirectObjectFramer::for_dictionary(&invalid[..2]).unwrap();
             let _ = framer.advance(&invalid[..split]);
             assert_eq!(framer.advance(invalid), FrameStatus::Invalid);
-            assert!(framer.scanned_bytes <= invalid.len());
+            assert!(framer.scanned_work <= invalid.len());
         }
     }
 
@@ -3529,7 +3586,7 @@ mod tests {
                 if first != FrameStatus::Ready {
                     assert_eq!(framer.advance(sample), FrameStatus::Ready, "split {split}: {sample:?}");
                 }
-                assert!(framer.scanned_bytes <= sample.len());
+                assert!(framer.scanned_work <= sample.len());
             }
         }
     }
@@ -3540,7 +3597,6 @@ mod tests {
             b"@".as_slice(),
             b"truX ".as_slice(),
             b"<0g> ".as_slice(),
-            b"/bad#G0 ".as_slice(),
             b"[1 0 Q] ".as_slice(),
             b"[>> ".as_slice(),
             b"<< 1 /NotAKey >> ".as_slice(),
@@ -3555,9 +3611,145 @@ mod tests {
                     FrameStatus::Invalid,
                     "split {split}: {sample:?}"
                 );
-                assert!(framer.scanned_bytes <= sample.len());
+                assert!(framer.scanned_work <= sample.len());
             }
         }
+    }
+
+    #[test]
+    fn malformed_top_level_tokens_match_eager_prefix_objects_and_consumption() {
+        let cases = [
+            (b"trueX".as_slice(), Object::Boolean(true), 4),
+            (b"1x".as_slice(), Object::Integer(1), 1),
+            (b"1 0 RX".as_slice(), Object::Reference((1, 0)), 5),
+            (b"/bad#G0".as_slice(), Object::Name(b"bad".to_vec()), 4),
+            (b"1.2.3".as_slice(), Object::Real(1.2), 3),
+        ];
+
+        for (body, expected, expected_consumed) in cases {
+            let (consumed, parsed) = crate::parser::direct_object_with_consumed(body).unwrap();
+            assert_eq!(parsed, expected, "{body:?}");
+            assert_eq!(consumed, expected_consumed, "{body:?}");
+
+            for split in 0..body.len() {
+                let mut framer = DirectObjectFramer::new();
+                let first = framer.advance(&body[..split]);
+                if first != FrameStatus::Ready {
+                    assert_eq!(framer.advance(body), FrameStatus::Ready, "split {split}: {body:?}");
+                }
+                assert!(framer.scanned_work <= body.len() + 6, "split {split}: {body:?}");
+            }
+
+            let pdf = object_pdf(&[ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body,
+            }]);
+            let eager = Document::load_mem(&pdf).unwrap();
+            let indexed = open_reader(&pdf, ResolverLimits::default()).resolve((1, 0)).unwrap();
+            assert_eq!(eager.objects.get(&(1, 0)).unwrap(), &expected, "{body:?}");
+            assert_eq!(indexed, expected, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_prefixes_remain_parser_compatible_when_nested() {
+        for body in [
+            b"[trueX] ".as_slice(),
+            b"[1x] ".as_slice(),
+            b"[1 0 RX] ".as_slice(),
+            b"[/bad#G0] ".as_slice(),
+        ] {
+            assert!(crate::parser::direct_object_with_consumed(body).is_none(), "{body:?}");
+            let mut framer = DirectObjectFramer::new();
+            assert_eq!(framer.advance(body), FrameStatus::Invalid, "{body:?}");
+        }
+
+        let body = b"[1.2.3] ";
+        let (consumed, expected) = crate::parser::direct_object_with_consumed(body).unwrap();
+        assert_eq!(consumed, body.len());
+        assert_eq!(expected, Object::Array(vec![Object::Real(1.2), Object::Real(0.3)]));
+        let mut framer = DirectObjectFramer::new();
+        assert_eq!(framer.advance(body), FrameStatus::Ready);
+    }
+
+    #[test]
+    fn literal_nesting_limit_matches_eager_at_exact_boundary_and_one_beyond() {
+        let literal = |levels: usize| {
+            let mut body = Vec::with_capacity(levels * 2 + 1);
+            body.extend(std::iter::repeat_n(b'(', levels));
+            body.extend(std::iter::repeat_n(b')', levels));
+            body.push(b' ');
+            body
+        };
+
+        let accepted = literal(crate::reader::MAX_BRACKET + 1);
+        assert!(crate::parser::direct_object_with_consumed(&accepted).is_some());
+        let mut framer = DirectObjectFramer::new();
+        assert_eq!(framer.advance(&accepted), FrameStatus::Ready);
+        let accepted_pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: &accepted,
+        }]);
+        let eager = Document::load_mem(&accepted_pdf).unwrap();
+        assert_eq!(
+            open_reader(&accepted_pdf, ResolverLimits::default())
+                .resolve((1, 0))
+                .unwrap(),
+            eager.objects.get(&(1, 0)).unwrap().clone()
+        );
+
+        let rejected = literal(crate::reader::MAX_BRACKET + 2);
+        assert!(crate::parser::direct_object_with_consumed(&rejected).is_none());
+        let mut framer = DirectObjectFramer::new();
+        assert_eq!(framer.advance(&rejected), FrameStatus::Invalid);
+
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: &rejected,
+        }]);
+        let eager = Document::load_mem(&pdf).unwrap();
+        assert!(!eager.objects.contains_key(&(1, 0)));
+        assert!(matches!(
+            open_reader(&pdf, ResolverLimits::default()).resolve((1, 0)),
+            Err(IndexError::InvalidIndirectObject { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_reference_probe_does_not_revisit_long_space_or_comments() {
+        let mut body = b"[1 ".to_vec();
+        body.extend(std::iter::repeat_n(b' ', 512 * 1_024));
+        body.extend_from_slice(b"% gap");
+        body.extend(std::iter::repeat_n(b'x', 512 * 1_024));
+        body.extend_from_slice(b"\n2 ");
+        body.extend(std::iter::repeat_n(b' ', 512 * 1_024));
+        body.extend_from_slice(b"% tail");
+        body.extend(std::iter::repeat_n(b'y', 512 * 1_024));
+        body.extend_from_slice(b"\n3] ");
+
+        let (_, expected) = crate::parser::direct_object_with_consumed(&body).unwrap();
+        assert_eq!(
+            expected,
+            Object::Array(vec![Object::Integer(1), Object::Integer(2), Object::Integer(3)])
+        );
+
+        let mut framer = DirectObjectFramer::new();
+        for end in (1..body.len()).step_by(7_919) {
+            assert_ne!(framer.advance(&body[..end]), FrameStatus::Invalid);
+        }
+        assert_eq!(framer.advance(&body), FrameStatus::Ready);
+        assert!(
+            framer.scanned_work <= body.len() + 6,
+            "work={} input={}",
+            framer.scanned_work,
+            body.len()
+        );
     }
 
     #[test]
@@ -3585,7 +3777,7 @@ mod tests {
             assert_ne!(framer.advance(&body[..end]), FrameStatus::Invalid);
         }
         assert_eq!(framer.advance(&body), FrameStatus::Ready);
-        assert!(framer.scanned_bytes <= body.len());
+        assert!(framer.scanned_work <= body.len());
 
         let object_offset = 1_024_u64 * 1_024;
         let mut object = b"1 0 obj\n".to_vec();
