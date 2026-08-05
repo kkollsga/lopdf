@@ -219,11 +219,9 @@ impl IndexedReader {
         let maximum = remaining.min(self.limits.max_object_bytes);
         let initial_length = maximum.min(INITIAL_OBJECT_WINDOW);
         let mut window = self.source.read_range(body_offset, initial_length, initial_length)?;
-        let mut dictionary_framer = DirectObjectFramer::for_dictionary(&window);
+        let mut object_framer = DirectObjectFramer::new();
         loop {
-            let frame_status = dictionary_framer
-                .as_mut()
-                .map_or(FrameStatus::Ready, |framer| framer.advance(&window));
+            let frame_status = object_framer.advance(&window);
             if frame_status == FrameStatus::Invalid {
                 return Err(IndexError::InvalidIndirectObject {
                     id,
@@ -231,11 +229,8 @@ impl IndexedReader {
                 });
             }
             if frame_status == FrameStatus::Ready {
-                match parse_object_body(&window, id, body_offset) {
-                    Ok(parsed) => return self.finish_object(id, body_offset, source_len, parsed, state),
-                    Err(IndexError::IncompleteObject { .. }) => {}
-                    Err(error) => return Err(error),
-                }
+                let parsed = parse_object_body(&window, id, body_offset)?;
+                return self.finish_object(id, body_offset, source_len, parsed, state);
             }
 
             let current = u64::try_from(window.len()).map_err(|_| IndexError::ObjectLimitExceeded {
@@ -1136,67 +1131,166 @@ enum FrameStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameLex {
     Normal,
-    Comment,
-    Name,
-    Bare,
-    Literal { depth: usize, escaped: bool },
+    Comment {
+        resume: FrameResume,
+    },
+    Name {
+        hash_digits: u8,
+        dictionary_key: bool,
+    },
+    Keyword {
+        kind: FrameKeyword,
+        matched: usize,
+    },
+    Number {
+        start: usize,
+        dot: bool,
+        digits: bool,
+        unsigned: bool,
+    },
+    ReferenceGap {
+        fallback: usize,
+    },
+    ReferenceSecond {
+        fallback: usize,
+        start: usize,
+    },
+    ReferenceTail {
+        fallback: usize,
+    },
+    ReferenceComment {
+        fallback: usize,
+        tail: bool,
+    },
+    ReferenceBoundary {
+        fallback: usize,
+    },
+    Literal {
+        depth: usize,
+        escaped: bool,
+    },
     Hex,
+    LessThan,
+    GreaterThan,
+    AfterValue,
     AfterDictionary,
     AfterComment,
-    StreamToken { matched: usize },
+    StreamToken {
+        matched: usize,
+    },
     StreamEol,
+    StreamEolCr,
 }
 
-/// Incrementally frames a dictionary direct object and its possible `stream`
-/// header. It consumes only bytes appended since the previous call, leaving
-/// semantic object construction to the existing parser once framing is ready.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameResume {
+    Normal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameKeyword {
+    True,
+    False,
+    Null,
+}
+
+impl FrameKeyword {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::True => b"true",
+            Self::False => b"false",
+            Self::Null => b"null",
+        }
+    }
+}
+
+/// Incrementally frames one direct object and a possible dictionary `stream`
+/// header. The fixed container stack avoids a second allocation beside the
+/// retained source window; semantic construction remains in the normal parser.
 struct DirectObjectFramer {
     position: usize,
-    containers: Vec<u8>,
+    containers: [u8; crate::reader::MAX_NESTING_DEPTH],
+    container_depth: usize,
     lex: FrameLex,
     status: FrameStatus,
     scanned_bytes: usize,
 }
 
 impl DirectObjectFramer {
-    fn for_dictionary(input: &[u8]) -> Option<Self> {
-        input.starts_with(b"<<").then(|| Self {
-            position: 2,
-            containers: vec![b'<'],
+    fn new() -> Self {
+        Self {
+            position: 0,
+            containers: [0; crate::reader::MAX_NESTING_DEPTH],
+            container_depth: 0,
             lex: FrameLex::Normal,
             status: FrameStatus::NeedMore,
-            scanned_bytes: 2,
-        })
+            scanned_bytes: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_dictionary(input: &[u8]) -> Option<Self> {
+        if !input.starts_with(b"<<") {
+            return None;
+        }
+        let mut framer = Self::new();
+        let _ = framer.advance(input);
+        Some(framer)
     }
 
     fn advance(&mut self, input: &[u8]) -> FrameStatus {
         while self.status == FrameStatus::NeedMore && self.position < input.len() {
-            let before = self.position;
             match self.lex {
                 FrameLex::Normal => self.advance_normal(input),
-                FrameLex::Comment => self.advance_comment(input, FrameLex::Normal),
-                FrameLex::Name | FrameLex::Bare => self.advance_regular(input),
+                FrameLex::Comment { resume } => self.advance_comment(input, resume),
+                FrameLex::Name {
+                    hash_digits,
+                    dictionary_key,
+                } => self.advance_name(input, hash_digits, dictionary_key),
+                FrameLex::Keyword { kind, matched } => self.advance_keyword(input, kind, matched),
+                FrameLex::Number {
+                    start,
+                    dot,
+                    digits,
+                    unsigned,
+                } => self.advance_number(input, start, dot, digits, unsigned),
+                FrameLex::ReferenceGap { fallback } => self.advance_reference_gap(input, fallback),
+                FrameLex::ReferenceSecond { fallback, start } => self.advance_reference_second(input, fallback, start),
+                FrameLex::ReferenceTail { fallback } => self.advance_reference_tail(input, fallback),
+                FrameLex::ReferenceComment { fallback, tail } => self.advance_reference_comment(input, fallback, tail),
+                FrameLex::ReferenceBoundary { fallback } => self.advance_reference_boundary(input, fallback),
                 FrameLex::Literal { depth, escaped } => self.advance_literal(input, depth, escaped),
                 FrameLex::Hex => self.advance_hex(input),
+                FrameLex::LessThan => self.advance_less_than(input),
+                FrameLex::GreaterThan => self.advance_greater_than(input),
+                FrameLex::AfterValue => self.status = FrameStatus::Ready,
                 FrameLex::AfterDictionary => self.advance_after_dictionary(input),
-                FrameLex::AfterComment => self.advance_comment(input, FrameLex::AfterDictionary),
+                FrameLex::AfterComment => self.advance_after_comment(input),
                 FrameLex::StreamToken { matched } => self.advance_stream_token(input, matched),
                 FrameLex::StreamEol => self.advance_stream_eol(input),
+                FrameLex::StreamEolCr => self.advance_stream_eol_cr(input),
             }
-            self.scanned_bytes = self.scanned_bytes.saturating_add(self.position.saturating_sub(before));
-            if self.position == before && self.status == FrameStatus::NeedMore {
-                break;
-            }
+            self.scanned_bytes = self.scanned_bytes.max(self.position);
         }
         self.status
     }
 
     fn advance_normal(&mut self, input: &[u8]) {
         let byte = input[self.position];
+        if self.container_depth != 0
+            && self.containers[self.container_depth - 1] == b'k'
+            && !matches!(byte, b'%' | b'/' | b'>')
+            && !is_pdf_whitespace(byte)
+        {
+            self.status = FrameStatus::Invalid;
+            return;
+        }
         match byte {
             b'%' => {
                 self.position += 1;
-                self.lex = FrameLex::Comment;
+                self.lex = FrameLex::Comment {
+                    resume: FrameResume::Normal,
+                };
             }
             b'(' => {
                 self.position += 1;
@@ -1207,76 +1301,241 @@ impl DirectObjectFramer {
             }
             b'/' => {
                 self.position += 1;
-                self.lex = FrameLex::Name;
+                self.lex = FrameLex::Name {
+                    hash_digits: 0,
+                    dictionary_key: self.container_depth != 0 && self.containers[self.container_depth - 1] == b'k',
+                };
             }
             b'<' => {
-                let Some(next) = input.get(self.position + 1) else {
-                    return;
-                };
-                if *next == b'<' {
-                    self.position += 2;
-                    if self.containers.len() >= crate::reader::MAX_NESTING_DEPTH {
-                        self.status = FrameStatus::Invalid;
-                    } else {
-                        self.containers.push(b'<');
-                    }
-                } else {
-                    self.position += 1;
-                    self.lex = FrameLex::Hex;
-                }
+                self.position += 1;
+                self.lex = FrameLex::LessThan;
             }
             b'>' => {
-                let Some(next) = input.get(self.position + 1) else {
-                    return;
-                };
-                if *next != b'>' || self.containers.pop() != Some(b'<') {
-                    self.status = FrameStatus::Invalid;
-                    return;
-                }
-                self.position += 2;
-                if self.containers.is_empty() {
-                    self.lex = FrameLex::AfterDictionary;
-                }
+                self.position += 1;
+                self.lex = FrameLex::GreaterThan;
             }
             b'[' => {
                 self.position += 1;
-                if self.containers.len() >= crate::reader::MAX_NESTING_DEPTH {
-                    self.status = FrameStatus::Invalid;
-                } else {
-                    self.containers.push(b'[');
-                }
+                self.push_container(b'[');
             }
             b']' => {
                 self.position += 1;
-                if self.containers.pop() != Some(b'[') || self.containers.is_empty() {
-                    self.status = FrameStatus::Invalid;
-                }
+                self.close_container(b'[', false);
             }
-            b'@' => self.status = FrameStatus::Invalid,
+            b't' => self.start_keyword(FrameKeyword::True),
+            b'f' => self.start_keyword(FrameKeyword::False),
+            b'n' => self.start_keyword(FrameKeyword::Null),
+            b'+' | b'-' | b'.' | b'0'..=b'9' => self.start_number(byte),
             byte if is_pdf_whitespace(byte) => self.position += 1,
-            _ => {
-                self.position += 1;
-                self.lex = FrameLex::Bare;
-            }
+            _ => self.status = FrameStatus::Invalid,
         }
     }
 
-    fn advance_comment(&mut self, input: &[u8], next: FrameLex) {
+    fn advance_comment(&mut self, input: &[u8], resume: FrameResume) {
         let byte = input[self.position];
         self.position += 1;
         if matches!(byte, b'\r' | b'\n') {
-            self.lex = next;
+            self.lex = match resume {
+                FrameResume::Normal => FrameLex::Normal,
+            };
         }
     }
 
-    fn advance_regular(&mut self, input: &[u8]) {
+    fn advance_name(&mut self, input: &[u8], hash_digits: u8, dictionary_key: bool) {
         let byte = input[self.position];
-        if is_pdf_whitespace(byte) || is_pdf_delimiter(byte) {
-            self.lex = FrameLex::Normal;
-            self.advance_normal(input);
+        if hash_digits != 0 {
+            if !byte.is_ascii_hexdigit() {
+                self.status = FrameStatus::Invalid;
+                return;
+            }
+            self.position += 1;
+            self.lex = FrameLex::Name {
+                hash_digits: if hash_digits == 1 { 2 } else { 0 },
+                dictionary_key,
+            };
+        } else if byte == b'#' {
+            self.position += 1;
+            self.lex = FrameLex::Name {
+                hash_digits: 1,
+                dictionary_key,
+            };
+        } else if is_pdf_whitespace(byte) || is_pdf_delimiter(byte) {
+            if dictionary_key {
+                self.containers[self.container_depth - 1] = b'v';
+                self.lex = FrameLex::Normal;
+            } else {
+                self.finish_value(false);
+            }
         } else {
             self.position += 1;
         }
+    }
+
+    fn start_keyword(&mut self, kind: FrameKeyword) {
+        self.position += 1;
+        self.lex = FrameLex::Keyword { kind, matched: 1 };
+    }
+
+    fn advance_keyword(&mut self, input: &[u8], kind: FrameKeyword, matched: usize) {
+        let token = kind.bytes();
+        let byte = input[self.position];
+        if matched < token.len() {
+            if byte != token[matched] {
+                self.status = FrameStatus::Invalid;
+            } else {
+                self.position += 1;
+                self.lex = FrameLex::Keyword {
+                    kind,
+                    matched: matched + 1,
+                };
+            }
+        } else if is_pdf_whitespace(byte) || is_pdf_delimiter(byte) {
+            self.finish_value(false);
+        } else {
+            self.status = FrameStatus::Invalid;
+        }
+    }
+
+    fn start_number(&mut self, byte: u8) {
+        let start = self.position;
+        self.position += 1;
+        self.lex = FrameLex::Number {
+            start,
+            dot: byte == b'.',
+            digits: byte.is_ascii_digit(),
+            unsigned: byte.is_ascii_digit(),
+        };
+    }
+
+    fn advance_number(&mut self, input: &[u8], start: usize, dot: bool, digits: bool, unsigned: bool) {
+        let byte = input[self.position];
+        if byte.is_ascii_digit() {
+            self.position += 1;
+            self.lex = FrameLex::Number {
+                start,
+                dot,
+                digits: true,
+                unsigned,
+            };
+        } else if byte == b'.' && !dot {
+            self.position += 1;
+            self.lex = FrameLex::Number {
+                start,
+                dot: true,
+                digits,
+                unsigned: false,
+            };
+        } else if is_pdf_whitespace(byte) || byte == b'%' {
+            if !digits || !self.number_is_valid(input, start, dot) {
+                self.status = FrameStatus::Invalid;
+            } else if unsigned
+                && !dot
+                && input[start..self.position]
+                    .iter()
+                    .try_fold(0_u32, |value, digit| {
+                        value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
+                    })
+                    .is_some()
+            {
+                let fallback = self.position;
+                self.lex = FrameLex::ReferenceGap { fallback };
+            } else {
+                self.finish_value(false);
+            }
+        } else if is_pdf_delimiter(byte) {
+            if !digits || !self.number_is_valid(input, start, dot) {
+                self.status = FrameStatus::Invalid;
+            } else {
+                self.finish_value(false);
+            }
+        } else {
+            self.status = FrameStatus::Invalid;
+        }
+    }
+
+    fn number_is_valid(&self, input: &[u8], start: usize, dot: bool) -> bool {
+        let Ok(text) = std::str::from_utf8(&input[start..self.position]) else {
+            return false;
+        };
+        if dot {
+            text.parse::<f32>().is_ok()
+        } else {
+            text.parse::<i64>().is_ok()
+        }
+    }
+
+    fn advance_reference_gap(&mut self, input: &[u8], fallback: usize) {
+        match input[self.position] {
+            byte if is_pdf_whitespace(byte) => self.position += 1,
+            b'%' => {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceComment { fallback, tail: false };
+            }
+            byte if byte.is_ascii_digit() => {
+                let start = self.position;
+                self.position += 1;
+                self.lex = FrameLex::ReferenceSecond { fallback, start };
+            }
+            _ => self.fallback_integer(fallback),
+        }
+    }
+
+    fn advance_reference_second(&mut self, input: &[u8], fallback: usize, start: usize) {
+        let byte = input[self.position];
+        if byte.is_ascii_digit() {
+            self.position += 1;
+        } else {
+            let generation = input[start..self.position].iter().try_fold(0_u16, |value, digit| {
+                value.checked_mul(10)?.checked_add(u16::from(*digit - b'0'))
+            });
+            if generation.is_none() {
+                self.fallback_integer(fallback);
+            } else {
+                self.lex = FrameLex::ReferenceTail { fallback };
+            }
+        }
+    }
+
+    fn advance_reference_tail(&mut self, input: &[u8], fallback: usize) {
+        match input[self.position] {
+            byte if is_pdf_whitespace(byte) => self.position += 1,
+            b'%' => {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceComment { fallback, tail: true };
+            }
+            b'R' => {
+                self.position += 1;
+                self.lex = FrameLex::ReferenceBoundary { fallback };
+            }
+            _ => self.fallback_integer(fallback),
+        }
+    }
+
+    fn advance_reference_comment(&mut self, input: &[u8], fallback: usize, tail: bool) {
+        let byte = input[self.position];
+        self.position += 1;
+        if matches!(byte, b'\r' | b'\n') {
+            self.lex = if tail {
+                FrameLex::ReferenceTail { fallback }
+            } else {
+                FrameLex::ReferenceGap { fallback }
+            };
+        }
+    }
+
+    fn advance_reference_boundary(&mut self, input: &[u8], fallback: usize) {
+        if is_token_boundary(input.get(self.position).copied()) {
+            self.finish_value(false);
+        } else {
+            let _ = fallback;
+            self.status = FrameStatus::Invalid;
+        }
+    }
+
+    fn fallback_integer(&mut self, fallback: usize) {
+        self.position = fallback;
+        self.lex = FrameLex::Normal;
+        self.finish_value(false);
     }
 
     fn advance_literal(&mut self, input: &[u8], mut depth: usize, escaped: bool) {
@@ -1291,10 +1550,14 @@ impl DirectObjectFramer {
                 self.lex = FrameLex::Literal { depth, escaped: true };
             }
             b'(' => {
+                if depth >= crate::reader::MAX_BRACKET {
+                    self.status = FrameStatus::Invalid;
+                    return;
+                }
                 depth += 1;
                 self.lex = FrameLex::Literal { depth, escaped: false };
             }
-            b')' if depth == 1 => self.lex = FrameLex::Normal,
+            b')' if depth == 1 => self.finish_value(false),
             b')' => {
                 depth -= 1;
                 self.lex = FrameLex::Literal { depth, escaped: false };
@@ -1305,9 +1568,74 @@ impl DirectObjectFramer {
 
     fn advance_hex(&mut self, input: &[u8]) {
         let byte = input[self.position];
-        self.position += 1;
         if byte == b'>' {
+            self.position += 1;
+            self.finish_value(false);
+        } else if byte.is_ascii_hexdigit() || is_pdf_whitespace(byte) {
+            self.position += 1;
+        } else {
+            self.status = FrameStatus::Invalid;
+        }
+    }
+
+    fn advance_less_than(&mut self, input: &[u8]) {
+        if input[self.position] == b'<' {
+            self.position += 1;
+            self.push_container(b'<');
+        } else {
+            self.lex = FrameLex::Hex;
+        }
+    }
+
+    fn advance_greater_than(&mut self, input: &[u8]) {
+        if input[self.position] != b'>' {
+            self.status = FrameStatus::Invalid;
+            return;
+        }
+        self.position += 1;
+        self.close_container(b'<', true);
+    }
+
+    fn push_container(&mut self, kind: u8) {
+        if self.container_depth >= self.containers.len() {
+            self.status = FrameStatus::Invalid;
+        } else {
+            self.containers[self.container_depth] = if kind == b'<' { b'k' } else { kind };
+            self.container_depth += 1;
             self.lex = FrameLex::Normal;
+        }
+    }
+
+    fn close_container(&mut self, kind: u8, dictionary: bool) {
+        let expected = if kind == b'<' { b'k' } else { kind };
+        if self.container_depth == 0 || self.containers[self.container_depth - 1] != expected {
+            self.status = FrameStatus::Invalid;
+            return;
+        }
+        self.container_depth -= 1;
+        self.finish_value(dictionary);
+    }
+
+    fn finish_value(&mut self, dictionary: bool) {
+        if self.container_depth == 0 {
+            if dictionary {
+                self.lex = FrameLex::AfterDictionary;
+            } else {
+                // The direct-object parser requires at least one following
+                // byte before it can distinguish a complete body from a
+                // window ending exactly at the object's final delimiter.
+                self.lex = FrameLex::AfterValue;
+            }
+        } else {
+            let parent = &mut self.containers[self.container_depth - 1];
+            if *parent == b'v' {
+                *parent = b'k';
+                self.lex = FrameLex::Normal;
+            } else if *parent == b'[' {
+                self.lex = FrameLex::Normal;
+            } else {
+                self.status = FrameStatus::Invalid;
+            }
         }
     }
 
@@ -1323,6 +1651,14 @@ impl DirectObjectFramer {
                 self.lex = FrameLex::StreamToken { matched: 1 };
             }
             _ => self.status = FrameStatus::Ready,
+        }
+    }
+
+    fn advance_after_comment(&mut self, input: &[u8]) {
+        let byte = input[self.position];
+        self.position += 1;
+        if matches!(byte, b'\r' | b'\n') {
+            self.lex = FrameLex::AfterDictionary;
         }
     }
 
@@ -1349,12 +1685,23 @@ impl DirectObjectFramer {
     fn advance_stream_eol(&mut self, input: &[u8]) {
         match input[self.position] {
             b' ' | b'\t' => self.position += 1,
-            b'\r' | b'\n' => {
+            b'\r' => {
+                self.position += 1;
+                self.lex = FrameLex::StreamEolCr;
+            }
+            b'\n' => {
                 self.position += 1;
                 self.status = FrameStatus::Ready;
             }
             _ => self.status = FrameStatus::Ready,
         }
+    }
+
+    fn advance_stream_eol_cr(&mut self, input: &[u8]) {
+        if input[self.position] == b'\n' {
+            self.position += 1;
+        }
+        self.status = FrameStatus::Ready;
     }
 }
 
@@ -2813,6 +3160,122 @@ mod tests {
             let _ = framer.advance(&invalid[..split]);
             assert_eq!(framer.advance(invalid), FrameStatus::Invalid);
             assert!(framer.scanned_bytes <= invalid.len());
+        }
+    }
+
+    #[test]
+    fn direct_object_framer_covers_every_object_kind_at_every_split_point() {
+        let samples = [
+            b"[true false null 1 -2 +3 1. .5 7 0 R /A#20B (x \\) y) <abc> << /K /V >>]\nendobj".as_slice(),
+            b"/Name#20with#23escapes\nendobj".as_slice(),
+            b"(literal (nested) \\) text)\nendobj".as_slice(),
+            b"<0a B>\nendobj".as_slice(),
+            b"false\nendobj".as_slice(),
+            b"-123.5\nendobj".as_slice(),
+            b"4294967295 65535 R\nendobj".as_slice(),
+        ];
+        for sample in samples {
+            assert!(parse_object_body(sample, (1, 0), 0).is_ok(), "{sample:?}");
+            for split in 0..sample.len() {
+                let mut framer = DirectObjectFramer::new();
+                let first = framer.advance(&sample[..split]);
+                if first != FrameStatus::Ready {
+                    assert_eq!(framer.advance(sample), FrameStatus::Ready, "split {split}: {sample:?}");
+                }
+                assert!(framer.scanned_bytes <= sample.len());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_object_framer_rejects_invalid_tokens_without_parsing() {
+        let invalid = [
+            b"@".as_slice(),
+            b"truX ".as_slice(),
+            b"<0g> ".as_slice(),
+            b"/bad#G0 ".as_slice(),
+            b"[1 0 Q] ".as_slice(),
+            b"[>> ".as_slice(),
+            b"<< 1 /NotAKey >> ".as_slice(),
+            b"<< /MissingValue >> ".as_slice(),
+        ];
+        for sample in invalid {
+            for split in 0..=sample.len() {
+                let mut framer = DirectObjectFramer::new();
+                let _ = framer.advance(&sample[..split]);
+                assert_eq!(
+                    framer.advance(sample),
+                    FrameStatus::Invalid,
+                    "split {split}: {sample:?}"
+                );
+                assert!(framer.scanned_bytes <= sample.len());
+            }
+        }
+    }
+
+    #[test]
+    fn stream_crlf_split_waits_for_lf_before_fixing_payload_offset() {
+        let sample = b"<< /Length 1 >>\nstream\r\nx\nendstream";
+        let split = sample.windows(2).position(|window| window == b"\r\n").unwrap() + 1;
+        let mut framer = DirectObjectFramer::new();
+        assert_eq!(framer.advance(&sample[..split]), FrameStatus::NeedMore);
+        assert_eq!(framer.advance(sample), FrameStatus::Ready);
+        let parsed = parse_object_body(sample, (1, 0), 0).unwrap();
+        let prefix = usize::try_from(parsed.stream_prefix.unwrap()).unwrap();
+        assert_eq!(&sample[parsed.consumed + prefix..parsed.consumed + prefix + 1], b"x");
+    }
+
+    #[test]
+    fn two_mib_literal_is_framed_linearly_and_parsed_once_from_nonoverlapping_growth_reads() {
+        let literal_length = 2_usize * 1_024 * 1_024;
+        let mut body = Vec::with_capacity(literal_length + 16);
+        body.push(b'(');
+        body.resize(literal_length + 1, b'x');
+        body.extend_from_slice(b")\nendobj\n");
+
+        let mut framer = DirectObjectFramer::new();
+        for end in (1..body.len()).step_by(7_919) {
+            assert_ne!(framer.advance(&body[..end]), FrameStatus::Invalid);
+        }
+        assert_eq!(framer.advance(&body), FrameStatus::Ready);
+        assert!(framer.scanned_bytes <= body.len());
+
+        let object_offset = 1_024_u64 * 1_024;
+        let mut object = b"1 0 obj\n".to_vec();
+        object.extend_from_slice(&body);
+        let xref = object_offset + u64::try_from(object.len()).unwrap() + 1_024;
+        let xref_bytes = format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .into_bytes();
+        let source = Arc::new(OverlaySource {
+            len: xref + u64::try_from(xref_bytes.len()).unwrap(),
+            regions: vec![(0, b"%PDF-1.7\n".to_vec()), (object_offset, object), (xref, xref_bytes)],
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open(
+            source.clone(),
+            ResolverLimits {
+                max_object_bytes: 3 * 1_024 * 1_024,
+                ..ResolverLimits::default()
+            },
+        )
+        .unwrap();
+        source.requests.lock().unwrap().clear();
+        OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
+        assert_eq!(reader.resolve((1, 0)).unwrap().as_str().unwrap().len(), literal_length);
+        OBJECT_BODY_PARSE_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+
+        let body_offset = object_offset + u64::try_from(b"1 0 obj\n".len()).unwrap();
+        let requests = source.requests.lock().unwrap();
+        let mut growth: Vec<_> = requests
+            .iter()
+            .copied()
+            .filter(|(offset, _)| *offset >= body_offset && *offset < xref)
+            .collect();
+        growth.sort_unstable();
+        for pair in growth.windows(2) {
+            assert!(pair[0].0 + u64::try_from(pair[0].1).unwrap() <= pair[1].0, "{pair:?}");
         }
     }
 
