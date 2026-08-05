@@ -1,9 +1,34 @@
 use lopdf::{BytesSource, RandomAccessSource, SourceError};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct PartialSource {
     bytes: Arc<[u8]>,
     offsets: Mutex<Vec<u64>>,
+}
+
+struct InterruptingSource {
+    bytes: Arc<[u8]>,
+    calls: AtomicUsize,
+}
+
+impl RandomAccessSource for InterruptingSource {
+    fn len(&self) -> Result<u64, SourceError> {
+        u64::try_from(self.bytes.len()).map_err(|_| SourceError::PlatformLimitExceeded {
+            requested: u64::MAX,
+            limit: u64::MAX,
+        })
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, SourceError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+        }
+        let start = usize::try_from(offset).unwrap();
+        let read = out.len().min(self.bytes.len() - start);
+        out[..read].copy_from_slice(&self.bytes[start..start + read]);
+        Ok(read)
+    }
 }
 
 impl PartialSource {
@@ -40,6 +65,19 @@ fn exact_reads_trace_each_partial_offset() {
 
     assert_eq!(bytes, b"12345");
     assert_eq!(*source.offsets.lock().unwrap(), vec![1, 3, 5]);
+}
+
+#[test]
+fn exact_reads_retry_interrupted_sources() {
+    let source = InterruptingSource {
+        bytes: Arc::from(&b"retry"[..]),
+        calls: AtomicUsize::new(0),
+    };
+    let mut output = [0_u8; 5];
+
+    source.read_exact_at(0, &mut output).unwrap();
+    assert_eq!(&output, b"retry");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -103,6 +141,48 @@ mod file {
         let source = FileSource::from_file(file).unwrap();
         assert_eq!(source.len().unwrap(), offset + 1);
         assert_eq!(source.read_range(offset, 1, 1).unwrap(), b"Z");
+    }
+
+    #[test]
+    fn file_and_bytes_raw_boundaries_match() {
+        let bytes = BytesSource::from(b"abcdef".to_vec());
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcdef").unwrap();
+        file.flush().unwrap();
+        let file = FileSource::from_file(file).unwrap();
+
+        for offset in [7, u64::MAX] {
+            let mut byte_output = [0_u8; 1];
+            let mut file_output = [0_u8; 1];
+            assert!(matches!(
+                bytes.read_at(offset, &mut byte_output),
+                Err(SourceError::OutOfBounds {
+                    offset: actual,
+                    length: 0,
+                    source_len: 6
+                }) if actual == offset
+            ));
+            assert!(matches!(
+                file.read_at(offset, &mut file_output),
+                Err(SourceError::OutOfBounds {
+                    offset: actual,
+                    length: 0,
+                    source_len: 6
+                }) if actual == offset
+            ));
+        }
+
+        let mut byte_empty = [];
+        let mut file_empty = [];
+        assert_eq!(bytes.read_at(6, &mut byte_empty).unwrap(), 0);
+        assert_eq!(file.read_at(6, &mut file_empty).unwrap(), 0);
+
+        let mut byte_tail = [0_u8; 1];
+        let mut file_tail = [0_u8; 1];
+        bytes.read_exact_at(5, &mut byte_tail).unwrap();
+        file.read_exact_at(5, &mut file_tail).unwrap();
+        assert_eq!(byte_tail, [b'f']);
+        assert_eq!(file_tail, byte_tail);
     }
 
     #[test]

@@ -236,6 +236,16 @@ impl RandomAccessSource for FileSource {
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+        if offset > self.len {
+            return Err(SourceError::OutOfBounds {
+                offset,
+                length: 0,
+                source_len: self.len,
+            });
+        }
+        if out.is_empty() || offset == self.len {
+            return Ok(0);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
