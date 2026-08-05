@@ -1213,10 +1213,12 @@ enum FrameLex {
     },
     ReferenceTail {
         scalar_completion: usize,
+        second_token_end: usize,
         second_completion: usize,
     },
     ReferenceComment {
         scalar_completion: usize,
+        second_token_end: Option<usize>,
         second_completion: Option<usize>,
     },
     ReferenceBoundary,
@@ -1317,12 +1319,14 @@ impl DirectObjectFramer {
                 } => self.advance_reference_second(input, scalar_completion, value),
                 FrameLex::ReferenceTail {
                     scalar_completion,
+                    second_token_end,
                     second_completion,
-                } => self.advance_reference_tail(input, scalar_completion, second_completion),
+                } => self.advance_reference_tail(input, scalar_completion, second_token_end, second_completion),
                 FrameLex::ReferenceComment {
                     scalar_completion,
+                    second_token_end,
                     second_completion,
-                } => self.advance_reference_comment(input, scalar_completion, second_completion),
+                } => self.advance_reference_comment(input, scalar_completion, second_token_end, second_completion),
                 FrameLex::ReferenceBoundary => self.advance_reference_boundary(input),
                 FrameLex::Literal { depth, escaped } => self.advance_literal(input, depth, escaped),
                 FrameLex::Hex => self.advance_hex(input),
@@ -1547,6 +1551,7 @@ impl DirectObjectFramer {
                 self.position += 1;
                 self.lex = FrameLex::ReferenceComment {
                     scalar_completion,
+                    second_token_end: None,
                     second_completion: None,
                 };
             }
@@ -1581,17 +1586,21 @@ impl DirectObjectFramer {
         } else {
             self.lex = FrameLex::ReferenceTail {
                 scalar_completion,
+                second_token_end: self.position,
                 second_completion: self.position,
             };
         }
     }
 
-    fn advance_reference_tail(&mut self, input: &[u8], scalar_completion: usize, second_completion: usize) {
+    fn advance_reference_tail(
+        &mut self, input: &[u8], scalar_completion: usize, second_token_end: usize, second_completion: usize,
+    ) {
         match input[self.position] {
             byte if is_pdf_whitespace(byte) => {
                 self.position += 1;
                 self.lex = FrameLex::ReferenceTail {
                     scalar_completion,
+                    second_token_end,
                     second_completion: self.position,
                 };
             }
@@ -1599,6 +1608,7 @@ impl DirectObjectFramer {
                 self.position += 1;
                 self.lex = FrameLex::ReferenceComment {
                     scalar_completion,
+                    second_token_end: Some(second_token_end),
                     second_completion: Some(second_completion),
                 };
             }
@@ -1606,18 +1616,22 @@ impl DirectObjectFramer {
                 self.position += 1;
                 self.lex = FrameLex::ReferenceBoundary;
             }
-            b'.' => self.fallback_integer(scalar_completion),
+            b'.' if self.position == second_token_end => self.fallback_integer(scalar_completion),
             _ => self.fallback_two_integers(scalar_completion, second_completion),
         }
     }
 
-    fn advance_reference_comment(&mut self, input: &[u8], scalar_completion: usize, second_completion: Option<usize>) {
+    fn advance_reference_comment(
+        &mut self, input: &[u8], scalar_completion: usize, second_token_end: Option<usize>,
+        second_completion: Option<usize>,
+    ) {
         let byte = input[self.position];
         self.position += 1;
         if matches!(byte, b'\r' | b'\n') {
             self.lex = if second_completion.is_some() {
                 FrameLex::ReferenceTail {
                     scalar_completion,
+                    second_token_end: second_token_end.unwrap(),
                     second_completion: self.position,
                 }
             } else {
@@ -3770,6 +3784,38 @@ mod tests {
             framer.scanned_work,
             body.len()
         );
+    }
+
+    #[test]
+    fn reference_probe_distinguishes_adjacent_decimal_from_separated_scalar() {
+        let mut spaced = b"[1 2".to_vec();
+        spaced.extend(std::iter::repeat_n(b' ', 127));
+        spaced.extend_from_slice(b".3] ");
+
+        let mut commented = b"[1 2%".to_vec();
+        commented.extend(std::iter::repeat_n(b'x', 256 * 1_024));
+        commented.extend_from_slice(b"\n.3] ");
+
+        for body in [b"[1 2.3] ".to_vec(), spaced, commented] {
+            let expected = if body == b"[1 2.3] " {
+                Object::Array(vec![Object::Integer(1), Object::Real(2.3)])
+            } else {
+                Object::Array(vec![Object::Integer(1), Object::Integer(2), Object::Real(0.3)])
+            };
+            assert_eq!(crate::parser::direct_object_with_consumed(&body).unwrap().1, expected);
+
+            let mut framer = DirectObjectFramer::new();
+            for end in (1..body.len()).step_by(7_919) {
+                assert_ne!(framer.advance(&body[..end]), FrameStatus::Invalid);
+            }
+            assert_eq!(framer.advance(&body), FrameStatus::Ready);
+            assert!(
+                framer.scanned_work <= body.len() + 6,
+                "work={} input={} expected={expected:?}",
+                framer.scanned_work,
+                body.len()
+            );
+        }
     }
 
     #[test]
