@@ -32,15 +32,18 @@ const DEFAULT_PAGE_TREE_DEPTH_LIMIT: usize = 256;
 const DEFAULT_PAGE_COUNT_LIMIT: usize = 1_000_000;
 const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
 
-type IndexResult<T> = std::result::Result<T, IndexError>;
+/// Result returned by the indexed random-access reader.
+pub type IndexedReaderResult<T> = std::result::Result<T, IndexedReaderError>;
 
 #[cfg(test)]
 thread_local! {
     static OBJECT_BODY_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Structured failures produced while opening or resolving an indexed PDF.
 #[derive(Debug, Error)]
-pub(crate) enum IndexError {
+#[non_exhaustive]
+pub enum IndexedReaderError {
     #[error("indexed source error")]
     Source(#[from] SourceError),
     #[error("invalid PDF header in the first {limit} bytes")]
@@ -141,9 +144,9 @@ pub(crate) enum IndexXrefType {
     Stream,
 }
 
-#[derive(Debug)]
 pub(crate) struct PdfIndex {
     pub(crate) version: String,
+    pub(crate) source_len: u64,
     pub(crate) source_origin: u64,
     pub(crate) xref_start: u64,
     pub(crate) xref_type: IndexXrefType,
@@ -154,8 +157,58 @@ pub(crate) struct PdfIndex {
     pub(crate) encrypt_object_id: Option<crate::ObjectId>,
 }
 
+/// Resource limits and optional password used by [`IndexedReader`].
+///
+/// Defaults preserve the indexed reader's bounded compatibility profile.
+#[derive(Clone)]
+pub struct IndexedReaderOptions {
+    /// Maximum bytes parsed while resolving one ordinary object.
+    pub object_bytes: u64,
+    /// Maximum declared or decoded bytes retained for one stream.
+    pub stream_bytes: u64,
+    /// Maximum bytes inspected after a declared stream payload.
+    pub endstream_tail_bytes: u64,
+    /// Maximum recursive object/reference resolution depth.
+    pub reference_depth: usize,
+    /// Maximum page-tree depth followed while deriving a page map.
+    pub page_tree_depth: usize,
+    /// Maximum leaf pages retained in a derived page map.
+    pub max_pages: usize,
+    /// Optional raw PDF password. Debug output always redacts its value.
+    pub password: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for IndexedReaderOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexedReaderOptions")
+            .field("object_bytes", &self.object_bytes)
+            .field("stream_bytes", &self.stream_bytes)
+            .field("endstream_tail_bytes", &self.endstream_tail_bytes)
+            .field("reference_depth", &self.reference_depth)
+            .field("page_tree_depth", &self.page_tree_depth)
+            .field("max_pages", &self.max_pages)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl Default for IndexedReaderOptions {
+    fn default() -> Self {
+        Self {
+            object_bytes: DEFAULT_OBJECT_LIMIT,
+            stream_bytes: DEFAULT_STREAM_LIMIT,
+            endstream_tail_bytes: DEFAULT_ENDSTREAM_TAIL_LIMIT,
+            reference_depth: DEFAULT_LENGTH_DEPTH_LIMIT,
+            page_tree_depth: DEFAULT_PAGE_TREE_DEPTH_LIMIT,
+            max_pages: DEFAULT_PAGE_COUNT_LIMIT,
+            password: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ResolverLimits {
+struct ResolverLimits {
     pub(crate) max_object_bytes: u64,
     pub(crate) max_stream_bytes: u64,
     pub(crate) max_endstream_tail_bytes: u64,
@@ -173,21 +226,54 @@ impl Default for ResolverLimits {
     }
 }
 
-pub(crate) struct IndexedReader {
+impl From<&IndexedReaderOptions> for ResolverLimits {
+    fn from(options: &IndexedReaderOptions) -> Self {
+        Self {
+            max_object_bytes: options.object_bytes,
+            max_stream_bytes: options.stream_bytes,
+            max_endstream_tail_bytes: options.endstream_tail_bytes,
+            max_length_depth: options.reference_depth,
+        }
+    }
+}
+
+/// Immutable indexed reader over a cursor-free random-access source.
+///
+/// All reads are synchronous. Custom sources must be thread-safe and must keep
+/// their length and bytes stable for the reader's lifetime. Resolved objects
+/// and page maps are owned, so independent calls may run concurrently.
+pub struct IndexedReader {
     source: Arc<dyn RandomAccessSource>,
-    pub(crate) index: PdfIndex,
+    index: Arc<PdfIndex>,
     limits: ResolverLimits,
+    options: IndexedReaderOptions,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct InheritedPageAttributeOwners {
-    pub(crate) resources: Option<crate::ObjectId>,
-    pub(crate) media_box: Option<crate::ObjectId>,
-    pub(crate) crop_box: Option<crate::ObjectId>,
-    pub(crate) rotate: Option<crate::ObjectId>,
+pub struct InheritedPageAttributeOwners {
+    resources: Option<crate::ObjectId>,
+    media_box: Option<crate::ObjectId>,
+    crop_box: Option<crate::ObjectId>,
+    rotate: Option<crate::ObjectId>,
 }
 
 impl InheritedPageAttributeOwners {
+    pub fn resources(&self) -> Option<crate::ObjectId> {
+        self.resources
+    }
+
+    pub fn media_box(&self) -> Option<crate::ObjectId> {
+        self.media_box
+    }
+
+    pub fn crop_box(&self) -> Option<crate::ObjectId> {
+        self.crop_box
+    }
+
+    pub fn rotate(&self) -> Option<crate::ObjectId> {
+        self.rotate
+    }
+
     fn updated(mut self, owner: crate::ObjectId, dictionary: &Dictionary) -> Self {
         if dictionary.has(b"Resources") {
             self.resources = Some(owner);
@@ -206,14 +292,42 @@ impl InheritedPageAttributeOwners {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PageMapEntry {
-    pub(crate) id: crate::ObjectId,
-    pub(crate) inherited: InheritedPageAttributeOwners,
+pub struct PageMapEntry {
+    id: crate::ObjectId,
+    inherited: InheritedPageAttributeOwners,
+}
+
+impl PageMapEntry {
+    pub fn id(&self) -> crate::ObjectId {
+        self.id
+    }
+
+    pub fn inherited(&self) -> &InheritedPageAttributeOwners {
+        &self.inherited
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PageMap {
-    pub(crate) pages: Vec<PageMapEntry>,
+pub struct PageMap {
+    pages: Vec<PageMapEntry>,
+}
+
+impl PageMap {
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&PageMapEntry> {
+        self.pages.get(index)
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &PageMapEntry> + DoubleEndedIterator + '_ {
+        self.pages.iter()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -254,21 +368,29 @@ struct PageMapWork {
 }
 
 impl PageMap {
-    pub(crate) fn from_reader(reader: &IndexedReader) -> IndexResult<Self> {
-        Self::from_reader_with_limits(reader, PageMapLimits::default())
+    fn from_reader(reader: &IndexedReader) -> IndexedReaderResult<Self> {
+        Self::from_reader_with_limits(
+            reader,
+            PageMapLimits {
+                max_depth: reader.options.page_tree_depth,
+                max_pages: reader.options.max_pages,
+            },
+        )
     }
 
-    fn from_reader_with_limits(reader: &IndexedReader, limits: PageMapLimits) -> IndexResult<Self> {
+    fn from_reader_with_limits(reader: &IndexedReader, limits: PageMapLimits) -> IndexedReaderResult<Self> {
         Self::from_reader_with_limits_and_work(reader, limits).map(|(page_map, _)| page_map)
     }
 
-    fn from_reader_with_limits_and_work(reader: &IndexedReader, limits: PageMapLimits) -> IndexResult<(Self, usize)> {
+    fn from_reader_with_limits_and_work(
+        reader: &IndexedReader, limits: PageMapLimits,
+    ) -> IndexedReaderResult<(Self, usize)> {
         Self::from_reader_with_limits_and_stats(reader, limits).map(|(page_map, work)| (page_map, work.consumed))
     }
 
     fn from_reader_with_limits_and_stats(
         reader: &IndexedReader, limits: PageMapLimits,
-    ) -> IndexResult<(Self, PageMapWork)> {
+    ) -> IndexedReaderResult<(Self, PageMapWork)> {
         let work_budget = reader
             .index
             .locations
@@ -280,7 +402,7 @@ impl PageMap {
 
     fn from_reader_with_work_budget_and_stats(
         reader: &IndexedReader, limits: PageMapLimits, work_budget: usize,
-    ) -> IndexResult<(Self, PageMapWork)> {
+    ) -> IndexedReaderResult<(Self, PageMapWork)> {
         let Some(root_id) = reader
             .index
             .trailer
@@ -320,7 +442,7 @@ impl PageMap {
 }
 
 impl PageMapBuilder<'_> {
-    fn walk_page_tree(&mut self, page_map: &mut PageMap, root_id: crate::ObjectId) -> IndexResult<()> {
+    fn walk_page_tree(&mut self, page_map: &mut PageMap, root_id: crate::ObjectId) -> IndexedReaderResult<()> {
         let Some(mut root) = self.reader.resolve_dictionary_deref(root_id)? else {
             return Ok(());
         };
@@ -352,7 +474,7 @@ impl PageMapBuilder<'_> {
             match dictionary.get_type() {
                 Ok(b"Page") => {
                     if page_map.pages.len() >= self.limits.max_pages {
-                        return Err(IndexError::PageCountLimitExceeded {
+                        return Err(IndexedReaderError::PageCountLimitExceeded {
                             limit: self.limits.max_pages,
                         });
                     }
@@ -393,25 +515,103 @@ impl PageMapBuilder<'_> {
 }
 
 impl IndexedReader {
-    pub(crate) fn open(source: Arc<dyn RandomAccessSource>, limits: ResolverLimits) -> IndexResult<Self> {
-        Self::open_with_password(source, limits, None)
+    /// Open a source with the default bounded options.
+    pub fn open<S: RandomAccessSource>(source: S) -> IndexedReaderResult<Self> {
+        Self::open_with_options(source, IndexedReaderOptions::default())
     }
 
-    pub(crate) fn open_with_password(
-        source: Arc<dyn RandomAccessSource>, limits: ResolverLimits, password: Option<&[u8]>,
-    ) -> IndexResult<Self> {
+    /// Open a source with explicit resource limits and password handling.
+    pub fn open_with_options<S: RandomAccessSource>(
+        source: S, options: IndexedReaderOptions,
+    ) -> IndexedReaderResult<Self> {
+        Self::open_shared(Arc::new(source), options)
+    }
+
+    /// Open a shared source without adding another source allocation.
+    pub fn open_shared(
+        source: Arc<dyn RandomAccessSource>, options: IndexedReaderOptions,
+    ) -> IndexedReaderResult<Self> {
+        Self::from_erased_source(source, options)
+    }
+
+    fn from_erased_source(
+        source: Arc<dyn RandomAccessSource>, mut options: IndexedReaderOptions,
+    ) -> IndexedReaderResult<Self> {
         let index = PdfIndex::open(Arc::clone(&source))?;
-        let mut reader = Self { source, index, limits };
-        reader.initialize_encryption(password)?;
+        let limits = ResolverLimits::from(&options);
+        let password = options.password.take();
+        let mut reader = Self {
+            source,
+            index: Arc::new(index),
+            limits,
+            options,
+        };
+        reader.initialize_encryption(password.as_deref())?;
         Ok(reader)
     }
 
-    pub(crate) fn resolve(&self, id: crate::ObjectId) -> IndexResult<Object> {
+    fn open_with_limits(source: Arc<dyn RandomAccessSource>, limits: ResolverLimits) -> IndexedReaderResult<Self> {
+        let options = IndexedReaderOptions {
+            object_bytes: limits.max_object_bytes,
+            stream_bytes: limits.max_stream_bytes,
+            endstream_tail_bytes: limits.max_endstream_tail_bytes,
+            reference_depth: limits.max_length_depth,
+            ..IndexedReaderOptions::default()
+        };
+        Self::from_erased_source(source, options)
+    }
+
+    fn open_with_password(
+        source: Arc<dyn RandomAccessSource>, limits: ResolverLimits, password: Option<&[u8]>,
+    ) -> IndexedReaderResult<Self> {
+        let options = IndexedReaderOptions {
+            object_bytes: limits.max_object_bytes,
+            stream_bytes: limits.max_stream_bytes,
+            endstream_tail_bytes: limits.max_endstream_tail_bytes,
+            reference_depth: limits.max_length_depth,
+            password: password.map(<[u8]>::to_vec),
+            ..IndexedReaderOptions::default()
+        };
+        Self::from_erased_source(source, options)
+    }
+
+    /// Resolve one full object id into an owned value.
+    pub fn resolve_object(&self, id: crate::ObjectId) -> IndexedReaderResult<Object> {
         let mut state = ResolutionState::default();
         self.resolve_inner(id, &mut state)
     }
 
-    fn resolve_dictionary_deref(&self, id: crate::ObjectId) -> IndexResult<Option<Dictionary>> {
+    /// Derive the actual ordered leaf-page map by walking `/Kids`.
+    pub fn page_map(&self) -> IndexedReaderResult<PageMap> {
+        PageMap::from_reader(self)
+    }
+
+    /// PDF header version, for example `"1.7"`.
+    pub fn version(&self) -> &str {
+        &self.index.version
+    }
+
+    /// Stable source length captured while the index was opened.
+    pub fn source_len(&self) -> u64 {
+        self.index.source_len
+    }
+
+    /// Whether the trailer declares an encryption dictionary.
+    pub fn is_encrypted(&self) -> bool {
+        self.index.trailer.has(b"Encrypt")
+    }
+
+    /// Whether an encrypted document has an authenticated decryption state.
+    pub fn is_authenticated(&self) -> bool {
+        self.index.encryption_state.is_some()
+    }
+
+    /// Derive and count actual leaf pages without trusting `/Count`.
+    pub fn page_count(&self) -> IndexedReaderResult<usize> {
+        self.page_map().map(|pages| pages.len())
+    }
+
+    fn resolve_dictionary_deref(&self, id: crate::ObjectId) -> IndexedReaderResult<Option<Dictionary>> {
         let Some(object) = self.resolve_page_tree_object(id)? else {
             return Ok(None);
         };
@@ -421,7 +621,7 @@ impl IndexedReader {
         })
     }
 
-    fn resolve_array_value(&self, value: Option<Object>) -> IndexResult<Option<Vec<Object>>> {
+    fn resolve_array_value(&self, value: Option<Object>) -> IndexedReaderResult<Option<Vec<Object>>> {
         let Some(value) = value else {
             return Ok(None);
         };
@@ -431,7 +631,7 @@ impl IndexedReader {
         })
     }
 
-    fn resolve_deref_value(&self, mut object: Object) -> IndexResult<Option<Object>> {
+    fn resolve_deref_value(&self, mut object: Object) -> IndexedReaderResult<Option<Object>> {
         let mut seen = HashSet::new();
         let mut dereferences = 0;
         while let Object::Reference(id) = object {
@@ -447,40 +647,40 @@ impl IndexedReader {
         Ok(Some(object))
     }
 
-    fn resolve_page_tree_object(&self, id: crate::ObjectId) -> IndexResult<Option<Object>> {
-        match self.resolve(id) {
+    fn resolve_page_tree_object(&self, id: crate::ObjectId) -> IndexedReaderResult<Option<Object>> {
+        match self.resolve_object(id) {
             Ok(object) => Ok(Some(object)),
             Err(
-                error @ IndexError::ObjectStreamMember {
+                error @ IndexedReaderError::ObjectStreamMember {
                     source:
                         crate::Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }) | crate::Error::IO(_),
                     ..
                 },
             ) => Err(error),
             Err(
-                IndexError::MissingNormalObject { .. }
-                | IndexError::GenerationMismatch { .. }
-                | IndexError::IndirectObjectMismatch { .. }
-                | IndexError::InvalidIndirectObject { .. }
-                | IndexError::IncompleteObject { .. }
-                | IndexError::NegativeStreamLength { .. }
-                | IndexError::MissingEndstream { .. }
-                | IndexError::ResolutionCycle { .. }
-                | IndexError::ObjectStreamContainerNotStream { .. }
-                | IndexError::ObjectStreamMember { .. },
+                IndexedReaderError::MissingNormalObject { .. }
+                | IndexedReaderError::GenerationMismatch { .. }
+                | IndexedReaderError::IndirectObjectMismatch { .. }
+                | IndexedReaderError::InvalidIndirectObject { .. }
+                | IndexedReaderError::IncompleteObject { .. }
+                | IndexedReaderError::NegativeStreamLength { .. }
+                | IndexedReaderError::MissingEndstream { .. }
+                | IndexedReaderError::ResolutionCycle { .. }
+                | IndexedReaderError::ObjectStreamContainerNotStream { .. }
+                | IndexedReaderError::ObjectStreamMember { .. },
             ) => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    fn resolve_inner(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
+    fn resolve_inner(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
         if state.depth >= self.limits.max_length_depth {
-            return Err(IndexError::ResolutionDepthExceeded {
+            return Err(IndexedReaderError::ResolutionDepthExceeded {
                 limit: self.limits.max_length_depth,
             });
         }
         if !state.active.insert(id) {
-            return Err(IndexError::ResolutionCycle { id });
+            return Err(IndexedReaderError::ResolutionCycle { id });
         }
         state.depth += 1;
         let result = match self.index.locations.get(&id.0).cloned() {
@@ -488,7 +688,7 @@ impl IndexedReader {
             Some(ObjectLocation64::Compressed { container, index }) => {
                 self.resolve_compressed(id, container, index, state)
             }
-            Some(ObjectLocation64::Free { .. }) | None => Err(IndexError::MissingNormalObject { id }),
+            Some(ObjectLocation64::Free { .. }) | None => Err(IndexedReaderError::MissingNormalObject { id }),
         };
         state.depth -= 1;
         state.active.remove(&id);
@@ -497,18 +697,18 @@ impl IndexedReader {
 
     fn resolve_compressed(
         &self, id: crate::ObjectId, container: u32, index: u32, state: &mut ResolutionState,
-    ) -> IndexResult<Object> {
+    ) -> IndexedReaderResult<Object> {
         if id.1 != 0 {
-            return Err(IndexError::GenerationMismatch { id, indexed: 0 });
+            return Err(IndexedReaderError::GenerationMismatch { id, indexed: 0 });
         }
         let container = (container, 0);
         if state.depth >= self.limits.max_length_depth {
-            return Err(IndexError::ResolutionDepthExceeded {
+            return Err(IndexedReaderError::ResolutionDepthExceeded {
                 limit: self.limits.max_length_depth,
             });
         }
         if !state.active.insert(container) {
-            return Err(IndexError::ResolutionCycle { id: container });
+            return Err(IndexedReaderError::ResolutionCycle { id: container });
         }
         state.depth += 1;
         // Object streams must themselves be ordinary, generation-zero indirect
@@ -519,11 +719,11 @@ impl IndexedReader {
 
         let object = resolved?;
         let Object::Stream(stream) = object else {
-            return Err(IndexError::ObjectStreamContainerNotStream { id, container });
+            return Err(IndexedReaderError::ObjectStreamContainerNotStream { id, container });
         };
         let limit = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
         ObjectStream::parse_selected_member_with_limit(&stream, id, index, Some(limit)).map_err(|source| {
-            IndexError::ObjectStreamMember {
+            IndexedReaderError::ObjectStreamMember {
                 id,
                 container,
                 index,
@@ -532,29 +732,29 @@ impl IndexedReader {
         })
     }
 
-    fn resolve_normal(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
+    fn resolve_normal(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
         let mut object = self.resolve_normal_plain(id, state)?;
         if self.index.encrypt_object_id != Some(id)
             && let Some(encryption_state) = &self.index.encryption_state
         {
             encryption::decrypt_object(encryption_state, id, &mut object)
-                .map_err(|source| IndexError::ObjectDecryption { id, source })?;
+                .map_err(|source| IndexedReaderError::ObjectDecryption { id, source })?;
         }
         Ok(object)
     }
 
-    fn resolve_normal_plain(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<Object> {
+    fn resolve_normal_plain(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
         let location = self
             .index
             .locations
             .get(&id.0)
-            .ok_or(IndexError::MissingNormalObject { id })?;
+            .ok_or(IndexedReaderError::MissingNormalObject { id })?;
         let (offset, indexed_generation) = match location {
             ObjectLocation64::Normal { offset, generation } => (*offset, *generation),
-            _ => return Err(IndexError::MissingNormalObject { id }),
+            _ => return Err(IndexedReaderError::MissingNormalObject { id }),
         };
         if indexed_generation != id.1 {
-            return Err(IndexError::GenerationMismatch {
+            return Err(IndexedReaderError::GenerationMismatch {
                 id,
                 indexed: indexed_generation,
             });
@@ -564,24 +764,26 @@ impl IndexedReader {
             .index
             .source_origin
             .checked_add(offset)
-            .ok_or(IndexError::InvalidIndirectObject { id, offset })?;
+            .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
         let source_len = self.source.len()?;
         let header = read_window(self.source.as_ref(), source_len, physical, INDIRECT_HEADER_LIMIT)?;
-        let (actual, header_bytes) = parse_indirect_header(&header).ok_or(IndexError::IndirectHeaderLimitExceeded {
-            offset,
-            limit: INDIRECT_HEADER_LIMIT,
-        })?;
+        let (actual, header_bytes) =
+            parse_indirect_header(&header).ok_or(IndexedReaderError::IndirectHeaderLimitExceeded {
+                offset,
+                limit: INDIRECT_HEADER_LIMIT,
+            })?;
         if actual != id {
-            return Err(IndexError::IndirectObjectMismatch { expected: id, actual });
+            return Err(IndexedReaderError::IndirectObjectMismatch { expected: id, actual });
         }
-        let header_bytes = u64::try_from(header_bytes).map_err(|_| IndexError::InvalidIndirectObject { id, offset })?;
+        let header_bytes =
+            u64::try_from(header_bytes).map_err(|_| IndexedReaderError::InvalidIndirectObject { id, offset })?;
         let body_offset = physical
             .checked_add(header_bytes)
-            .ok_or(IndexError::InvalidIndirectObject { id, offset })?;
+            .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
         self.resolve_body(id, body_offset, source_len, state)
     }
 
-    fn initialize_encryption(&mut self, password: Option<&[u8]>) -> IndexResult<()> {
+    fn initialize_encryption(&mut self, password: Option<&[u8]>) -> IndexedReaderResult<()> {
         let Ok(encrypt) = self.index.trailer.get(b"Encrypt") else {
             return Ok(());
         };
@@ -592,11 +794,11 @@ impl IndexedReader {
             let object = self.resolve_normal_plain(id, &mut state)?;
             let dictionary = object
                 .as_dict()
-                .map_err(|_| IndexError::InvalidEncryptDictionary)?
+                .map_err(|_| IndexedReaderError::InvalidEncryptDictionary)?
                 .clone();
             (dictionary, Some(id))
         } else {
-            return Err(IndexError::InvalidEncryptDictionary);
+            return Err(IndexedReaderError::InvalidEncryptDictionary);
         };
         let file_id = self
             .index
@@ -606,25 +808,26 @@ impl IndexedReader {
             .and_then(|id| id.as_array().ok())
             .and_then(|ids| ids.first())
             .and_then(|id| id.as_str().ok());
-        let algorithm = PasswordAlgorithm::try_from(&dictionary).map_err(IndexError::Encryption)?;
+        let algorithm = PasswordAlgorithm::try_from(&dictionary).map_err(IndexedReaderError::Encryption)?;
 
         let selected = if let Some(selected) = authenticate_password(&algorithm, file_id, b"")? {
             selected
         } else if let Some(password) = password {
-            authenticate_password(&algorithm, file_id, password)?.ok_or(IndexError::InvalidPassword)?
+            authenticate_password(&algorithm, file_id, password)?.ok_or(IndexedReaderError::InvalidPassword)?
         } else {
-            return Err(IndexError::PasswordRequired);
+            return Err(IndexedReaderError::PasswordRequired);
         };
-        let state =
-            EncryptionState::decode_from_dictionary(&dictionary, file_id, &selected).map_err(IndexError::Encryption)?;
-        self.index.encryption_state = Some(state);
-        self.index.encrypt_object_id = encrypt_object_id;
+        let state = EncryptionState::decode_from_dictionary(&dictionary, file_id, &selected)
+            .map_err(IndexedReaderError::Encryption)?;
+        let index = Arc::get_mut(&mut self.index).expect("index is not shared during reader construction");
+        index.encryption_state = Some(state);
+        index.encrypt_object_id = encrypt_object_id;
         Ok(())
     }
 
     fn resolve_body(
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64, state: &mut ResolutionState,
-    ) -> IndexResult<Object> {
+    ) -> IndexedReaderResult<Object> {
         let remaining = source_len.checked_sub(body_offset).ok_or(SourceError::OutOfBounds {
             offset: body_offset,
             length: 0,
@@ -637,7 +840,7 @@ impl IndexedReader {
         loop {
             let frame_status = object_framer.advance(&window);
             if frame_status == FrameStatus::Invalid {
-                return Err(IndexError::InvalidIndirectObject {
+                return Err(IndexedReaderError::InvalidIndirectObject {
                     id,
                     offset: body_offset,
                 });
@@ -647,18 +850,18 @@ impl IndexedReader {
                 return self.finish_object(id, body_offset, source_len, parsed, state);
             }
 
-            let current = u64::try_from(window.len()).map_err(|_| IndexError::ObjectLimitExceeded {
+            let current = u64::try_from(window.len()).map_err(|_| IndexedReaderError::ObjectLimitExceeded {
                 id,
                 limit: self.limits.max_object_bytes,
             })?;
             if current >= maximum {
                 return if remaining > self.limits.max_object_bytes {
-                    Err(IndexError::ObjectLimitExceeded {
+                    Err(IndexedReaderError::ObjectLimitExceeded {
                         id,
                         limit: self.limits.max_object_bytes,
                     })
                 } else {
-                    Err(IndexError::IncompleteObject {
+                    Err(IndexedReaderError::IncompleteObject {
                         id,
                         offset: body_offset,
                     })
@@ -672,12 +875,13 @@ impl IndexedReader {
                 .min(current.saturating_add(OBJECT_GROWTH_CHUNK))
                 .min(maximum);
             let extension_length = target - current;
-            let extension_offset = body_offset
-                .checked_add(current)
-                .ok_or(IndexError::InvalidIndirectObject {
-                    id,
-                    offset: body_offset,
-                })?;
+            let extension_offset =
+                body_offset
+                    .checked_add(current)
+                    .ok_or(IndexedReaderError::InvalidIndirectObject {
+                        id,
+                        offset: body_offset,
+                    })?;
             let extension = self
                 .source
                 .read_range(extension_offset, extension_length, extension_length)?;
@@ -688,7 +892,7 @@ impl IndexedReader {
     fn finish_object(
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64, parsed: ParsedObject,
         state: &mut ResolutionState,
-    ) -> IndexResult<Object> {
+    ) -> IndexedReaderResult<Object> {
         let ParsedObject {
             object,
             consumed,
@@ -698,19 +902,21 @@ impl IndexedReader {
             return Ok(object);
         };
         let Object::Dictionary(dictionary) = object else {
-            return Err(IndexError::InvalidIndirectObject {
+            return Err(IndexedReaderError::InvalidIndirectObject {
                 id,
                 offset: body_offset,
             });
         };
 
         let stream_start = body_offset
-            .checked_add(u64::try_from(consumed).map_err(|_| IndexError::InvalidIndirectObject {
-                id,
-                offset: body_offset,
-            })?)
+            .checked_add(
+                u64::try_from(consumed).map_err(|_| IndexedReaderError::InvalidIndirectObject {
+                    id,
+                    offset: body_offset,
+                })?,
+            )
             .and_then(|offset| offset.checked_add(stream_prefix))
-            .ok_or(IndexError::InvalidIndirectObject {
+            .ok_or(IndexedReaderError::InvalidIndirectObject {
                 id,
                 offset: body_offset,
             })?;
@@ -721,26 +927,25 @@ impl IndexedReader {
             // Stream positions in eager `Document` objects are relative to the
             // PDF header, even when transport junk precedes it. The indexed
             // source offsets are physical, so rebase before exposing parity.
-            let relative_stream_start =
-                stream_start
-                    .checked_sub(self.index.source_origin)
-                    .ok_or(IndexError::InvalidIndirectObject {
-                        id,
-                        offset: stream_start,
-                    })?;
+            let relative_stream_start = stream_start.checked_sub(self.index.source_origin).ok_or(
+                IndexedReaderError::InvalidIndirectObject {
+                    id,
+                    offset: stream_start,
+                },
+            )?;
             let stream_start =
-                usize::try_from(relative_stream_start).map_err(|_| IndexError::InvalidIndirectObject {
+                usize::try_from(relative_stream_start).map_err(|_| IndexedReaderError::InvalidIndirectObject {
                     id,
                     offset: stream_start,
                 })?;
             return Ok(Object::Stream(Stream::with_position(dictionary, stream_start)));
         };
         if length < 0 {
-            return Err(IndexError::NegativeStreamLength { id, length });
+            return Err(IndexedReaderError::NegativeStreamLength { id, length });
         }
-        let length = u64::try_from(length).map_err(|_| IndexError::NegativeStreamLength { id, length })?;
+        let length = u64::try_from(length).map_err(|_| IndexedReaderError::NegativeStreamLength { id, length })?;
         if length > self.limits.max_stream_bytes {
-            return Err(IndexError::StreamLimitExceeded {
+            return Err(IndexedReaderError::StreamLimitExceeded {
                 id,
                 length,
                 limit: self.limits.max_stream_bytes,
@@ -749,7 +954,7 @@ impl IndexedReader {
 
         let stream_end = stream_start
             .checked_add(length)
-            .ok_or(IndexError::InvalidIndirectObject {
+            .ok_or(IndexedReaderError::InvalidIndirectObject {
                 id,
                 offset: stream_start,
             })?;
@@ -764,7 +969,7 @@ impl IndexedReader {
         )? {
             EndstreamStatus::Found => {}
             EndstreamStatus::Missing => return Ok(Object::Dictionary(dictionary)),
-            EndstreamStatus::LimitExceeded => return Err(IndexError::MissingEndstream { id }),
+            EndstreamStatus::LimitExceeded => return Err(IndexedReaderError::MissingEndstream { id }),
         }
         let content = self
             .source
@@ -772,7 +977,9 @@ impl IndexedReader {
         Ok(Object::Stream(Stream::new(dictionary, content)))
     }
 
-    fn resolve_stream_length(&self, dictionary: &Dictionary, state: &mut ResolutionState) -> IndexResult<Option<i64>> {
+    fn resolve_stream_length(
+        &self, dictionary: &Dictionary, state: &mut ResolutionState,
+    ) -> IndexedReaderResult<Option<i64>> {
         let Ok(length) = dictionary.get(b"Length") else {
             return Ok(None);
         };
@@ -788,20 +995,20 @@ impl IndexedReader {
         Ok(self.resolve_length_reference(reference, state).ok())
     }
 
-    fn resolve_length_reference(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexResult<i64> {
+    fn resolve_length_reference(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<i64> {
         if state.depth >= self.limits.max_length_depth {
-            return Err(IndexError::ResolutionDepthExceeded {
+            return Err(IndexedReaderError::ResolutionDepthExceeded {
                 limit: self.limits.max_length_depth,
             });
         }
         if !state.active.insert(id) {
-            return Err(IndexError::ResolutionCycle { id });
+            return Err(IndexedReaderError::ResolutionCycle { id });
         }
         state.depth += 1;
         let result = self.resolve_normal(id, state).and_then(|object| match object {
             Object::Integer(value) => Ok(value),
             Object::Reference(next) => self.resolve_length_reference(next, state),
-            _ => Err(IndexError::InvalidIndirectObject { id, offset: 0 }),
+            _ => Err(IndexedReaderError::InvalidIndirectObject { id, offset: 0 }),
         });
         state.depth -= 1;
         state.active.remove(&id);
@@ -817,7 +1024,7 @@ struct ResolutionState {
 
 fn authenticate_password(
     algorithm: &PasswordAlgorithm, file_id: Option<&[u8]>, password: &[u8],
-) -> IndexResult<Option<Vec<u8>>> {
+) -> IndexedReaderResult<Option<Vec<u8>>> {
     let user = algorithm.authenticate_user_password_with_file_id(file_id, password);
     if user.is_ok() {
         return Ok(Some(password.to_vec()));
@@ -838,9 +1045,9 @@ fn authenticate_password(
                 Ok(None)
             }
             Err(crate::encryption::DecryptionError::IncorrectPassword) => {
-                Err(IndexError::Encryption(crate::Error::Decryption(owner_error)))
+                Err(IndexedReaderError::Encryption(crate::Error::Decryption(owner_error)))
             }
-            Err(user_error) => Err(IndexError::Encryption(crate::Error::Decryption(user_error))),
+            Err(user_error) => Err(IndexedReaderError::Encryption(crate::Error::Decryption(user_error))),
             Ok(()) => unreachable!(),
         },
     }
@@ -853,7 +1060,7 @@ struct ParsedObject {
 }
 
 impl PdfIndex {
-    pub(crate) fn open(source: Arc<dyn RandomAccessSource>) -> IndexResult<Self> {
+    pub(crate) fn open(source: Arc<dyn RandomAccessSource>) -> IndexedReaderResult<Self> {
         let source_len = source.len()?;
         let (source_origin, version) = read_header(source.as_ref(), source_len)?;
         let xref_start = read_startxref(source.as_ref(), source_len)?;
@@ -870,24 +1077,26 @@ impl PdfIndex {
             if !seen.insert(offset) {
                 break;
             }
-            revisions = revisions.checked_add(1).ok_or(IndexError::RevisionLimitExceeded {
-                limit: MAX_XREF_REVISIONS,
-            })?;
+            revisions = revisions
+                .checked_add(1)
+                .ok_or(IndexedReaderError::RevisionLimitExceeded {
+                    limit: MAX_XREF_REVISIONS,
+                })?;
             if revisions > MAX_XREF_REVISIONS {
-                return Err(IndexError::RevisionLimitExceeded {
+                return Err(IndexedReaderError::RevisionLimitExceeded {
                     limit: MAX_XREF_REVISIONS,
                 });
             }
 
             let physical = source_origin
                 .checked_add(offset)
-                .ok_or(IndexError::InvalidXref { offset })?;
+                .ok_or(IndexedReaderError::InvalidXref { offset })?;
             let section = read_xref_section(source.as_ref(), source_len, physical)?;
             if newest_trailer.is_none() {
                 newest_type = Some(section.kind);
                 newest_trailer = Some(section.trailer.clone());
                 declared_size =
-                    trailer_unsigned(&section.trailer, b"Size").ok_or(IndexError::InvalidTrailer { offset })?;
+                    trailer_unsigned(&section.trailer, b"Size").ok_or(IndexedReaderError::InvalidTrailer { offset })?;
             }
             merge_newest(&mut locations, section.entries);
 
@@ -896,10 +1105,10 @@ impl PdfIndex {
             if let Some(hybrid) = trailer_offset(&section.trailer, b"XRefStm", "XRefStm")? {
                 let hybrid_physical = source_origin
                     .checked_add(hybrid)
-                    .ok_or(IndexError::InvalidTrailerOffset { key: "XRefStm" })?;
+                    .ok_or(IndexedReaderError::InvalidTrailerOffset { key: "XRefStm" })?;
                 let supplement = read_xref_section(source.as_ref(), source_len, hybrid_physical)?;
                 if supplement.kind != IndexXrefType::Stream {
-                    return Err(IndexError::InvalidXref { offset: hybrid });
+                    return Err(IndexedReaderError::InvalidXref { offset: hybrid });
                 }
                 merge_newest(&mut locations, supplement.entries);
             }
@@ -907,12 +1116,13 @@ impl PdfIndex {
             next = trailer_offset(&section.trailer, b"Prev", "Prev")?;
         }
 
-        let trailer = newest_trailer.ok_or(IndexError::InvalidXref { offset: xref_start })?;
+        let trailer = newest_trailer.ok_or(IndexedReaderError::InvalidXref { offset: xref_start })?;
         Ok(Self {
             version,
+            source_len,
             source_origin,
             xref_start,
-            xref_type: newest_type.ok_or(IndexError::InvalidXref { offset: xref_start })?,
+            xref_type: newest_type.ok_or(IndexedReaderError::InvalidXref { offset: xref_start })?,
             declared_size,
             locations,
             trailer,
@@ -934,10 +1144,10 @@ fn merge_newest(target: &mut BTreeMap<u32, ObjectLocation64>, entries: BTreeMap<
     }
 }
 
-fn read_header(source: &dyn RandomAccessSource, source_len: u64) -> IndexResult<(u64, String)> {
+fn read_header(source: &dyn RandomAccessSource, source_len: u64) -> IndexedReaderResult<(u64, String)> {
     let read_limit = HEADER_SCAN_LIMIT
         .checked_add(HEADER_PARSE_OVERLAP)
-        .ok_or(IndexError::InvalidHeader {
+        .ok_or(IndexedReaderError::InvalidHeader {
             limit: HEADER_SCAN_LIMIT,
         })?;
     let length = source_len.min(read_limit);
@@ -950,43 +1160,46 @@ fn read_header(source: &dyn RandomAccessSource, source_len: u64) -> IndexResult<
                 .ok()
                 .is_some_and(|origin| origin < HEADER_SCAN_LIMIT)
         })
-        .ok_or(IndexError::InvalidHeader {
+        .ok_or(IndexedReaderError::InvalidHeader {
             limit: HEADER_SCAN_LIMIT,
         })?;
-    let version = crate::parser::header(&bytes[origin..], false).ok_or(IndexError::InvalidHeader {
+    let version = crate::parser::header(&bytes[origin..], false).ok_or(IndexedReaderError::InvalidHeader {
         limit: HEADER_SCAN_LIMIT,
     })?;
-    let origin = u64::try_from(origin).map_err(|_| IndexError::InvalidHeader {
+    let origin = u64::try_from(origin).map_err(|_| IndexedReaderError::InvalidHeader {
         limit: HEADER_SCAN_LIMIT,
     })?;
     Ok((origin, version))
 }
 
-fn read_startxref(source: &dyn RandomAccessSource, source_len: u64) -> IndexResult<u64> {
+fn read_startxref(source: &dyn RandomAccessSource, source_len: u64) -> IndexedReaderResult<u64> {
     let length = source_len.min(TAIL_SCAN_LIMIT);
     let offset = source_len
         .checked_sub(length)
-        .ok_or(IndexError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })?;
+        .ok_or(IndexedReaderError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })?;
     let tail = source.read_range(offset, length, TAIL_SCAN_LIMIT)?;
-    let eof = rfind(&tail, b"%%EOF").ok_or(IndexError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })?;
-    let marker = rfind(&tail[..eof], b"startxref").ok_or(IndexError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })?;
+    let eof = rfind(&tail, b"%%EOF").ok_or(IndexedReaderError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })?;
+    let marker =
+        rfind(&tail[..eof], b"startxref").ok_or(IndexedReaderError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })?;
     let mut cursor = TokenCursor::new(&tail[marker + b"startxref".len()..]);
     cursor
         .unsigned()
-        .ok_or(IndexError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })
+        .ok_or(IndexedReaderError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })
 }
 
 fn read_xref_section(
     source: &dyn RandomAccessSource, source_len: u64, physical_offset: u64,
-) -> IndexResult<XrefSection64> {
+) -> IndexedReaderResult<XrefSection64> {
     if physical_offset >= source_len {
-        return Err(IndexError::InvalidXref {
+        return Err(IndexedReaderError::InvalidXref {
             offset: physical_offset,
         });
     }
-    let remaining = source_len.checked_sub(physical_offset).ok_or(IndexError::InvalidXref {
-        offset: physical_offset,
-    })?;
+    let remaining = source_len
+        .checked_sub(physical_offset)
+        .ok_or(IndexedReaderError::InvalidXref {
+            offset: physical_offset,
+        })?;
     let maximum = remaining.min(XREF_WINDOW_LIMIT);
     let mut length = maximum.min(XREF_INITIAL_WINDOW);
     loop {
@@ -998,17 +1211,17 @@ fn read_xref_section(
         };
         match result {
             Ok(section) => return Ok(section),
-            Err(IndexError::IncompleteXref { .. }) if length < maximum => {
+            Err(IndexedReaderError::IncompleteXref { .. }) if length < maximum => {
                 length = length.saturating_mul(2).min(maximum);
             }
-            Err(IndexError::IncompleteXref { .. }) if remaining > XREF_WINDOW_LIMIT => {
-                return Err(IndexError::StructureLimitExceeded {
+            Err(IndexedReaderError::IncompleteXref { .. }) if remaining > XREF_WINDOW_LIMIT => {
+                return Err(IndexedReaderError::StructureLimitExceeded {
                     structure: "cross-reference section",
                     limit: XREF_WINDOW_LIMIT,
                 });
             }
-            Err(IndexError::IncompleteXref { .. }) => {
-                return Err(IndexError::InvalidXref {
+            Err(IndexedReaderError::IncompleteXref { .. }) => {
+                return Err(IndexedReaderError::InvalidXref {
                     offset: physical_offset,
                 });
             }
@@ -1017,7 +1230,7 @@ fn read_xref_section(
     }
 }
 
-fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> {
+fn parse_classic_xref(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSection64> {
     let mut cursor = TokenCursor::new(window);
     required_xref_token(&mut cursor, b"xref", offset)?;
     let mut entries = BTreeMap::new();
@@ -1028,16 +1241,16 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> 
         if cursor.remaining().is_empty()
             || (cursor.remaining().len() < b"trailer".len() && b"trailer".starts_with(cursor.remaining()))
         {
-            return Err(IndexError::IncompleteXref { offset });
+            return Err(IndexedReaderError::IncompleteXref { offset });
         }
         if cursor.consume(b"trailer") {
             let trailer = match cursor.direct_object() {
                 Some(Object::Dictionary(dictionary)) => dictionary,
-                Some(_) => return Err(IndexError::InvalidTrailer { offset }),
+                Some(_) => return Err(IndexedReaderError::InvalidTrailer { offset }),
                 None if dictionary_may_be_truncated(cursor.remaining()) => {
-                    return Err(IndexError::IncompleteXref { offset });
+                    return Err(IndexedReaderError::IncompleteXref { offset });
                 }
-                None => return Err(IndexError::InvalidTrailer { offset }),
+                None => return Err(IndexedReaderError::InvalidTrailer { offset }),
             };
             return Ok(XrefSection64 {
                 kind: IndexXrefType::Table,
@@ -1048,23 +1261,27 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> 
 
         let start = required_xref_unsigned(&mut cursor, offset)?;
         let count = required_xref_unsigned(&mut cursor, offset)?;
-        entry_count = entry_count.checked_add(count).ok_or(IndexError::EntryLimitExceeded {
-            count: u64::MAX,
-            limit: MAX_XREF_ENTRIES,
-        })?;
+        entry_count = entry_count
+            .checked_add(count)
+            .ok_or(IndexedReaderError::EntryLimitExceeded {
+                count: u64::MAX,
+                limit: MAX_XREF_ENTRIES,
+            })?;
         check_entry_limit(entry_count)?;
 
         for index in 0..count {
-            let object_number = start.checked_add(index).ok_or(IndexError::InvalidXref { offset })?;
-            let object_number = u32::try_from(object_number).map_err(|_| IndexError::InvalidXref { offset })?;
+            let object_number = start
+                .checked_add(index)
+                .ok_or(IndexedReaderError::InvalidXref { offset })?;
+            let object_number = u32::try_from(object_number).map_err(|_| IndexedReaderError::InvalidXref { offset })?;
             let field = required_xref_unsigned(&mut cursor, offset)?;
             let generation = required_xref_unsigned(&mut cursor, offset)?;
-            let generation = u16::try_from(generation).map_err(|_| IndexError::InvalidXref { offset })?;
+            let generation = u16::try_from(generation).map_err(|_| IndexedReaderError::InvalidXref { offset })?;
             cursor.skip_space();
             if cursor.remaining().is_empty() {
-                return Err(IndexError::IncompleteXref { offset });
+                return Err(IndexedReaderError::IncompleteXref { offset });
             }
-            let state = cursor.token().ok_or(IndexError::InvalidXref { offset })?;
+            let state = cursor.token().ok_or(IndexedReaderError::InvalidXref { offset })?;
             let location = match state {
                 b"n" => ObjectLocation64::Normal {
                     offset: field,
@@ -1074,97 +1291,99 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexResult<XrefSection64> 
                     next: field,
                     generation,
                 },
-                _ => return Err(IndexError::InvalidXref { offset }),
+                _ => return Err(IndexedReaderError::InvalidXref { offset }),
             };
             entries.insert(object_number, location);
         }
     }
 }
 
-fn parse_xref_stream(window: &[u8], offset: u64) -> IndexResult<XrefSection64> {
+fn parse_xref_stream(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSection64> {
     let mut cursor = TokenCursor::new(window);
     required_xref_unsigned(&mut cursor, offset)?;
     required_xref_unsigned(&mut cursor, offset)?;
     required_xref_token(&mut cursor, b"obj", offset)?;
     let dictionary = match cursor.direct_object() {
         Some(Object::Dictionary(dictionary)) => dictionary,
-        Some(_) => return Err(IndexError::InvalidTrailer { offset }),
+        Some(_) => return Err(IndexedReaderError::InvalidTrailer { offset }),
         None if dictionary_may_be_truncated(cursor.remaining()) => {
-            return Err(IndexError::IncompleteXref { offset });
+            return Err(IndexedReaderError::IncompleteXref { offset });
         }
-        None => return Err(IndexError::InvalidTrailer { offset }),
+        None => return Err(IndexedReaderError::InvalidTrailer { offset }),
     };
     required_xref_token(&mut cursor, b"stream", offset)?;
     if cursor.consume_stream_eol().is_none() {
         return if cursor.remaining().is_empty() {
-            Err(IndexError::IncompleteXref { offset })
+            Err(IndexedReaderError::IncompleteXref { offset })
         } else {
-            Err(IndexError::InvalidXref { offset })
+            Err(IndexedReaderError::InvalidXref { offset })
         };
     }
 
-    let stream_len = trailer_unsigned(&dictionary, b"Length").ok_or(IndexError::InvalidTrailer { offset })?;
-    let stream_len = usize::try_from(stream_len).map_err(|_| IndexError::StructureLimitExceeded {
+    let stream_len = trailer_unsigned(&dictionary, b"Length").ok_or(IndexedReaderError::InvalidTrailer { offset })?;
+    let stream_len = usize::try_from(stream_len).map_err(|_| IndexedReaderError::StructureLimitExceeded {
         structure: "cross-reference stream",
         limit: XREF_WINDOW_LIMIT,
     })?;
     if stream_len > cursor.remaining().len() {
-        return Err(IndexError::IncompleteXref { offset });
+        return Err(IndexedReaderError::IncompleteXref { offset });
     }
     let content = cursor
         .take(stream_len)
-        .ok_or(IndexError::IncompleteXref { offset })?
+        .ok_or(IndexedReaderError::IncompleteXref { offset })?
         .to_vec();
     cursor.consume_optional_eol();
     if !cursor.consume_exact(b"endstream") {
         return if cursor.remaining().is_empty()
             || (cursor.remaining().len() < b"endstream".len() && b"endstream".starts_with(cursor.remaining()))
         {
-            Err(IndexError::IncompleteXref { offset })
+            Err(IndexedReaderError::IncompleteXref { offset })
         } else {
-            Err(IndexError::InvalidXref { offset })
+            Err(IndexedReaderError::InvalidXref { offset })
         };
     }
     let mut stream = Stream::new(dictionary.clone(), content);
     if stream.is_compressed() {
         stream
             .decompress_with_limit(XREF_DECOMPRESSED_LIMIT)
-            .map_err(IndexError::XrefDecompression)?;
+            .map_err(IndexedReaderError::XrefDecompression)?;
     }
     decode_xref_stream64(stream, offset)
 }
 
-fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexResult<XrefSection64> {
+fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexedReaderResult<XrefSection64> {
     let mut trailer = stream.dict;
-    let size = trailer_unsigned(&trailer, b"Size").ok_or(IndexError::InvalidTrailer { offset })?;
-    let widths = integer_array(&trailer, b"W").ok_or(IndexError::InvalidXref { offset })?;
+    let size = trailer_unsigned(&trailer, b"Size").ok_or(IndexedReaderError::InvalidTrailer { offset })?;
+    let widths = integer_array(&trailer, b"W").ok_or(IndexedReaderError::InvalidXref { offset })?;
     if widths.len() < 3 || widths[..3].iter().any(|width| *width > MAX_XREF_FIELD_WIDTH) {
-        return Err(IndexError::InvalidXref { offset });
+        return Err(IndexedReaderError::InvalidXref { offset });
     }
     let indices = integer_array(&trailer, b"Index").unwrap_or_else(|| vec![0, size]);
     if !indices.chunks_exact(2).remainder().is_empty() {
-        return Err(IndexError::InvalidXref { offset });
+        return Err(IndexedReaderError::InvalidXref { offset });
     }
 
     let mut total = 0_u64;
     for pair in indices.chunks_exact(2) {
-        total = total.checked_add(pair[1]).ok_or(IndexError::EntryLimitExceeded {
-            count: u64::MAX,
-            limit: MAX_XREF_ENTRIES,
-        })?;
+        total = total
+            .checked_add(pair[1])
+            .ok_or(IndexedReaderError::EntryLimitExceeded {
+                count: u64::MAX,
+                limit: MAX_XREF_ENTRIES,
+            })?;
     }
     check_entry_limit(total)?;
 
     let entry_width = widths[..3]
         .iter()
         .try_fold(0_u64, |sum, width| sum.checked_add(*width))
-        .ok_or(IndexError::InvalidXref { offset })?;
+        .ok_or(IndexedReaderError::InvalidXref { offset })?;
     let required = total
         .checked_mul(entry_width)
-        .ok_or(IndexError::InvalidXref { offset })?;
-    let content_len = u64::try_from(stream.content.len()).map_err(|_| IndexError::InvalidXref { offset })?;
+        .ok_or(IndexedReaderError::InvalidXref { offset })?;
+    let content_len = u64::try_from(stream.content.len()).map_err(|_| IndexedReaderError::InvalidXref { offset })?;
     if required > content_len {
-        return Err(IndexError::InvalidXref { offset });
+        return Err(IndexedReaderError::InvalidXref { offset });
     }
 
     let mut content = stream.content.as_slice();
@@ -1180,20 +1399,22 @@ fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexResult<XrefSection6
             };
             let field2 = read_be(&mut content, widths[1], offset)?;
             let field3 = read_be(&mut content, widths[2], offset)?;
-            let object_number = start.checked_add(index).ok_or(IndexError::InvalidXref { offset })?;
-            let object_number = u32::try_from(object_number).map_err(|_| IndexError::InvalidXref { offset })?;
+            let object_number = start
+                .checked_add(index)
+                .ok_or(IndexedReaderError::InvalidXref { offset })?;
+            let object_number = u32::try_from(object_number).map_err(|_| IndexedReaderError::InvalidXref { offset })?;
             let location = match kind {
                 0 => ObjectLocation64::Free {
                     next: field2,
-                    generation: u16::try_from(field3).map_err(|_| IndexError::InvalidXref { offset })?,
+                    generation: u16::try_from(field3).map_err(|_| IndexedReaderError::InvalidXref { offset })?,
                 },
                 1 => ObjectLocation64::Normal {
                     offset: field2,
-                    generation: u16::try_from(field3).map_err(|_| IndexError::InvalidXref { offset })?,
+                    generation: u16::try_from(field3).map_err(|_| IndexedReaderError::InvalidXref { offset })?,
                 },
                 2 => ObjectLocation64::Compressed {
-                    container: u32::try_from(field2).map_err(|_| IndexError::InvalidXref { offset })?,
-                    index: u32::try_from(field3).map_err(|_| IndexError::InvalidXref { offset })?,
+                    container: u32::try_from(field2).map_err(|_| IndexedReaderError::InvalidXref { offset })?,
+                    index: u32::try_from(field3).map_err(|_| IndexedReaderError::InvalidXref { offset })?,
                 },
                 _ => continue,
             };
@@ -1211,16 +1432,16 @@ fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexResult<XrefSection6
     })
 }
 
-fn read_be(input: &mut &[u8], width: u64, offset: u64) -> IndexResult<u64> {
-    let width = usize::try_from(width).map_err(|_| IndexError::InvalidXref { offset })?;
-    let bytes = input.get(..width).ok_or(IndexError::InvalidXref { offset })?;
-    *input = input.get(width..).ok_or(IndexError::InvalidXref { offset })?;
+fn read_be(input: &mut &[u8], width: u64, offset: u64) -> IndexedReaderResult<u64> {
+    let width = usize::try_from(width).map_err(|_| IndexedReaderError::InvalidXref { offset })?;
+    let bytes = input.get(..width).ok_or(IndexedReaderError::InvalidXref { offset })?;
+    *input = input.get(width..).ok_or(IndexedReaderError::InvalidXref { offset })?;
     Ok(bytes.iter().fold(0_u64, |value, byte| (value << 8) | u64::from(*byte)))
 }
 
-fn check_entry_limit(count: u64) -> IndexResult<()> {
+fn check_entry_limit(count: u64) -> IndexedReaderResult<()> {
     if count > MAX_XREF_ENTRIES {
-        return Err(IndexError::EntryLimitExceeded {
+        return Err(IndexedReaderError::EntryLimitExceeded {
             count,
             limit: MAX_XREF_ENTRIES,
         });
@@ -1248,41 +1469,43 @@ fn trailer_unsigned(dictionary: &Dictionary, key: &[u8]) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
-fn trailer_offset(dictionary: &Dictionary, key: &[u8], name: &'static str) -> IndexResult<Option<u64>> {
+fn trailer_offset(dictionary: &Dictionary, key: &[u8], name: &'static str) -> IndexedReaderResult<Option<u64>> {
     match dictionary.get(key) {
         Ok(object) => object
             .as_i64()
             .ok()
             .and_then(|value| u64::try_from(value).ok())
             .map(Some)
-            .ok_or(IndexError::InvalidTrailerOffset { key: name }),
+            .ok_or(IndexedReaderError::InvalidTrailerOffset { key: name }),
         Err(_) => Ok(None),
     }
 }
 
-fn required_xref_token(cursor: &mut TokenCursor<'_>, expected: &[u8], offset: u64) -> IndexResult<()> {
+fn required_xref_token(cursor: &mut TokenCursor<'_>, expected: &[u8], offset: u64) -> IndexedReaderResult<()> {
     cursor.skip_space();
     if cursor.remaining().is_empty()
         || (cursor.remaining().len() < expected.len() && expected.starts_with(cursor.remaining()))
     {
-        return Err(IndexError::IncompleteXref { offset });
+        return Err(IndexedReaderError::IncompleteXref { offset });
     }
-    cursor.expect(expected).ok_or(IndexError::InvalidXref { offset })
+    cursor
+        .expect(expected)
+        .ok_or(IndexedReaderError::InvalidXref { offset })
 }
 
-fn required_xref_unsigned(cursor: &mut TokenCursor<'_>, offset: u64) -> IndexResult<u64> {
+fn required_xref_unsigned(cursor: &mut TokenCursor<'_>, offset: u64) -> IndexedReaderResult<u64> {
     cursor.skip_space();
     if cursor.remaining().is_empty() {
-        return Err(IndexError::IncompleteXref { offset });
+        return Err(IndexedReaderError::IncompleteXref { offset });
     }
-    let token = cursor.token().ok_or(IndexError::InvalidXref { offset })?;
+    let token = cursor.token().ok_or(IndexedReaderError::InvalidXref { offset })?;
     if !token.iter().all(u8::is_ascii_digit) {
-        return Err(IndexError::InvalidXref { offset });
+        return Err(IndexedReaderError::InvalidXref { offset });
     }
     std::str::from_utf8(token)
         .ok()
         .and_then(|token| token.parse().ok())
-        .ok_or(IndexError::InvalidXref { offset })
+        .ok_or(IndexedReaderError::InvalidXref { offset })
 }
 
 fn dictionary_may_be_truncated(input: &[u8]) -> bool {
@@ -1548,7 +1771,9 @@ fn is_pdf_delimiter(byte: u8) -> bool {
     b"()<>[]{}/%".contains(&byte)
 }
 
-fn read_window(source: &dyn RandomAccessSource, source_len: u64, offset: u64, limit: u64) -> IndexResult<Vec<u8>> {
+fn read_window(
+    source: &dyn RandomAccessSource, source_len: u64, offset: u64, limit: u64,
+) -> IndexedReaderResult<Vec<u8>> {
     let remaining = source_len.checked_sub(offset).ok_or(SourceError::OutOfBounds {
         offset,
         length: 0,
@@ -2259,22 +2484,22 @@ impl DirectObjectFramer {
     }
 }
 
-fn parse_object_body(input: &[u8], id: crate::ObjectId, offset: u64) -> IndexResult<ParsedObject> {
+fn parse_object_body(input: &[u8], id: crate::ObjectId, offset: u64) -> IndexedReaderResult<ParsedObject> {
     #[cfg(test)]
     OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let Some((consumed, object)) = crate::parser::direct_object_with_consumed(input) else {
         return if direct_object_may_be_truncated(input) {
-            Err(IndexError::IncompleteObject { id, offset })
+            Err(IndexedReaderError::IncompleteObject { id, offset })
         } else {
-            Err(IndexError::InvalidIndirectObject { id, offset })
+            Err(IndexedReaderError::InvalidIndirectObject { id, offset })
         };
     };
     if !matches!(object, Object::Dictionary(_)) {
         let remaining = input
             .get(consumed..)
-            .ok_or(IndexError::InvalidIndirectObject { id, offset })?;
+            .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
         if remaining.is_empty() || integer_reference_may_be_truncated(&object, remaining) {
-            return Err(IndexError::IncompleteObject { id, offset });
+            return Err(IndexedReaderError::IncompleteObject { id, offset });
         }
         return Ok(ParsedObject {
             object,
@@ -2285,13 +2510,13 @@ fn parse_object_body(input: &[u8], id: crate::ObjectId, offset: u64) -> IndexRes
 
     let remaining = input
         .get(consumed..)
-        .ok_or(IndexError::InvalidIndirectObject { id, offset })?;
+        .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
     let mut cursor = TokenCursor::new(remaining);
     cursor.skip_space();
     if cursor.remaining().is_empty()
         || (cursor.remaining().len() < b"stream".len() && b"stream".starts_with(cursor.remaining()))
     {
-        return Err(IndexError::IncompleteObject { id, offset });
+        return Err(IndexedReaderError::IncompleteObject { id, offset });
     }
     if !cursor.consume(b"stream") {
         return Ok(ParsedObject {
@@ -2302,7 +2527,7 @@ fn parse_object_body(input: &[u8], id: crate::ObjectId, offset: u64) -> IndexRes
     }
     if cursor.consume_stream_eol().is_none() {
         return if cursor.remaining().is_empty() {
-            Err(IndexError::IncompleteObject { id, offset })
+            Err(IndexedReaderError::IncompleteObject { id, offset })
         } else {
             Ok(ParsedObject {
                 object,
@@ -2315,7 +2540,9 @@ fn parse_object_body(input: &[u8], id: crate::ObjectId, offset: u64) -> IndexRes
     Ok(ParsedObject {
         object,
         consumed,
-        stream_prefix: Some(u64::try_from(prefix).map_err(|_| IndexError::InvalidIndirectObject { id, offset })?),
+        stream_prefix: Some(
+            u64::try_from(prefix).map_err(|_| IndexedReaderError::InvalidIndirectObject { id, offset })?,
+        ),
     })
 }
 
@@ -2408,7 +2635,7 @@ enum EndstreamStatus {
 
 fn validate_endstream(
     source: &dyn RandomAccessSource, source_len: u64, offset: u64, limit: u64,
-) -> IndexResult<EndstreamStatus> {
+) -> IndexedReaderResult<EndstreamStatus> {
     let remaining = source_len.checked_sub(offset).ok_or(SourceError::OutOfBounds {
         offset,
         length: 0,
@@ -2925,7 +3152,7 @@ mod tests {
         pdf
     }
 
-    fn open_encrypted(pdf: &[u8], password: Option<&[u8]>) -> IndexResult<IndexedReader> {
+    fn open_encrypted(pdf: &[u8], password: Option<&[u8]>) -> IndexedReaderResult<IndexedReader> {
         IndexedReader::open_with_password(
             Arc::new(BytesSource::from(pdf.to_vec())),
             ResolverLimits::default(),
@@ -2935,16 +3162,16 @@ mod tests {
 
     fn assert_encrypted_fixture_plaintext(reader: &IndexedReader) {
         assert_eq!(
-            reader.resolve((1, 0)).unwrap(),
+            reader.resolve_object((1, 0)).unwrap(),
             Object::String(b"encrypted string".to_vec(), StringFormat::Literal)
         );
         assert_eq!(
-            reader.resolve((2, 0)).unwrap().as_stream().unwrap().content,
+            reader.resolve_object((2, 0)).unwrap().as_stream().unwrap().content,
             b"encrypted stream"
         );
         assert_eq!(
             reader
-                .resolve((3, 0))
+                .resolve_object((3, 0))
                 .unwrap()
                 .as_dict()
                 .unwrap()
@@ -2955,7 +3182,7 @@ mod tests {
     }
 
     fn open_reader(pdf: &[u8], limits: ResolverLimits) -> IndexedReader {
-        IndexedReader::open(Arc::new(BytesSource::from(pdf.to_vec())), limits).unwrap()
+        IndexedReader::open_with_limits(Arc::new(BytesSource::from(pdf.to_vec())), limits).unwrap()
     }
 
     fn encode_field(value: u64, width: usize, output: &mut Vec<u8>) {
@@ -3121,22 +3348,25 @@ mod tests {
         for revision in 2..=6 {
             let pdf = encrypted_pdf(revision, "owner", "user");
 
-            assert!(matches!(open_encrypted(&pdf, None), Err(IndexError::PasswordRequired)));
+            assert!(matches!(
+                open_encrypted(&pdf, None),
+                Err(IndexedReaderError::PasswordRequired)
+            ));
             let wrong_a = open_encrypted(&pdf, Some(b"wrong")).err().unwrap();
             let wrong_b = open_encrypted(&pdf, Some(b"wrong")).err().unwrap();
-            assert!(matches!(wrong_a, IndexError::InvalidPassword));
+            assert!(matches!(wrong_a, IndexedReaderError::InvalidPassword));
             assert_eq!(format!("{wrong_a:?}"), format!("{wrong_b:?}"));
 
             let user = open_encrypted(&pdf, Some(b"user")).unwrap();
             assert_encrypted_fixture_plaintext(&user);
             let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
             for id in [(1, 0), (2, 0), (3, 0)] {
-                assert_eq!(user.resolve(id).unwrap(), eager.get_object(id).unwrap().clone());
+                assert_eq!(user.resolve_object(id).unwrap(), eager.get_object(id).unwrap().clone());
             }
 
             let encrypt_id = user.index.encrypt_object_id.unwrap();
             assert_eq!(
-                user.resolve(encrypt_id)
+                user.resolve_object(encrypt_id)
                     .unwrap()
                     .as_dict()
                     .unwrap()
@@ -3316,7 +3546,7 @@ mod tests {
                     max_pages: 1,
                 }
             ),
-            Err(IndexError::PageCountLimitExceeded { limit: 1 })
+            Err(IndexedReaderError::PageCountLimitExceeded { limit: 1 })
         ));
     }
 
@@ -3332,6 +3562,28 @@ mod tests {
     }
 
     #[test]
+    fn public_options_wire_every_exposed_resolver_and_page_limit() {
+        let options = IndexedReaderOptions {
+            object_bytes: 101,
+            stream_bytes: 102,
+            endstream_tail_bytes: 103,
+            reference_depth: 7,
+            page_tree_depth: 0,
+            max_pages: 11,
+            password: None,
+        };
+        let limits = ResolverLimits::from(&options);
+        assert_eq!(limits.max_object_bytes, 101);
+        assert_eq!(limits.max_stream_bytes, 102);
+        assert_eq!(limits.max_endstream_tail_bytes, 103);
+        assert_eq!(limits.max_length_depth, 7);
+
+        let pdf = generated_deep_page_tree_pdf(1);
+        let reader = IndexedReader::open_with_options(BytesSource::from(pdf), options).unwrap();
+        assert!(reader.page_map().unwrap().is_empty());
+    }
+
+    #[test]
     fn repeated_page_dag_uses_eager_global_work_budget() {
         let pdf = repeated_page_dag_pdf(15);
         let eager = Document::load_mem(&pdf).unwrap();
@@ -3340,7 +3592,7 @@ mod tests {
             bytes: pdf,
             requests: Mutex::new(Vec::new()),
         });
-        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
 
         let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
@@ -3481,7 +3733,7 @@ mod tests {
         );
         assert!(matches!(
             PageMap::from_reader(&reader),
-            Err(IndexError::ObjectStreamMember {
+            Err(IndexedReaderError::ObjectStreamMember {
                 source: crate::Error::Decompress(crate::DecompressError::MemoryLimitExceeded {
                     limit: actual
                 }),
@@ -3493,7 +3745,10 @@ mod tests {
     #[test]
     fn encrypted_page_map_matches_authenticated_eager_order() {
         let pdf = encrypted_page_tree_pdf();
-        assert!(matches!(open_encrypted(&pdf, None), Err(IndexError::PasswordRequired)));
+        assert!(matches!(
+            open_encrypted(&pdf, None),
+            Err(IndexedReaderError::PasswordRequired)
+        ));
         let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
         let page_map = PageMap::from_reader(&reader).unwrap();
         let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
@@ -3531,7 +3786,7 @@ mod tests {
         let (pdf, image_plaintext, xref_plaintext) = encrypted_object_stream_pdf();
         let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
 
-        let member = reader.resolve((10, 0)).unwrap();
+        let member = reader.resolve_object((10, 0)).unwrap();
         let member = member.as_dict().unwrap();
         assert_eq!(
             member.get(b"Text").unwrap(),
@@ -3541,21 +3796,21 @@ mod tests {
 
         for _ in 0..2 {
             assert_eq!(
-                reader.resolve((20, 0)).unwrap().as_stream().unwrap().content,
+                reader.resolve_object((20, 0)).unwrap().as_stream().unwrap().content,
                 image_plaintext
             );
         }
         assert_eq!(
-            reader.resolve((21, 0)).unwrap(),
+            reader.resolve_object((21, 0)).unwrap(),
             Object::String(b"normal secret".to_vec(), StringFormat::Literal)
         );
         assert_eq!(
-            reader.resolve((31, 0)).unwrap().as_stream().unwrap().content,
+            reader.resolve_object((31, 0)).unwrap().as_stream().unwrap().content,
             xref_plaintext
         );
         assert_eq!(
             reader
-                .resolve((30, 0))
+                .resolve_object((30, 0))
                 .unwrap()
                 .as_dict()
                 .unwrap()
@@ -3652,7 +3907,7 @@ mod tests {
         outside.extend_from_slice(&pdf);
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(outside))),
-            Err(IndexError::InvalidHeader { .. })
+            Err(IndexedReaderError::InvalidHeader { .. })
         ));
     }
 
@@ -3663,7 +3918,7 @@ mod tests {
         missing[marker..marker + b"startxref".len()].fill(b'x');
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(missing))),
-            Err(IndexError::InvalidStartXref { .. })
+            Err(IndexedReaderError::InvalidStartXref { .. })
         ));
 
         let mut out_of_bounds = classic_pdf();
@@ -3672,7 +3927,7 @@ mod tests {
         out_of_bounds.splice(marker..end, b"999999999".iter().copied());
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(out_of_bounds))),
-            Err(IndexError::InvalidXref { .. })
+            Err(IndexedReaderError::InvalidXref { .. })
         ));
 
         let (mut bad_prev, offsets) = basic_body();
@@ -3684,7 +3939,7 @@ mod tests {
         append_classic(&mut bad_prev, &[(0, entries)], "<< /Size 5 /Root 1 0 R /Prev -1 >>");
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(bad_prev))),
-            Err(IndexError::InvalidTrailerOffset { key: "Prev" })
+            Err(IndexedReaderError::InvalidTrailerOffset { key: "Prev" })
         ));
     }
 
@@ -3725,7 +3980,7 @@ mod tests {
         assert!(PdfIndex::open(Arc::new(BytesSource::from(padded_classic_xref(0)))).is_ok());
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(padded_classic_xref(1)))),
-            Err(IndexError::StructureLimitExceeded {
+            Err(IndexedReaderError::StructureLimitExceeded {
                 structure: "cross-reference section",
                 limit: XREF_WINDOW_LIMIT
             })
@@ -3762,7 +4017,7 @@ mod tests {
             PdfIndex::open(Arc::new(BytesSource::from(compressed_limit_xref(
                 XREF_DECOMPRESSED_LIMIT + 1
             )))),
-            Err(IndexError::XrefDecompression(_))
+            Err(IndexedReaderError::XrefDecompression(_))
         ));
     }
 
@@ -3783,12 +4038,12 @@ mod tests {
         assert!(PdfIndex::open(Arc::new(BytesSource::from(empty_width_xref(8)))).is_ok());
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(empty_width_xref(9)))),
-            Err(IndexError::InvalidXref { .. })
+            Err(IndexedReaderError::InvalidXref { .. })
         ));
         assert!(check_entry_limit(MAX_XREF_ENTRIES).is_ok());
         assert!(matches!(
             check_entry_limit(MAX_XREF_ENTRIES + 1),
-            Err(IndexError::EntryLimitExceeded {
+            Err(IndexedReaderError::EntryLimitExceeded {
                 count,
                 limit: MAX_XREF_ENTRIES
             }) if count == MAX_XREF_ENTRIES + 1
@@ -3846,7 +4101,7 @@ mod tests {
 
         for id in [(1, 0), (2, 0)] {
             assert_eq!(
-                format!("{:?}", reader.resolve(id).unwrap()),
+                format!("{:?}", reader.resolve_object(id).unwrap()),
                 format!("{:?}", eager.get_object(id).unwrap())
             );
         }
@@ -3877,9 +4132,15 @@ mod tests {
             let eager = Document::load_mem(&fixture.pdf).unwrap();
 
             for id in [(10, 0), (11, 0), (12, 0)] {
-                assert_eq!(reader.resolve(id).unwrap(), eager.get_object(id).unwrap().clone());
+                assert_eq!(
+                    reader.resolve_object(id).unwrap(),
+                    eager.get_object(id).unwrap().clone()
+                );
             }
-            assert_eq!(reader.resolve((999, 0)).is_err(), eager.get_object((999, 0)).is_err());
+            assert_eq!(
+                reader.resolve_object((999, 0)).is_err(),
+                eager.get_object((999, 0)).is_err()
+            );
         }
     }
 
@@ -3889,8 +4150,8 @@ mod tests {
         let wrong_index = object_stream_fixture(&format!("/Type /ObjStm /N 2 /First {first}"), &content, &[(10, 1)]);
         let reader = open_reader(&wrong_index.pdf, ResolverLimits::default());
         assert!(matches!(
-            reader.resolve((10, 0)),
-            Err(IndexError::ObjectStreamMember {
+            reader.resolve_object((10, 0)),
+            Err(IndexedReaderError::ObjectStreamMember {
                 id: (10, 0),
                 container: (5, 0),
                 index: 1,
@@ -3898,8 +4159,8 @@ mod tests {
             })
         ));
         assert!(matches!(
-            reader.resolve((10, 1)),
-            Err(IndexError::GenerationMismatch {
+            reader.resolve_object((10, 1)),
+            Err(IndexedReaderError::GenerationMismatch {
                 id: (10, 1),
                 indexed: 0
             })
@@ -3912,13 +4173,13 @@ mod tests {
             body: b"<< /Not /AStream >>",
         }]);
         let mut reader = open_reader(&ordinary, ResolverLimits::default());
-        reader
-            .index
+        Arc::get_mut(&mut reader.index)
+            .unwrap()
             .locations
             .insert(10, ObjectLocation64::Compressed { container: 5, index: 0 });
         assert!(matches!(
-            reader.resolve((10, 0)),
-            Err(IndexError::ObjectStreamContainerNotStream {
+            reader.resolve_object((10, 0)),
+            Err(IndexedReaderError::ObjectStreamContainerNotStream {
                 id: (10, 0),
                 container: (5, 0)
             })
@@ -3932,7 +4193,7 @@ mod tests {
             let eager = Document::load_mem(&fixture.pdf).unwrap();
             assert_eq!(
                 open_reader(&fixture.pdf, ResolverLimits::default())
-                    .resolve((10, 0))
+                    .resolve_object((10, 0))
                     .unwrap(),
                 eager.get_object((10, 0)).unwrap().clone()
             );
@@ -3946,7 +4207,10 @@ mod tests {
         let eager = Document::load_mem(&equal_offsets.pdf).unwrap();
         let reader = open_reader(&equal_offsets.pdf, ResolverLimits::default());
         for id in [(10, 0), (11, 0)] {
-            assert_eq!(reader.resolve(id).unwrap(), eager.get_object(id).unwrap().clone());
+            assert_eq!(
+                reader.resolve_object(id).unwrap(),
+                eager.get_object(id).unwrap().clone()
+            );
         }
 
         let malformed = [
@@ -3956,8 +4220,8 @@ mod tests {
         for (dictionary, content) in malformed {
             let fixture = object_stream_fixture(dictionary, content, &[(10, 0)]);
             assert!(matches!(
-                open_reader(&fixture.pdf, ResolverLimits::default()).resolve((10, 0)),
-                Err(IndexError::ObjectStreamMember { .. })
+                open_reader(&fixture.pdf, ResolverLimits::default()).resolve_object((10, 0)),
+                Err(IndexedReaderError::ObjectStreamMember { .. })
             ));
         }
 
@@ -3980,9 +4244,53 @@ mod tests {
             },
         );
         assert!(matches!(
-            reader.resolve((10, 0)),
-            Err(IndexError::ObjectStreamMember { .. })
+            reader.resolve_object((10, 0)),
+            Err(IndexedReaderError::ObjectStreamMember { .. })
         ));
+    }
+
+    #[test]
+    fn encrypted_and_object_stream_errors_are_deterministic_across_threads() {
+        let encrypted = encrypted_page_tree_pdf();
+        for _ in 0..3 {
+            let mut threads = Vec::new();
+            for _ in 0..4 {
+                let encrypted = encrypted.clone();
+                threads.push(std::thread::spawn(move || {
+                    matches!(
+                        open_encrypted(&encrypted, Some(b"wrong")),
+                        Err(IndexedReaderError::InvalidPassword)
+                    )
+                }));
+            }
+            assert!(threads.into_iter().all(|thread| thread.join().unwrap()));
+        }
+        let authenticated = open_encrypted(&encrypted, Some(b"user")).unwrap();
+        assert!(authenticated.is_encrypted());
+        assert!(authenticated.is_authenticated());
+        assert_eq!(authenticated.page_count().unwrap(), 2);
+        assert_eq!(authenticated.source_len(), u64::try_from(encrypted.len()).unwrap());
+
+        let malformed = object_stream_fixture("/Type /ObjStm /N 1 /First 5", b"10 0 << /Broken", &[(10, 0)]);
+        let reader = Arc::new(open_reader(&malformed.pdf, ResolverLimits::default()));
+        let classify = |reader: &IndexedReader| match reader.resolve_object((10, 0)).unwrap_err() {
+            IndexedReaderError::ObjectStreamMember {
+                id,
+                container,
+                index,
+                source,
+            } => (id, container, index, source.to_string()),
+            other => panic!("unexpected object-stream error: {other}"),
+        };
+        let expected = classify(&reader);
+        for _ in 0..3 {
+            let mut threads = Vec::new();
+            for _ in 0..4 {
+                let reader = Arc::clone(&reader);
+                threads.push(std::thread::spawn(move || classify(&reader)));
+            }
+            assert!(threads.into_iter().all(|thread| thread.join().unwrap() == expected));
+        }
     }
 
     #[test]
@@ -4007,7 +4315,7 @@ mod tests {
         let eager = Document::load_mem(&fixture.pdf).unwrap();
         for id in 10..110 {
             assert_eq!(
-                reader.resolve((id, 0)).unwrap(),
+                reader.resolve_object((id, 0)).unwrap(),
                 eager.get_object((id, 0)).unwrap().clone()
             );
         }
@@ -4027,7 +4335,7 @@ mod tests {
         prefixed.extend_from_slice(&pdf);
 
         let resolved = open_reader(&prefixed, ResolverLimits::default())
-            .resolve((1, 0))
+            .resolve_object((1, 0))
             .unwrap();
         let eager = Document::load_mem(&prefixed)
             .unwrap()
@@ -4059,12 +4367,12 @@ mod tests {
         let reader = open_reader(&pdf, ResolverLimits::default());
 
         assert!(matches!(
-            reader.resolve((1, 0)),
-            Err(IndexError::GenerationMismatch { id: (1, 0), indexed: 1 })
+            reader.resolve_object((1, 0)),
+            Err(IndexedReaderError::GenerationMismatch { id: (1, 0), indexed: 1 })
         ));
         assert!(matches!(
-            reader.resolve((1, 1)),
-            Err(IndexError::IndirectObjectMismatch {
+            reader.resolve_object((1, 1)),
+            Err(IndexedReaderError::IndirectObjectMismatch {
                 expected: (1, 1),
                 actual: (1, 0)
             })
@@ -4115,7 +4423,7 @@ mod tests {
         let eager = Document::load_mem(&pdf).unwrap();
 
         for (id, expected) in [((1, 0), b"hello".as_slice()), ((2, 0), b"world"), ((4, 0), b"abcde")] {
-            let resolved = reader.resolve(id).unwrap();
+            let resolved = reader.resolve_object(id).unwrap();
             assert_eq!(resolved.as_stream().unwrap().content, expected);
             assert_eq!(
                 resolved.as_stream().unwrap().content,
@@ -4144,7 +4452,9 @@ mod tests {
             body: &body,
         }]);
 
-        let stream = open_reader(&pdf, ResolverLimits::default()).resolve((1, 0)).unwrap();
+        let stream = open_reader(&pdf, ResolverLimits::default())
+            .resolve_object((1, 0))
+            .unwrap();
         assert_eq!(stream.as_stream().unwrap().content, b"hello");
     }
 
@@ -4222,11 +4532,19 @@ mod tests {
         let eager = Document::load_mem(&pdf).unwrap();
 
         for id in [(1, 0), (2, 0), (3, 0), (4, 0)] {
-            let resolved = reader.resolve(id).unwrap();
+            let resolved = reader.resolve_object(id).unwrap();
             assert_eq!(&resolved, eager.get_object(id).unwrap());
             assert!(resolved.as_stream().unwrap().content.is_empty());
         }
-        assert!(reader.resolve((7, 0)).unwrap().as_stream().unwrap().content.is_empty());
+        assert!(
+            reader
+                .resolve_object((7, 0))
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .content
+                .is_empty()
+        );
         assert_eq!(
             eager.get_object((7, 0)).unwrap().as_stream().unwrap().content,
             b"ignored"
@@ -4264,8 +4582,8 @@ mod tests {
         let default_reader = open_reader(&pdf, ResolverLimits::default());
         for id in [(1, 0), (2, 0)] {
             assert!(matches!(
-                default_reader.resolve(id),
-                Err(IndexError::NegativeStreamLength { id: actual, length: -1 }) if actual == id
+                default_reader.resolve_object(id),
+                Err(IndexedReaderError::NegativeStreamLength { id: actual, length: -1 }) if actual == id
             ));
         }
         let limited_reader = open_reader(
@@ -4276,8 +4594,8 @@ mod tests {
             },
         );
         assert!(matches!(
-            limited_reader.resolve((4, 0)),
-            Err(IndexError::StreamLimitExceeded {
+            limited_reader.resolve_object((4, 0)),
+            Err(IndexedReaderError::StreamLimitExceeded {
                 id: (4, 0),
                 length: 5,
                 limit: 4
@@ -4292,8 +4610,8 @@ mod tests {
             },
         );
         assert!(matches!(
-            tail_limited_reader.resolve((4, 0)),
-            Err(IndexError::MissingEndstream { id: (4, 0) })
+            tail_limited_reader.resolve_object((4, 0)),
+            Err(IndexedReaderError::MissingEndstream { id: (4, 0) })
         ));
     }
 
@@ -4329,7 +4647,7 @@ mod tests {
         let eager = Document::load_mem(&pdf).unwrap();
 
         for id in [(1, 0), (2, 0), (3, 0), (4, 0)] {
-            let resolved = reader.resolve(id).unwrap();
+            let resolved = reader.resolve_object(id).unwrap();
             assert!(matches!(resolved, Object::Dictionary(_)));
             assert_eq!(&resolved, eager.get_object(id).unwrap());
         }
@@ -4351,8 +4669,8 @@ mod tests {
             },
         );
         assert!(matches!(
-            reader.resolve((1, 0)),
-            Err(IndexError::ObjectLimitExceeded { id: (1, 0), limit: 32 })
+            reader.resolve_object((1, 0)),
+            Err(IndexedReaderError::ObjectLimitExceeded { id: (1, 0), limit: 32 })
         ));
     }
 
@@ -4422,12 +4740,15 @@ mod tests {
                 bytes: classic_pdf(),
                 mode: AtomicU8::new(0),
             });
-            let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+            let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
             source.mode.store(mode, Ordering::SeqCst);
-            assert!(matches!(PageMap::from_reader(&reader), Err(IndexError::Source(_))));
+            assert!(matches!(
+                PageMap::from_reader(&reader),
+                Err(IndexedReaderError::Source(_))
+            ));
         }
 
-        let reader = IndexedReader::open(
+        let reader = IndexedReader::open_with_limits(
             Arc::new(BytesSource::from(classic_pdf())),
             ResolverLimits {
                 max_object_bytes: 8,
@@ -4437,7 +4758,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             PageMap::from_reader(&reader),
-            Err(IndexError::ObjectLimitExceeded { limit: 8, .. })
+            Err(IndexedReaderError::ObjectLimitExceeded { limit: 8, .. })
         ));
     }
 
@@ -4454,11 +4775,11 @@ mod tests {
             bytes: fixture.pdf,
             requests: Mutex::new(Vec::new()),
         });
-        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
 
-        let first_value = reader.resolve((10, 0)).unwrap();
-        let second_value = reader.resolve((10, 0)).unwrap();
+        let first_value = reader.resolve_object((10, 0)).unwrap();
+        let second_value = reader.resolve_object((10, 0)).unwrap();
         assert_eq!(first_value, Object::string_literal("tiny"));
         assert_eq!(second_value, first_value);
         let requests = source.requests.lock().unwrap();
@@ -4590,7 +4911,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
         });
 
-        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
         let page_map = PageMap::from_reader(&reader).unwrap();
         assert_eq!(
             page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
@@ -4638,11 +4959,11 @@ mod tests {
             ],
             requests: Mutex::new(Vec::new()),
         });
-        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
         OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
 
-        let stream = reader.resolve((1, 0)).unwrap();
+        let stream = reader.resolve_object((1, 0)).unwrap();
         assert_eq!(
             u64::try_from(stream.as_stream().unwrap().content.len()).unwrap(),
             stream_length
@@ -4700,10 +5021,10 @@ mod tests {
             ],
             requests: Mutex::new(Vec::new()),
         });
-        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
 
-        let image = reader.resolve((1, 0)).unwrap();
+        let image = reader.resolve_object((1, 0)).unwrap();
         assert_eq!(
             u64::try_from(image.as_stream().unwrap().content.len()).unwrap(),
             stream_length
@@ -4748,12 +5069,12 @@ mod tests {
             ],
             requests: Mutex::new(Vec::new()),
         });
-        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
 
-        let error = reader.resolve((1, 0)).unwrap_err();
+        let error = reader.resolve_object((1, 0)).unwrap_err();
         assert!(
-            matches!(error, IndexError::InvalidIndirectObject { id: (1, 0), .. }),
+            matches!(error, IndexedReaderError::InvalidIndirectObject { id: (1, 0), .. }),
             "unexpected error: {error:?}"
         );
         let requests = source.requests.lock().unwrap();
@@ -4790,11 +5111,11 @@ mod tests {
             ],
             requests: Mutex::new(Vec::new()),
         });
-        let reader = IndexedReader::open(source.clone(), ResolverLimits::default()).unwrap();
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
         source.requests.lock().unwrap().clear();
         OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
 
-        let stream = reader.resolve((1, 0)).unwrap();
+        let stream = reader.resolve_object((1, 0)).unwrap();
         assert_eq!(
             u64::try_from(stream.as_stream().unwrap().content.len()).unwrap(),
             stream_length
@@ -4923,7 +5244,7 @@ mod tests {
         let over = revision_source(MAX_XREF_REVISIONS + 1);
         assert!(matches!(
             PdfIndex::open(over),
-            Err(IndexError::RevisionLimitExceeded {
+            Err(IndexedReaderError::RevisionLimitExceeded {
                 limit: MAX_XREF_REVISIONS
             })
         ));
@@ -4983,7 +5304,7 @@ mod tests {
 
         assert!(matches!(
             PdfIndex::open(source.clone()),
-            Err(IndexError::InvalidXref { .. })
+            Err(IndexedReaderError::InvalidXref { .. })
         ));
         let requests = source.requests.lock().unwrap();
         let lengths: Vec<_> = requests
@@ -5026,7 +5347,7 @@ mod tests {
         let invalid = b"<< /Broken @";
         assert!(matches!(
             parse_object_body(invalid, (1, 0), 0),
-            Err(IndexError::InvalidIndirectObject { .. })
+            Err(IndexedReaderError::InvalidIndirectObject { .. })
         ));
         for split in 2..=invalid.len() {
             let mut framer = DirectObjectFramer::for_dictionary(&invalid[..2]).unwrap();
@@ -5116,7 +5437,9 @@ mod tests {
                 body,
             }]);
             let eager = Document::load_mem(&pdf).unwrap();
-            let indexed = open_reader(&pdf, ResolverLimits::default()).resolve((1, 0)).unwrap();
+            let indexed = open_reader(&pdf, ResolverLimits::default())
+                .resolve_object((1, 0))
+                .unwrap();
             assert_eq!(eager.objects.get(&(1, 0)).unwrap(), &expected, "{body:?}");
             assert_eq!(indexed, expected, "{body:?}");
         }
@@ -5166,7 +5489,7 @@ mod tests {
         let eager = Document::load_mem(&accepted_pdf).unwrap();
         assert_eq!(
             open_reader(&accepted_pdf, ResolverLimits::default())
-                .resolve((1, 0))
+                .resolve_object((1, 0))
                 .unwrap(),
             eager.objects.get(&(1, 0)).unwrap().clone()
         );
@@ -5185,8 +5508,8 @@ mod tests {
         let eager = Document::load_mem(&pdf).unwrap();
         assert!(!eager.objects.contains_key(&(1, 0)));
         assert!(matches!(
-            open_reader(&pdf, ResolverLimits::default()).resolve((1, 0)),
-            Err(IndexError::InvalidIndirectObject { .. })
+            open_reader(&pdf, ResolverLimits::default()).resolve_object((1, 0)),
+            Err(IndexedReaderError::InvalidIndirectObject { .. })
         ));
     }
 
@@ -5376,7 +5699,7 @@ mod tests {
             regions: vec![(0, b"%PDF-1.7\n".to_vec()), (object_offset, object), (xref, xref_bytes)],
             requests: Mutex::new(Vec::new()),
         });
-        let reader = IndexedReader::open(
+        let reader = IndexedReader::open_with_limits(
             source.clone(),
             ResolverLimits {
                 max_object_bytes: 3 * 1_024 * 1_024,
@@ -5386,7 +5709,10 @@ mod tests {
         .unwrap();
         source.requests.lock().unwrap().clear();
         OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
-        assert_eq!(reader.resolve((1, 0)).unwrap().as_str().unwrap().len(), literal_length);
+        assert_eq!(
+            reader.resolve_object((1, 0)).unwrap().as_str().unwrap().len(),
+            literal_length
+        );
         OBJECT_BODY_PARSE_CALLS.with(|calls| assert_eq!(calls.get(), 1));
 
         let body_offset = object_offset + u64::try_from(b"1 0 obj\n".len()).unwrap();
@@ -5418,7 +5744,7 @@ mod tests {
         assert!(Document::load_mem(&missing_endstream).is_err());
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(missing_endstream))),
-            Err(IndexError::InvalidXref { .. })
+            Err(IndexedReaderError::InvalidXref { .. })
         ));
 
         let mut missing_endobj = valid.clone();
@@ -5450,7 +5776,7 @@ mod tests {
             assert!(Document::load_mem(&rejected).is_err());
             assert!(matches!(
                 PdfIndex::open(Arc::new(BytesSource::from(rejected))),
-                Err(IndexError::InvalidXref { .. })
+                Err(IndexedReaderError::InvalidXref { .. })
             ));
         }
 
@@ -5470,7 +5796,7 @@ mod tests {
             assert!(Document::load_mem(&rejected).is_err());
             assert!(matches!(
                 PdfIndex::open(Arc::new(BytesSource::from(rejected))),
-                Err(IndexError::InvalidXref { .. })
+                Err(IndexedReaderError::InvalidXref { .. })
             ));
         }
     }

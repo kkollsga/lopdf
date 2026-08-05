@@ -12,6 +12,18 @@ struct InterruptingSource {
     calls: AtomicUsize,
 }
 
+struct OverreportingSource;
+
+impl RandomAccessSource for OverreportingSource {
+    fn len(&self) -> Result<u64, SourceError> {
+        Ok(4)
+    }
+
+    fn read_at(&self, _offset: u64, out: &mut [u8]) -> Result<usize, SourceError> {
+        Ok(out.len() + 1)
+    }
+}
+
 impl RandomAccessSource for InterruptingSource {
     fn len(&self) -> Result<u64, SourceError> {
         u64::try_from(self.bytes.len()).map_err(|_| SourceError::PlatformLimitExceeded {
@@ -78,6 +90,18 @@ fn exact_reads_retry_interrupted_sources() {
     source.read_exact_at(0, &mut output).unwrap();
     assert_eq!(&output, b"retry");
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn exact_reads_reject_a_custom_source_that_overreports_without_panicking() {
+    let mut output = [0_u8; 4];
+    assert!(matches!(
+        OverreportingSource.read_exact_at(0, &mut output),
+        Err(SourceError::InvalidReadCount {
+            returned: 5,
+            buffer_len: 4
+        })
+    ));
 }
 
 #[test]

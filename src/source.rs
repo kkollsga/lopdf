@@ -38,6 +38,10 @@ pub enum SourceError {
     #[error("source ended during read: offset {offset}, expected {expected} bytes, read {actual} bytes")]
     UnexpectedEof { offset: u64, expected: u64, actual: u64 },
 
+    /// A custom source claimed to write more bytes than its output buffer held.
+    #[error("source returned {returned} bytes for a {buffer_len}-byte output buffer")]
+    InvalidReadCount { returned: usize, buffer_len: usize },
+
     /// The platform's positional read failed.
     #[error("source I/O error")]
     Io(#[from] std::io::Error),
@@ -45,7 +49,12 @@ pub enum SourceError {
 
 /// A cursor-free byte source that supports concurrent independent reads.
 ///
+/// Implementations are synchronous and must be [`Send`] + [`Sync`]. Their
+/// reported length and bytes must remain stable for every reader that owns the
+/// source; mutation after open is unsupported and may fail closed.
+///
 /// Implementations may return fewer bytes than `out.len()` from [`read_at`].
+/// They must never return a count larger than `out.len()`.
 /// Callers that require a complete range should use [`read_exact_at`] or
 /// [`read_range`], which loop over partial reads and validate all arithmetic.
 ///
@@ -79,12 +88,19 @@ pub trait RandomAccessSource: Send + Sync + 'static {
                 requested: actual,
                 limit: platform_limit(),
             })?;
+            let remaining = out.len() - completed;
             match self.read_at(offset + actual, &mut out[completed..]) {
                 Ok(0) => {
                     return Err(SourceError::UnexpectedEof {
                         offset,
                         expected: length,
                         actual,
+                    });
+                }
+                Ok(read) if read > remaining => {
+                    return Err(SourceError::InvalidReadCount {
+                        returned: read,
+                        buffer_len: remaining,
                     });
                 }
                 Ok(read) => {

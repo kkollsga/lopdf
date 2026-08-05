@@ -49,6 +49,10 @@ pub use encodings::{Encoding, encode_utf8, encode_utf16_be};
 pub use encryption::{EncryptionState, EncryptionVersion, Permissions};
 pub use error::{DecompressError, Error, ParseError, Result};
 pub use incremental_document::IncrementalDocument;
+pub use indexed_reader::{
+    IndexedReader, IndexedReaderError, IndexedReaderOptions, IndexedReaderResult, InheritedPageAttributeOwners,
+    PageMap, PageMapEntry,
+};
 pub use load_options::{FilterFunc, LoadOptions};
 pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use outlines::Outline;
