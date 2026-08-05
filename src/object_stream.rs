@@ -1,11 +1,17 @@
 use crate::parser;
 use crate::{DecompressError, Document, Error, Object, ObjectId, Result, Stream};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::TryFromIntError;
 use std::str::FromStr;
 
-const MAX_SELECTED_OBJECT_STREAM_MEMBERS: usize = 131_072;
+/// Maximum `/N` accepted by the selected-member object-stream parsers.
+///
+/// This bounds header-validation work for untrusted object streams. It applies
+/// only to [`ObjectStream::parse_selected_member`] and
+/// [`ObjectStream::parse_selected_member_with_limit`]; the existing eager
+/// constructors retain their behavior.
+pub const MAX_SELECTED_OBJECT_STREAM_MEMBERS: usize = 131_072;
 
 use log::warn;
 #[cfg(feature = "rayon")]
@@ -131,7 +137,9 @@ impl ObjectStream {
     /// `member_index` is the zero-based index recorded by the compressed xref
     /// entry. The header entry at that index must name `expected_id`, whose
     /// generation must be zero. Only that member is parsed into an [`Object`];
-    /// the other members are validated as compact `(id, offset)` metadata.
+    /// the other members are validated without materializing their objects.
+    /// Repeated object ids are accepted; the index selects the exact declared
+    /// occurrence, which must name `expected_id`.
     ///
     /// This decompresses without a size limit. For untrusted input, prefer
     /// [`ObjectStream::parse_selected_member_with_limit`].
@@ -143,9 +151,10 @@ impl ObjectStream {
     /// exceeds `max_decompressed_size`. `None` means no decompression limit.
     ///
     /// Unlike [`ObjectStream::new_with_limit`], malformed header counts,
-    /// duplicate ids, invalid offsets, xref index/id disagreement and truncated
-    /// selected objects are errors. This is the strict contract needed by an
-    /// indexed resolver; the eager constructor retains its existing leniency.
+    /// invalid offsets, xref index/id disagreement and truncated selected
+    /// objects are errors. Repeated ids remain accepted, matching the eager
+    /// parser's header behavior. This is the strict contract needed by an
+    /// indexed resolver.
     pub fn parse_selected_member_with_limit(
         stream: &Stream, expected_id: ObjectId, member_index: u32, max_decompressed_size: Option<usize>,
     ) -> Result<Object> {
@@ -202,7 +211,6 @@ impl ObjectStream {
         let index_block = decoded.get(..first).ok_or(Error::InvalidOffset(first))?;
         let index_text = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
         let mut numbers = index_text.split_whitespace();
-        let mut ids = BTreeSet::new();
         let mut previous_offset = None;
         let mut selected = None;
         let mut selected_end = None;
@@ -213,11 +221,6 @@ impl ObjectStream {
                 .try_into()
                 .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
 
-            if !ids.insert(id) {
-                return Err(Error::InvalidObjectStream(format!(
-                    "duplicate object id {id} in object stream header"
-                )));
-            }
             if previous_offset.is_some_and(|previous| relative_offset <= previous) {
                 return Err(Error::InvalidObjectStream(
                     "object stream member offsets are not strictly increasing".to_string(),
@@ -672,14 +675,41 @@ mod selected_member_tests {
     }
 
     #[test]
-    fn duplicate_ids_and_invalid_offsets_are_rejected() {
-        let mut duplicate_id = raw_stream(b"1 0 1 3 ", b"42 true ", 2);
-        let message = invalid_object_stream(ObjectStream::parse_selected_member(&duplicate_id, (1, 0), 0));
-        assert!(message.contains("duplicate object id 1"));
+    fn duplicate_ids_preserve_eager_acceptance_and_exact_index_selection() {
+        let members: &[(u32, &[u8])] = &[(1, b"42"), (1, b"true"), (2, b"false"), (2, b"null"), (3, b"[7]")];
+        let mut eager_stream = generated_stream(members);
+        let eager = ObjectStream::new(&mut eager_stream).unwrap();
 
-        let eager = ObjectStream::new(&mut duplicate_id).unwrap();
+        // Eager collection accepts duplicate declarations and retains the last
+        // value for each repeated id.
         assert_eq!(eager.objects.get(&(1, 0)), Some(&Object::Boolean(true)));
+        assert_eq!(eager.objects.get(&(2, 0)), Some(&Object::Null));
 
+        let selected_stream = generated_stream(members);
+        assert_eq!(
+            ObjectStream::parse_selected_member(&selected_stream, (1, 0), 0).unwrap(),
+            Object::Integer(42)
+        );
+        assert_eq!(
+            ObjectStream::parse_selected_member(&selected_stream, (1, 0), 1).unwrap(),
+            Object::Boolean(true)
+        );
+        assert_eq!(
+            ObjectStream::parse_selected_member(&selected_stream, (2, 0), 2).unwrap(),
+            Object::Boolean(false)
+        );
+        assert_eq!(
+            ObjectStream::parse_selected_member(&selected_stream, (2, 0), 3).unwrap(),
+            Object::Null
+        );
+        assert_eq!(
+            ObjectStream::parse_selected_member(&selected_stream, (3, 0), 4).unwrap(),
+            eager.objects.get(&(3, 0)).unwrap().clone()
+        );
+    }
+
+    #[test]
+    fn invalid_offsets_are_rejected() {
         let duplicate_offset = raw_stream(b"1 0 2 0 ", b"42 true ", 2);
         let message = invalid_object_stream(ObjectStream::parse_selected_member(&duplicate_offset, (1, 0), 0));
         assert!(message.contains("not strictly increasing"));
@@ -705,7 +735,7 @@ mod selected_member_tests {
     }
 
     #[test]
-    fn selected_member_metadata_count_is_capped() {
+    fn selected_member_count_is_capped() {
         for accepted_count in [
             MAX_SELECTED_OBJECT_STREAM_MEMBERS - 1,
             MAX_SELECTED_OBJECT_STREAM_MEMBERS,
