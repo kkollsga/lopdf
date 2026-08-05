@@ -12,7 +12,29 @@ use thiserror::Error;
 pub type SourceResult<T> = std::result::Result<T, SourceError>;
 
 /// Errors produced while validating or reading a source range.
+///
+/// Downstream callers must include a wildcard arm so new source failures can
+/// be added without breaking exhaustive matches. This intentionally exhaustive
+/// downstream match therefore does not compile:
+///
+/// ```compile_fail,E0004
+/// use lopdf::SourceError;
+///
+/// fn classify(error: SourceError) {
+///     match error {
+///         SourceError::RangeOverflow { .. }
+///         | SourceError::OutOfBounds { .. }
+///         | SourceError::ReadLimitExceeded { .. }
+///         | SourceError::PlatformLimitExceeded { .. }
+///         | SourceError::AllocationFailed { .. }
+///         | SourceError::UnexpectedEof { .. }
+///         | SourceError::InvalidReadCount { .. }
+///         | SourceError::Io(_) => {}
+///     }
+/// }
+/// ```
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SourceError {
     /// Adding a range's offset and length overflowed `u64`.
     #[error("source range overflows: offset {offset}, length {length}")]
