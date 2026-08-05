@@ -1,6 +1,6 @@
 use crate::parser;
 use crate::{Document, Error, Object, ObjectId, Result, Stream};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::TryFromIntError;
 use std::str::FromStr;
 
@@ -120,6 +120,127 @@ impl ObjectStream {
             objects,
             max_objects: 100,
             compression_level: 6,
+        })
+    }
+
+    /// Parse one declared member of an existing object stream.
+    ///
+    /// `member_index` is the zero-based index recorded by the compressed xref
+    /// entry. The header entry at that index must name `expected_id`, whose
+    /// generation must be zero. Only that member is parsed into an [`Object`];
+    /// the other members are validated as compact `(id, offset)` metadata.
+    ///
+    /// This decompresses without a size limit. For untrusted input, prefer
+    /// [`ObjectStream::parse_selected_member_with_limit`].
+    pub fn parse_selected_member(stream: &mut Stream, expected_id: ObjectId, member_index: u16) -> Result<Object> {
+        Self::parse_selected_member_with_limit(stream, expected_id, member_index, None)
+    }
+
+    /// Parse one declared member, rejecting the object stream if decompression
+    /// exceeds `max_decompressed_size`. `None` means no decompression limit.
+    ///
+    /// Unlike [`ObjectStream::new_with_limit`], malformed header counts,
+    /// duplicate ids, invalid offsets, xref index/id disagreement and truncated
+    /// selected objects are errors. This is the strict contract needed by an
+    /// indexed resolver; the eager constructor retains its existing leniency.
+    pub fn parse_selected_member_with_limit(
+        stream: &mut Stream, expected_id: ObjectId, member_index: u16, max_decompressed_size: Option<usize>,
+    ) -> Result<Object> {
+        if expected_id.1 != 0 {
+            return Err(Error::InvalidObjectStream(
+                "compressed objects must have generation zero".to_string(),
+            ));
+        }
+
+        match max_decompressed_size {
+            Some(max) => stream.decompress_with_limit(max)?,
+            None => {
+                stream.decompress()?;
+            }
+        }
+
+        let first = stream
+            .dict
+            .get(b"First")
+            .and_then(Object::as_i64)?
+            .try_into()
+            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+        let n: usize = stream
+            .dict
+            .get(b"N")
+            .and_then(Object::as_i64)?
+            .try_into()
+            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+        let member_index = usize::from(member_index);
+
+        if member_index >= n {
+            return Err(Error::InvalidObjectStream(format!(
+                "member index {member_index} is outside declared count {n}"
+            )));
+        }
+
+        let index_block = stream.content.get(..first).ok_or(Error::InvalidOffset(first))?;
+        let index_text = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
+        let mut numbers = index_text.split_whitespace();
+        let mut entries = Vec::new();
+        let mut ids = BTreeSet::new();
+        let mut previous_offset = None;
+
+        for index in 0..n {
+            let id = parse_object_stream_number(numbers.next(), "object id", index)?;
+            let relative_offset: usize = parse_object_stream_number(numbers.next(), "member offset", index)?
+                .try_into()
+                .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+
+            if !ids.insert(id) {
+                return Err(Error::InvalidObjectStream(format!(
+                    "duplicate object id {id} in object stream header"
+                )));
+            }
+            if previous_offset.is_some_and(|previous| relative_offset <= previous) {
+                return Err(Error::InvalidObjectStream(
+                    "object stream member offsets are not strictly increasing".to_string(),
+                ));
+            }
+
+            let absolute_offset = first
+                .checked_add(relative_offset)
+                .ok_or_else(|| Error::InvalidObjectStream("object stream member offset overflow".to_string()))?;
+            if absolute_offset >= stream.content.len() {
+                return Err(Error::InvalidOffset(absolute_offset));
+            }
+
+            entries.push((id, absolute_offset));
+            previous_offset = Some(relative_offset);
+        }
+
+        if numbers.next().is_some() {
+            return Err(Error::InvalidObjectStream(format!(
+                "object stream header has more than the declared {n} members"
+            )));
+        }
+
+        let (declared_id, start) = entries[member_index];
+        if declared_id != expected_id.0 {
+            return Err(Error::InvalidObjectStream(format!(
+                "member index {member_index} declares object {declared_id}, not {}",
+                expected_id.0
+            )));
+        }
+
+        let end = entries
+            .get(member_index + 1)
+            .map(|(_, offset)| *offset)
+            .unwrap_or(stream.content.len());
+        let member = &stream.content[start..end];
+        let member = member
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map(|leading| &member[leading..])
+            .ok_or_else(|| Error::InvalidObjectStream("selected object stream member is empty".to_string()))?;
+
+        parser::direct_object(member).ok_or_else(|| {
+            Error::InvalidObjectStream("selected object stream member is truncated or invalid".to_string())
         })
     }
 
@@ -318,6 +439,15 @@ impl ObjectStream {
     }
 }
 
+fn parse_object_stream_number(value: Option<&str>, kind: &str, index: usize) -> Result<u32> {
+    let value = value.ok_or_else(|| {
+        Error::InvalidObjectStream(format!("object stream header ended before {kind} for member {index}"))
+    })?;
+    value
+        .parse()
+        .map_err(|_| Error::InvalidObjectStream(format!("invalid {kind} for object stream member {index}")))
+}
+
 impl ObjectStreamBuilder {
     /// Set the maximum number of objects per stream
     pub fn max_objects(mut self, max: usize) -> Self {
@@ -348,5 +478,164 @@ impl ObjectStreamBuilder {
     /// Get the current compression_level setting
     pub fn get_compression_level(&self) -> u32 {
         self.compression_level
+    }
+}
+
+#[cfg(test)]
+mod selected_member_tests {
+    use super::*;
+    use crate::{DecompressError, Dictionary};
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    fn raw_stream(index: &[u8], members: &[u8], n: i64) -> Stream {
+        let mut content = index.to_vec();
+        content.extend_from_slice(members);
+        let mut dict = Dictionary::new();
+        dict.set("Type", "ObjStm");
+        dict.set("N", n);
+        dict.set("First", index.len() as i64);
+        Stream::new(dict, content)
+    }
+
+    fn generated_stream(members: &[(u32, &[u8])]) -> Stream {
+        let mut index = String::new();
+        let mut body = Vec::new();
+        for (id, object) in members {
+            index.push_str(&format!("{id} {} ", body.len()));
+            body.extend_from_slice(object);
+            body.push(b' ');
+        }
+        raw_stream(index.as_bytes(), &body, members.len() as i64)
+    }
+
+    fn invalid_object_stream(result: Result<Object>) -> String {
+        match result {
+            Err(Error::InvalidObjectStream(message)) => message,
+            other => panic!("expected InvalidObjectStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selected_members_match_the_existing_eager_parser() {
+        let members: &[(u32, &[u8])] = &[
+            (7, b"42"),
+            (11, b"<< /Type /Example /Enabled true >>"),
+            (19, b"[1 2 /Three]"),
+        ];
+        let mut eager_stream = generated_stream(members);
+        let eager = ObjectStream::new(&mut eager_stream).unwrap();
+
+        for (index, (id, _)) in members.iter().enumerate() {
+            let mut selected_stream = generated_stream(members);
+            let selected = ObjectStream::parse_selected_member(&mut selected_stream, (*id, 0), index as u16).unwrap();
+            assert_eq!(&selected, eager.objects.get(&(*id, 0)).unwrap());
+        }
+    }
+
+    #[test]
+    fn selected_member_does_not_materialize_other_members() {
+        let members: &[(u32, &[u8])] = &[(1, b"<< /Valid true >>"), (2, b"<< /Truncated")];
+        let mut stream = generated_stream(members);
+        assert!(ObjectStream::parse_selected_member(&mut stream, (1, 0), 0).is_ok());
+
+        let mut stream = generated_stream(members);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut stream, (2, 0), 1));
+        assert!(message.contains("truncated or invalid"));
+    }
+
+    #[test]
+    fn declared_count_must_match_the_complete_header() {
+        let mut too_large = raw_stream(b"1 0 2 3 ", b"42 true ", 3);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut too_large, (1, 0), 0));
+        assert!(message.contains("ended before object id for member 2"));
+
+        let mut too_small = raw_stream(b"1 0 2 3 ", b"42 true ", 1);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut too_small, (1, 0), 0));
+        assert!(message.contains("more than the declared 1 members"));
+
+        let mut negative = raw_stream(b"1 0 ", b"42 ", -1);
+        assert!(matches!(
+            ObjectStream::parse_selected_member(&mut negative, (1, 0), 0),
+            Err(Error::NumericCast(_))
+        ));
+    }
+
+    #[test]
+    fn first_must_bound_the_header() {
+        let mut past_end = generated_stream(&[(1, b"42")]);
+        let invalid_first = past_end.content.len() as i64 + 1;
+        past_end.dict.set("First", invalid_first);
+        assert!(matches!(
+            ObjectStream::parse_selected_member(&mut past_end, (1, 0), 0),
+            Err(Error::InvalidOffset(_))
+        ));
+
+        let mut cuts_header = generated_stream(&[(1, b"42")]);
+        cuts_header.dict.set("First", 0i64);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut cuts_header, (1, 0), 0));
+        assert!(message.contains("ended before object id"));
+
+        let mut negative = generated_stream(&[(1, b"42")]);
+        negative.dict.set("First", -1i64);
+        assert!(matches!(
+            ObjectStream::parse_selected_member(&mut negative, (1, 0), 0),
+            Err(Error::NumericCast(_))
+        ));
+    }
+
+    #[test]
+    fn xref_member_index_id_and_generation_are_validated() {
+        let members: &[(u32, &[u8])] = &[(5, b"42"), (9, b"true")];
+
+        let mut bad_index = generated_stream(members);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut bad_index, (9, 0), 2));
+        assert!(message.contains("outside declared count"));
+
+        let mut bad_id = generated_stream(members);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut bad_id, (9, 0), 0));
+        assert!(message.contains("declares object 5, not 9"));
+
+        let mut bad_generation = generated_stream(members);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut bad_generation, (5, 1), 0));
+        assert!(message.contains("generation zero"));
+    }
+
+    #[test]
+    fn duplicate_ids_and_invalid_offsets_are_rejected() {
+        let mut duplicate_id = raw_stream(b"1 0 1 3 ", b"42 true ", 2);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut duplicate_id, (1, 0), 0));
+        assert!(message.contains("duplicate object id 1"));
+
+        let mut duplicate_offset = raw_stream(b"1 0 2 0 ", b"42 true ", 2);
+        let message = invalid_object_stream(ObjectStream::parse_selected_member(&mut duplicate_offset, (1, 0), 0));
+        assert!(message.contains("not strictly increasing"));
+
+        let mut out_of_bounds = raw_stream(b"1 50 ", b"42 ", 1);
+        assert!(matches!(
+            ObjectStream::parse_selected_member(&mut out_of_bounds, (1, 0), 0),
+            Err(Error::InvalidOffset(_))
+        ));
+    }
+
+    #[test]
+    fn selected_member_honors_the_decompression_limit() {
+        const LIMIT: usize = 4096;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![b'0'; LIMIT * 4]).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut dict = Dictionary::new();
+        dict.set("Type", "ObjStm");
+        dict.set("N", 1i64);
+        dict.set("First", 4i64);
+        dict.set("Filter", "FlateDecode");
+        let mut stream = Stream::new(dict, compressed);
+
+        assert!(matches!(
+            ObjectStream::parse_selected_member_with_limit(&mut stream, (1, 0), 0, Some(LIMIT)),
+            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit: LIMIT }))
+        ));
     }
 }
