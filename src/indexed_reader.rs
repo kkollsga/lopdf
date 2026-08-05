@@ -672,6 +672,12 @@ impl<'a> TokenCursor<'a> {
     }
 
     fn consume_stream_eol(&mut self) -> Option<()> {
+        let horizontal = self
+            .remaining
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(self.remaining.len());
+        self.remaining = &self.remaining[horizontal..];
         if self.remaining.starts_with(b"\r\n") {
             self.remaining = &self.remaining[2..];
             Some(())
@@ -1377,6 +1383,18 @@ mod tests {
         missing_endobj.drain(marker..marker + b"endobj".len());
         assert!(Document::load_mem(&missing_endobj).is_ok());
         assert!(PdfIndex::open(Arc::new(BytesSource::from(missing_endobj))).is_ok());
+
+        let mut spaced_header = valid.clone();
+        let marker = spaced_header
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .unwrap();
+        spaced_header.splice(
+            marker + b"stream".len()..marker + b"stream".len(),
+            b" \t".iter().copied(),
+        );
+        assert!(Document::load_mem(&spaced_header).is_ok());
+        assert!(PdfIndex::open(Arc::new(BytesSource::from(spaced_header))).is_ok());
 
         for replacement in [b"".as_slice(), b"\r\n"] {
             let mut accepted = valid.clone();
