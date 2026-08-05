@@ -5,6 +5,7 @@
 pub mod content;
 pub mod encryption;
 pub mod filters;
+pub mod source;
 pub mod xobject;
 pub mod xref;
 
@@ -51,6 +52,9 @@ pub use object_stream::{ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use outlines::Outline;
 pub use reader::{PdfMetadata, Reader};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
+#[cfg(any(unix, windows))]
+pub use source::FileSource;
+pub use source::{BytesSource, RandomAccessSource, SourceError, SourceResult};
 pub use toc::{Toc, TocType};
 
 pub use parser_aux::substr;
