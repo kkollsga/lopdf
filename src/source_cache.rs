@@ -469,12 +469,16 @@ impl CachedSource {
         let mut completed = 0_usize;
         while completed < output.len() {
             let remaining = output.len() - completed;
-            saturating_add(&self.stats.requested_bytes, remaining as u64);
+            let request_len = remaining.min(SOURCE_CHUNK_BYTES as usize);
+            saturating_add(&self.stats.requested_bytes, request_len as u64);
             let read_offset = offset.checked_add(completed as u64).ok_or(SourceError::RangeOverflow {
                 offset,
                 length: expected,
             })?;
-            match self.source.read_at(read_offset, &mut output[completed..]) {
+            match self
+                .source
+                .read_at(read_offset, &mut output[completed..completed + request_len])
+            {
                 Ok(0) => {
                     return Err(SourceError::UnexpectedEof {
                         offset,
@@ -482,10 +486,10 @@ impl CachedSource {
                         actual: completed as u64,
                     });
                 }
-                Ok(read) if read > remaining => {
+                Ok(read) if read > request_len => {
                     return Err(SourceError::InvalidReadCount {
                         returned: read,
-                        buffer_len: remaining,
+                        buffer_len: request_len,
                     });
                 }
                 Ok(read) => completed += read,
@@ -494,6 +498,34 @@ impl CachedSource {
             }
         }
         Ok(())
+    }
+
+    fn read_source_bounded(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+        let requested = output.len() as u64;
+        let mut completed = 0_usize;
+        while completed < output.len() {
+            let remaining = output.len() - completed;
+            let request_len = remaining.min(SOURCE_CHUNK_BYTES as usize);
+            let read_offset = offset.checked_add(completed as u64).ok_or(SourceError::RangeOverflow {
+                offset,
+                length: requested,
+            })?;
+            saturating_add(&self.stats.requested_bytes, request_len as u64);
+            let read = self
+                .source
+                .read_at(read_offset, &mut output[completed..completed + request_len])?;
+            if read > request_len {
+                return Err(SourceError::InvalidReadCount {
+                    returned: read,
+                    buffer_len: request_len,
+                });
+            }
+            completed += read;
+            if read < request_len {
+                break;
+            }
+        }
+        Ok(completed)
     }
 
     fn load_bypass_chunk(&self, offset: u64, length: u64) -> SourceResult<Arc<Vec<u8>>> {
@@ -569,8 +601,7 @@ impl RandomAccessSource for CachedSource {
         if requested > SOURCE_CHUNK_BYTES {
             saturating_add(&self.stats.bypass_reads, 1);
             saturating_add(&self.stats.bypass_bytes, requested);
-            saturating_add(&self.stats.requested_bytes, requested);
-            return self.source.read_at(offset, output);
+            return self.read_source_bounded(offset, output);
         }
 
         let available = self.source_len - offset;
@@ -669,7 +700,7 @@ fn wait_unpoisoned<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexG
 mod tests {
     use std::fmt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
 
     use super::*;
     use crate::BytesSource;
@@ -698,6 +729,131 @@ mod tests {
             output[..read].copy_from_slice(&self.bytes[start..start + read]);
             Ok(read)
         }
+    }
+
+    struct RequestRecordingSource {
+        bytes: Arc<[u8]>,
+        requests: Mutex<Vec<(u64, usize)>>,
+        max_read: usize,
+    }
+
+    impl RandomAccessSource for RequestRecordingSource {
+        fn len(&self) -> SourceResult<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+            lock_unpoisoned(&self.requests).push((offset, output.len()));
+            let start = offset as usize;
+            let read = output
+                .len()
+                .min(self.max_read)
+                .min(self.bytes.len().saturating_sub(start));
+            output[..read].copy_from_slice(&self.bytes[start..start + read]);
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn sixty_four_kib_plus_one_bypass_uses_two_bounded_source_reads() {
+        let source = Arc::new(RequestRecordingSource {
+            bytes: bytes(2),
+            requests: Mutex::new(Vec::new()),
+            max_read: usize::MAX,
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let cached = CachedSource::new(erased, IndexedReaderCacheOptions::new(4 * SOURCE_CHUNK_BYTES, 8)).unwrap();
+        let offset = 19_u64;
+        let mut output = vec![0; SOURCE_CHUNK_BYTES as usize + 1];
+
+        assert_eq!(cached.read_at(offset, &mut output).unwrap(), output.len());
+        assert_eq!(output, source.bytes[offset as usize..offset as usize + output.len()]);
+        assert_eq!(
+            *lock_unpoisoned(&source.requests),
+            vec![(offset, SOURCE_CHUNK_BYTES as usize), (offset + SOURCE_CHUNK_BYTES, 1)]
+        );
+    }
+
+    #[test]
+    fn multi_chunk_bypass_never_exceeds_the_source_chunk_limit() {
+        let source = Arc::new(RequestRecordingSource {
+            bytes: bytes(4),
+            requests: Mutex::new(Vec::new()),
+            max_read: usize::MAX,
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let cached = CachedSource::new(erased, IndexedReaderCacheOptions::new(4 * SOURCE_CHUNK_BYTES, 8)).unwrap();
+        let mut output = vec![0; 2 * SOURCE_CHUNK_BYTES as usize + 17];
+
+        cached.read_exact_at(0, &mut output).unwrap();
+        assert_eq!(output, source.bytes[..output.len()]);
+        assert_eq!(
+            *lock_unpoisoned(&source.requests),
+            vec![
+                (0, SOURCE_CHUNK_BYTES as usize),
+                (SOURCE_CHUNK_BYTES, SOURCE_CHUNK_BYTES as usize),
+                (2 * SOURCE_CHUNK_BYTES, 17),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_bypass_preserves_a_backing_source_short_read() {
+        let source = Arc::new(RequestRecordingSource {
+            bytes: bytes(2),
+            requests: Mutex::new(Vec::new()),
+            max_read: 17,
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let cached = CachedSource::new(erased, IndexedReaderCacheOptions::new(4 * SOURCE_CHUNK_BYTES, 8)).unwrap();
+        let offset = 23_u64;
+        let mut output = vec![0; SOURCE_CHUNK_BYTES as usize + 1];
+
+        assert_eq!(cached.read_at(offset, &mut output).unwrap(), 17);
+        assert_eq!(&output[..17], &source.bytes[offset as usize..offset as usize + 17]);
+        assert_eq!(
+            *lock_unpoisoned(&source.requests),
+            vec![(offset, SOURCE_CHUNK_BYTES as usize)]
+        );
+    }
+
+    struct ErrorOnSecondReadSource {
+        bytes: Arc<[u8]>,
+        reads: AtomicUsize,
+    }
+
+    impl RandomAccessSource for ErrorOnSecondReadSource {
+        fn len(&self) -> SourceResult<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(SourceError::Io(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )));
+            }
+            let start = offset as usize;
+            output.copy_from_slice(&self.bytes[start..start + output.len()]);
+            Ok(output.len())
+        }
+    }
+
+    #[test]
+    fn bounded_bypass_propagates_an_error_from_a_later_source_chunk() {
+        let source = Arc::new(ErrorOnSecondReadSource {
+            bytes: bytes(2),
+            reads: AtomicUsize::new(0),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let cached = CachedSource::new(erased, IndexedReaderCacheOptions::new(4 * SOURCE_CHUNK_BYTES, 8)).unwrap();
+        let mut output = vec![0; SOURCE_CHUNK_BYTES as usize + 1];
+
+        let SourceError::Io(error) = cached.read_at(0, &mut output).unwrap_err() else {
+            panic!("expected source I/O error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(source.reads.load(Ordering::SeqCst), 2);
     }
 
     struct GatedSource {
