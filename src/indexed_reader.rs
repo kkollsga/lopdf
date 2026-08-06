@@ -1202,50 +1202,45 @@ fn object_retained_bytes(root: &Object) -> usize {
 }
 
 fn dictionary_retained_bytes(dictionary: &Dictionary) -> usize {
-    let mut bytes = std::mem::size_of::<Dictionary>();
-    let mut pending = Vec::new();
-    for (key, value) in dictionary.iter() {
-        // IndexMap's hash/index control storage is deliberately charged with a
-        // conservative fixed envelope in addition to the visible key/value.
-        bytes = bytes
+    std::mem::size_of::<Dictionary>().saturating_add(scalar_dictionary_heap_bytes(dictionary))
+}
+
+fn scalar_object_retained_bytes(object: &Object) -> usize {
+    std::mem::size_of::<Object>().saturating_add(scalar_object_heap_bytes(object))
+}
+
+fn scalar_object_heap_bytes(object: &Object) -> usize {
+    match object {
+        Object::Name(value) | Object::String(value, _) => value.capacity(),
+        Object::Array(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Object>())
+            .saturating_add(
+                values
+                    .iter()
+                    .map(scalar_object_heap_bytes)
+                    .fold(0, usize::saturating_add),
+            ),
+        Object::Dictionary(dictionary) => scalar_dictionary_heap_bytes(dictionary),
+        Object::Stream(stream) => stream
+            .content
+            .capacity()
+            .saturating_add(scalar_dictionary_heap_bytes(&stream.dict)),
+        Object::Null | Object::Boolean(_) | Object::Integer(_) | Object::Real(_) | Object::Reference(_) => 0,
+    }
+}
+
+fn scalar_dictionary_heap_bytes(dictionary: &Dictionary) -> usize {
+    dictionary.iter().fold(0, |bytes, (key, value)| {
+        bytes
             .saturating_add(key.capacity())
             .saturating_add(std::mem::size_of::<(Vec<u8>, Object)>())
-            .saturating_add(64);
-        pending.push(value);
-    }
-    while let Some(object) = pending.pop() {
-        bytes = bytes.saturating_add(std::mem::size_of::<Object>());
-        match object {
-            Object::Name(value) | Object::String(value, _) => {
-                bytes = bytes.saturating_add(value.capacity());
-            }
-            Object::Array(values) => {
-                bytes = bytes.saturating_add(values.capacity().saturating_mul(std::mem::size_of::<Object>()));
-                pending.extend(values);
-            }
-            Object::Dictionary(nested) => {
-                for (key, value) in nested.iter() {
-                    bytes = bytes
-                        .saturating_add(key.capacity())
-                        .saturating_add(std::mem::size_of::<(Vec<u8>, Object)>())
-                        .saturating_add(64);
-                    pending.push(value);
-                }
-            }
-            Object::Stream(stream) => {
-                bytes = bytes.saturating_add(stream.content.capacity());
-                for (key, value) in stream.dict.iter() {
-                    bytes = bytes
-                        .saturating_add(key.capacity())
-                        .saturating_add(std::mem::size_of::<(Vec<u8>, Object)>())
-                        .saturating_add(64);
-                    pending.push(value);
-                }
-            }
-            Object::Null | Object::Boolean(_) | Object::Integer(_) | Object::Real(_) | Object::Reference(_) => {}
-        }
-    }
-    bytes
+            // IndexMap's index/hash/control allocation is not visible through
+            // the public iterator; use the same conservative node envelope as
+            // the allocation-free preflight.
+            .saturating_add(128)
+            .saturating_add(scalar_object_heap_bytes(value))
+    })
 }
 
 fn selected_object_stream_member(
@@ -1735,6 +1730,29 @@ impl IndexedReader {
     fn resolve_normal_scalar_limited(
         &self, id: crate::ObjectId, permit: &ScalarResolutionPermit,
     ) -> IndexedReaderResult<BoundedScalar> {
+        let (_, _, parsed, mut object_charge) = self.parse_normal_at_limited(id, permit)?;
+        if parsed.stream_prefix.is_some() {
+            return Err(IndexedReaderError::NotScalarObject { id });
+        }
+        let object = parsed.object;
+        debug_assert!(self.index.encryption_state.is_none());
+        let retained = u64::try_from(scalar_object_retained_bytes(&object)).unwrap_or(u64::MAX);
+        if retained > object_charge.bytes() {
+            return Err(IndexedReaderError::ScalarResourceLimit {
+                id,
+                requested: retained,
+                limit: object_charge.bytes(),
+                phase: "measured-scalar",
+            });
+        }
+        object_charge.shrink_to(retained);
+        let peak = permit.stats().peak_bytes;
+        Ok(BoundedScalar::new(object, retained, peak, object_charge))
+    }
+
+    fn parse_normal_at_limited(
+        &self, id: crate::ObjectId, permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<(u64, u64, ParsedObject, ScalarCharge)> {
         let location = self
             .index
             .locations
@@ -1789,25 +1807,13 @@ impl IndexedReader {
             )
             .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
         drop(header);
-        let (object, mut object_charge) = self.parse_normal_scalar_limited(id, body_offset, source_len, permit)?;
-        debug_assert!(self.index.encryption_state.is_none());
-        let retained = u64::try_from(object_retained_bytes(&object)).unwrap_or(u64::MAX);
-        if retained > object_charge.bytes() {
-            return Err(IndexedReaderError::ScalarResourceLimit {
-                id,
-                requested: retained,
-                limit: object_charge.bytes(),
-                phase: "measured-scalar",
-            });
-        }
-        object_charge.shrink_to(retained);
-        let peak = permit.stats().peak_bytes;
-        Ok(BoundedScalar::new(object, retained, peak, object_charge))
+        let (parsed, charge) = self.parse_normal_body_limited(id, body_offset, source_len, permit)?;
+        Ok((body_offset, source_len, parsed, charge))
     }
 
-    fn parse_normal_scalar_limited(
+    fn parse_normal_body_limited(
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64, permit: &ScalarResolutionPermit,
-    ) -> IndexedReaderResult<(Object, ScalarCharge)> {
+    ) -> IndexedReaderResult<(ParsedObject, ScalarCharge)> {
         let remaining = source_len.checked_sub(body_offset).ok_or(SourceError::OutOfBounds {
             offset: body_offset,
             length: 0,
@@ -1863,11 +1869,8 @@ impl IndexedReader {
             .reserved_bytes(self.index.encryption_state.is_some());
         let ast_charge = permit.reserve(id, ast_bound, "scalar-ast-envelope")?;
         let parsed = parse_object_body(&window.bytes, id, body_offset)?;
-        if parsed.stream_prefix.is_some() {
-            return Err(IndexedReaderError::NotScalarObject { id });
-        }
         drop(window);
-        Ok((parsed.object, ast_charge))
+        Ok((parsed, ast_charge))
     }
 
     fn resolve_compressed_scalar_limited(
@@ -1883,35 +1886,65 @@ impl IndexedReader {
             });
         }
         let container_id = (container, 0);
-        let descriptor =
-            self.resolve_stream_descriptor(container_id)
-                .map_err(|error| IndexedReaderError::ObjectStreamMember {
-                    id,
-                    container: container_id,
-                    index,
-                    source: crate::Error::InvalidObjectStream(error.to_string()),
-                })?;
-        if descriptor.protection() != EncodedStreamProtection::Plain {
-            return Err(IndexedReaderError::UnsupportedBoundedScalar {
+        let (body_offset, source_len, parsed, mut dictionary_charge) =
+            self.parse_normal_at_limited(container_id, permit)?;
+        let ParsedObject {
+            object,
+            consumed,
+            stream_prefix,
+        } = parsed;
+        let Some(stream_prefix) = stream_prefix else {
+            return Err(IndexedReaderError::ObjectStreamContainerNotStream {
                 id,
-                reason: "protected object streams",
+                container: container_id,
             });
-        }
-        if !limited_object_stream_filter_supported(descriptor.dictionary()) {
+        };
+        let Object::Dictionary(dictionary) = object else {
+            return Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                id,
+                container: container_id,
+            });
+        };
+        if !limited_object_stream_filter_supported(&dictionary) {
             return Err(IndexedReaderError::UnsupportedBoundedScalar {
                 id,
                 reason: "object-stream filter chains or predictors outside plain/FlateDecode",
             });
         }
-        let encoded_len = descriptor
-            .encoded_len()
+        let encoded_len = dictionary
+            .get(b"Length")
+            .and_then(Object::as_i64)
+            .ok()
+            .and_then(|length| u64::try_from(length).ok())
             .ok_or(IndexedReaderError::UnsupportedBoundedScalar {
                 id,
-                reason: "object streams without a proven encoded length",
+                reason: "object streams without a direct nonnegative /Length",
             })?;
-        let dictionary_bytes = u64::try_from(dictionary_retained_bytes(&descriptor.dictionary)).unwrap_or(u64::MAX);
-        let dictionary_charge = permit.reserve(id, dictionary_bytes, "object-stream-dictionary")?;
-        let dictionary = descriptor.dictionary.clone();
+        let encoded_start = body_offset
+            .checked_add(u64::try_from(consumed).unwrap_or(u64::MAX))
+            .and_then(|offset| offset.checked_add(stream_prefix))
+            .ok_or(IndexedReaderError::InvalidIndirectObject {
+                id: container_id,
+                offset: body_offset,
+            })?;
+        let encoded_end = encoded_start
+            .checked_add(encoded_len)
+            .filter(|end| *end <= source_len)
+            .ok_or(IndexedReaderError::StreamLimitExceeded {
+                id: container_id,
+                length: encoded_len,
+                limit: permit.limit_bytes(),
+            })?;
+        let dictionary_bytes = u64::try_from(dictionary_retained_bytes(&dictionary)).unwrap_or(u64::MAX);
+        if dictionary_bytes > dictionary_charge.bytes() {
+            return Err(IndexedReaderError::ScalarResourceLimit {
+                id,
+                requested: dictionary_bytes,
+                limit: dictionary_charge.bytes(),
+                phase: "measured-object-stream-dictionary",
+            });
+        }
+        dictionary_charge.shrink_to(dictionary_bytes);
         let first = dictionary
             .get(b"First")
             .and_then(Object::as_i64)
@@ -1935,6 +1968,23 @@ impl IndexedReader {
                 index,
                 source: crate::Error::InvalidObjectStream("invalid object stream /N".into()),
             })?;
+        let tail_bytes = self
+            .limits
+            .max_endstream_tail_bytes
+            .min(source_len.saturating_sub(encoded_end));
+        let tail_charge = permit.reserve(id, tail_bytes, "object-stream-end-marker")?;
+        match validate_endstream(
+            self.source.as_ref(),
+            source_len,
+            encoded_end,
+            self.limits.max_endstream_tail_bytes,
+        )? {
+            EndstreamStatus::Found => {}
+            EndstreamStatus::Missing | EndstreamStatus::LimitExceeded => {
+                return Err(IndexedReaderError::MissingEndstream { id: container_id });
+            }
+        }
+        drop(tail_charge);
         let encoded_charge = permit.reserve(id, encoded_len, "object-stream-encoded")?;
         let encoded_usize = usize::try_from(encoded_len).map_err(|_| IndexedReaderError::ScalarResourceLimit {
             id,
@@ -1947,34 +1997,18 @@ impl IndexedReader {
             .try_reserve_exact(encoded_usize)
             .map_err(|_| SourceError::AllocationFailed { requested: encoded_len })?;
         encoded.resize(encoded_usize, 0);
-        let mut encoded_reader =
-            descriptor
-                .open_plain_encoded()
-                .map_err(|error| IndexedReaderError::ObjectStreamMember {
-                    id,
-                    container: container_id,
-                    index,
-                    source: crate::Error::InvalidObjectStream(error.to_string()),
-                })?;
-        let mut completed = 0;
+        let mut completed = 0_usize;
         while completed < encoded.len() {
-            let read = encoded_reader.read_chunk(&mut encoded[completed..]).map_err(|error| {
-                IndexedReaderError::ObjectStreamMember {
-                    id,
-                    container: container_id,
-                    index,
-                    source: crate::Error::InvalidObjectStream(error.to_string()),
-                }
-            })?;
-            if read == 0 {
-                return Err(IndexedReaderError::ObjectStreamMember {
-                    id,
-                    container: container_id,
-                    index,
-                    source: crate::Error::InvalidObjectStream("truncated object stream".to_string()),
-                });
-            }
-            completed += read;
+            let request = (encoded.len() - completed).min(ENCODED_STREAM_CHUNK_LIMIT);
+            let offset = encoded_start
+                .checked_add(u64::try_from(completed).unwrap_or(u64::MAX))
+                .ok_or(IndexedReaderError::InvalidIndirectObject {
+                    id: container_id,
+                    offset: encoded_start,
+                })?;
+            self.source
+                .read_exact_at(offset, &mut encoded[completed..completed + request])?;
+            completed += request;
         }
         let stream = Stream {
             dict: dictionary,
@@ -2047,7 +2081,7 @@ impl IndexedReader {
         })?;
         drop(decoded);
         drop(decoded_charge);
-        let retained = u64::try_from(object_retained_bytes(&object)).unwrap_or(u64::MAX);
+        let retained = u64::try_from(scalar_object_retained_bytes(&object)).unwrap_or(u64::MAX);
         if retained > ast_charge.bytes() {
             return Err(IndexedReaderError::ScalarResourceLimit {
                 id,
@@ -10106,7 +10140,7 @@ mod tests {
     fn assert_scalar_preflight_bounds_retained(input: &[u8]) {
         let object = crate::parser::direct_object(input)
             .unwrap_or_else(|| panic!("direct-object corpus entry did not parse: {input:?}"));
-        let measured = object_retained_bytes(&object);
+        let measured = scalar_object_retained_bytes(&object);
         let preflight = scalar_ast_preflight(input)
             .unwrap_or_else(|| panic!("preflight rejected direct-object corpus entry: {input:?}"));
         assert!(
@@ -10216,7 +10250,7 @@ mod tests {
         let preflight = scalar_ast_preflight(input).unwrap();
         let object = crate::parser::direct_object(input).unwrap();
         assert!(preflight.transient_bytes > 0, "{preflight:?}");
-        assert!(usize::try_from(preflight.reserved_bytes(false)).unwrap() >= object_retained_bytes(&object));
+        assert!(usize::try_from(preflight.reserved_bytes(false)).unwrap() >= scalar_object_retained_bytes(&object));
     }
 
     #[test]
@@ -10365,7 +10399,8 @@ mod tests {
             reader.resolve_scalar_with_permit((10, 0), &permit),
             Err(IndexedReaderError::UnsupportedBoundedScalar { .. })
         ));
-        assert_eq!(permit.stats().peak_bytes, 0);
+        assert!(permit.stats().peak_bytes < permit.limit_bytes());
+        assert_eq!(permit.stats().current_bytes, 0);
         permit.close().unwrap();
     }
 
