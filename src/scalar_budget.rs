@@ -70,6 +70,17 @@ pub struct BoundedStreamContent {
     _charge: ScalarCharge,
 }
 
+impl std::fmt::Debug for BoundedStreamContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundedStreamContent")
+            .field("bytes", &self.bytes.len())
+            .field("allocation_bytes", &self.bytes.capacity())
+            .field("peak_bytes", &self.peak_bytes)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for BoundedScalar {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
