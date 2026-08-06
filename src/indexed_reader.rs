@@ -6119,13 +6119,17 @@ fn validate_endstream(
 mod tests {
     use super::*;
     use crate::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
-    use crate::source::{BytesSource, FileSource};
+    use crate::source::BytesSource;
+    #[cfg(any(unix, windows))]
+    use crate::source::FileSource;
     use crate::writer::Writer;
     use crate::xref::XrefEntry;
     use crate::{Document, EncryptionState, EncryptionVersion, Permissions, StringFormat};
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
+    #[cfg(any(unix, windows))]
+    use std::io::{Seek, SeekFrom};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -9884,6 +9888,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn stream_descriptor_physical_reads_fail_closed_after_detectable_mutation() {
         let pdf = object_pdf(&[ObjectDef {

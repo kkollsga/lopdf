@@ -4,10 +4,9 @@
 //! prescribe caching or scheduling policy and never fall back to reading an
 //! entire file into memory.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
+#[cfg(any(unix, windows))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
