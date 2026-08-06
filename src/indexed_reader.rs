@@ -1717,6 +1717,12 @@ impl IndexedReader {
                 phase: "permit-not-empty",
             });
         }
+        if self.index.encryption_state.is_some() {
+            return Err(IndexedReaderError::UnsupportedBoundedScalar {
+                id,
+                reason: "encrypted scalar objects",
+            });
+        }
         match self.index.locations.get(&id.0).cloned() {
             Some(ObjectLocation64::Normal { .. }) => self.resolve_normal_scalar_limited(id, permit),
             Some(ObjectLocation64::Compressed { container, index }) => {
@@ -1783,15 +1789,8 @@ impl IndexedReader {
             )
             .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
         drop(header);
-        let (mut object, mut object_charge) = self.parse_normal_scalar_limited(id, body_offset, source_len, permit)?;
-        if self.index.encrypt_object_id != Some(id)
-            && let Some(encryption_state) = &self.index.encryption_state
-        {
-            // The conservative AST envelope remains live while ciphertext and
-            // plaintext overlap inside the compatibility decrypter.
-            encryption::decrypt_object(encryption_state, id, &mut object)
-                .map_err(|source| IndexedReaderError::ObjectDecryption { id, source })?;
-        }
+        let (object, mut object_charge) = self.parse_normal_scalar_limited(id, body_offset, source_len, permit)?;
+        debug_assert!(self.index.encryption_state.is_none());
         let retained = u64::try_from(object_retained_bytes(&object)).unwrap_or(u64::MAX);
         if retained > object_charge.bytes() {
             return Err(IndexedReaderError::ScalarResourceLimit {
@@ -3800,7 +3799,7 @@ fn is_pdf_delimiter(byte: u8) -> bool {
 }
 
 struct ChargedBytes {
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
     _charge: ScalarCharge,
 }
 
@@ -3810,8 +3809,7 @@ impl ChargedBytes {
         id: crate::ObjectId, phase: &'static str,
     ) -> IndexedReaderResult<Self> {
         let charge = permit.reserve(id, length, phase)?;
-        let bytes = source.read_range(offset, length, length)?;
-        debug_assert_eq!(u64::try_from(bytes.capacity()).unwrap_or(u64::MAX), length);
+        let bytes = source.read_range(offset, length, length)?.into_boxed_slice();
         Ok(Self { bytes, _charge: charge })
     }
 
@@ -3832,12 +3830,8 @@ impl ChargedBytes {
             limit: permit.limit_bytes(),
             phase,
         })?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(target_usize)
-            .map_err(|_| SourceError::AllocationFailed { requested: target })?;
-        bytes.extend_from_slice(&old.bytes);
-        bytes.resize(target_usize, 0);
+        let mut bytes = vec![0; target_usize].into_boxed_slice();
+        bytes[..old.bytes.len()].copy_from_slice(&old.bytes);
         let extension_offset = base_offset
             .checked_add(old_len)
             .ok_or(IndexedReaderError::InvalidIndirectObject {
@@ -3848,7 +3842,6 @@ impl ChargedBytes {
             extension_offset,
             &mut bytes[usize::try_from(old_len).unwrap_or(usize::MAX)..],
         )?;
-        debug_assert_eq!(u64::try_from(bytes.capacity()).unwrap_or(u64::MAX), target);
         drop(old);
         Ok(Self { bytes, _charge: charge })
     }
@@ -9752,6 +9745,62 @@ mod tests {
         assert!(reader.resolve_scalar_with_permit((10, 0), &permit).is_err());
         assert!(permit.stats().peak_bytes <= permit.limit_bytes());
         assert_eq!(permit.stats().current_bytes, 0);
+        permit.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_scalar_never_issues_a_physical_read_over_sixty_four_kib() {
+        let mut body = Vec::with_capacity(128 * 1024 + 2);
+        body.push(b'(');
+        body.resize(128 * 1024 + 1, b'x');
+        body.push(b')');
+        let source = Arc::new(TracingBytesSource {
+            bytes: object_pdf(&[ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: &body,
+            }]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+        let permit = crate::ScalarResolutionPermit::new(64 * 1024 * 1024);
+        let scalar = reader.resolve_scalar_with_permit((1, 0), &permit).unwrap();
+        assert_eq!(scalar.as_object().as_str().unwrap().len(), 128 * 1024);
+        assert!(
+            source
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, bytes)| *bytes <= 64 * 1024)
+        );
+        drop(scalar);
+        permit.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_scalar_refuses_encryption_before_any_call_local_allocation() {
+        let pdf = encrypted_pdf(2, "owner", "user");
+        let reader = IndexedReader::open_with_options(
+            BytesSource::from(pdf),
+            IndexedReaderOptions {
+                password: Some(b"user".to_vec()),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        assert!(matches!(
+            reader.resolve_scalar_with_permit((1, 0), &permit),
+            Err(IndexedReaderError::UnsupportedBoundedScalar {
+                reason: "encrypted scalar objects",
+                ..
+            })
+        ));
+        assert_eq!(permit.stats().peak_bytes, 0);
         permit.close().unwrap();
     }
 }
