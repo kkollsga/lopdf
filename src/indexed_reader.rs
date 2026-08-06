@@ -406,6 +406,19 @@ thread_local! {
     static OBJECT_BODY_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Why a normal xref entry has eager-compatible object-not-found semantics.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum MissingNormalObjectReason {
+    #[error("no indirect-object header appears within the {limit}-byte probe at xref offset {offset}")]
+    HeaderProbeLimit { offset: u64, limit: u64 },
+    #[error("indirect-object header mismatch: expected {expected:?}, found {actual:?}")]
+    HeaderMismatch {
+        expected: crate::ObjectId,
+        actual: crate::ObjectId,
+    },
+}
+
 /// Structured failures produced while opening or resolving an indexed PDF.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -434,6 +447,12 @@ pub enum IndexedReaderError {
     XrefDecompression(#[source] crate::Error),
     #[error("missing normal xref entry for object {id:?}")]
     MissingNormalObject { id: crate::ObjectId },
+    #[error("normal xref entry does not resolve object {id:?}: {reason}")]
+    MissingNormalObjectAtXref {
+        id: crate::ObjectId,
+        #[source]
+        reason: MissingNormalObjectReason,
+    },
     #[error("xref generation {indexed} does not match requested object {id:?}")]
     GenerationMismatch { id: crate::ObjectId, indexed: u16 },
     #[error("indirect-object header at offset {offset} exceeds the {limit}-byte limit")]
@@ -1904,6 +1923,7 @@ impl IndexedReader {
             ) => Err(error),
             Err(
                 IndexedReaderError::MissingNormalObject { .. }
+                | IndexedReaderError::MissingNormalObjectAtXref { .. }
                 | IndexedReaderError::GenerationMismatch { .. }
                 | IndexedReaderError::IndirectObjectMismatch { .. }
                 | IndexedReaderError::InvalidIndirectObject { .. }
@@ -2227,12 +2247,18 @@ impl IndexedReader {
         let source_len = self.source.len()?;
         let header = read_window(self.source.as_ref(), source_len, physical, INDIRECT_HEADER_LIMIT)?;
         let (actual, header_bytes) =
-            parse_indirect_header(&header).ok_or(IndexedReaderError::IndirectHeaderLimitExceeded {
-                offset,
-                limit: INDIRECT_HEADER_LIMIT,
+            parse_indirect_header(&header).ok_or(IndexedReaderError::MissingNormalObjectAtXref {
+                id,
+                reason: MissingNormalObjectReason::HeaderProbeLimit {
+                    offset,
+                    limit: INDIRECT_HEADER_LIMIT,
+                },
             })?;
         if actual != id {
-            return Err(IndexedReaderError::IndirectObjectMismatch { expected: id, actual });
+            return Err(IndexedReaderError::MissingNormalObjectAtXref {
+                id,
+                reason: MissingNormalObjectReason::HeaderMismatch { expected: id, actual },
+            });
         }
         let header_bytes =
             u64::try_from(header_bytes).map_err(|_| IndexedReaderError::InvalidIndirectObject { id, offset })?;
@@ -4261,6 +4287,30 @@ mod tests {
             &[(0, entries)],
             &format!("<< /Size {} /Root 1 0 R >>", u64::from(max_id) + 1),
         );
+        pdf
+    }
+
+    fn malformed_normal_xref_fixture(object_id: u32, offset_delta: u64, body: &[u8]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let object_offset = push_object(&mut pdf, object_id, body);
+        let malformed_offset = object_offset.checked_add(offset_delta).unwrap();
+        append_classic(
+            &mut pdf,
+            &[(object_id, vec![(malformed_offset, 0, true)])],
+            &format!("<< /Size {} >>", u64::from(object_id) + 1),
+        );
+        pdf
+    }
+
+    fn nul_header_probe_fixture() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        push_object(&mut pdf, 1, b"(unreachable)");
+        let malformed_offset = u64::try_from(pdf.len()).unwrap();
+        pdf.extend(std::iter::repeat_n(
+            b'\0',
+            usize::try_from(INDIRECT_HEADER_LIMIT).unwrap() + 1,
+        ));
+        append_classic(&mut pdf, &[(1, vec![(malformed_offset, 0, true)])], "<< /Size 2 >>");
         pdf
     }
 
@@ -6624,13 +6674,95 @@ mod tests {
             reader.resolve_object((1, 0)),
             Err(IndexedReaderError::GenerationMismatch { id: (1, 0), indexed: 1 })
         ));
+        for _ in 0..3 {
+            assert!(matches!(
+                reader.resolve_object((1, 1)),
+                Err(IndexedReaderError::MissingNormalObjectAtXref {
+                    id: (1, 1),
+                    reason: MissingNormalObjectReason::HeaderMismatch {
+                        expected: (1, 1),
+                        actual: (1, 0)
+                    }
+                })
+            ));
+            assert!(matches!(
+                reader.resolve_object_shared((1, 1)).unwrap_err().as_ref(),
+                IndexedReaderError::MissingNormalObjectAtXref {
+                    id: (1, 1),
+                    reason: MissingNormalObjectReason::HeaderMismatch {
+                        expected: (1, 1),
+                        actual: (1, 0)
+                    }
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_normal_xref_header_probe_matches_eager_object_omission() {
+        let pdf = nul_header_probe_fixture();
+        let eager = Document::load_mem(&pdf).unwrap();
         assert!(matches!(
-            reader.resolve_object((1, 1)),
-            Err(IndexedReaderError::IndirectObjectMismatch {
-                expected: (1, 1),
-                actual: (1, 0)
-            })
+            eager.get_object((1, 0)),
+            Err(crate::Error::ObjectNotFound((1, 0)))
         ));
+
+        let classify = |error: &IndexedReaderError| match error {
+            IndexedReaderError::MissingNormalObjectAtXref {
+                id,
+                reason: MissingNormalObjectReason::HeaderProbeLimit { offset, limit },
+            } => (*id, *offset, *limit),
+            other => panic!("unexpected malformed-normal-object error: {other}"),
+        };
+        let reader = Arc::new(open_reader(&pdf, ResolverLimits::default()));
+        let expected = classify(&reader.resolve_object((1, 0)).unwrap_err());
+        assert_eq!(expected.0, (1, 0));
+        assert_eq!(expected.2, INDIRECT_HEADER_LIMIT);
+        for _ in 0..3 {
+            assert_eq!(classify(&reader.resolve_object((1, 0)).unwrap_err()), expected);
+            assert_eq!(
+                classify(reader.resolve_object_shared((1, 0)).unwrap_err().as_ref()),
+                expected
+            );
+        }
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let reader = Arc::clone(&reader);
+                std::thread::spawn(move || classify(&reader.resolve_object((1, 0)).unwrap_err()))
+            })
+            .collect();
+        assert!(threads.into_iter().all(|thread| thread.join().unwrap() == expected));
+    }
+
+    #[test]
+    fn xref_offset_inside_object_body_matches_eager_object_omission() {
+        const NASA_OBJECT_ID: u32 = 34_472;
+        // The observed file records an offset exactly twelve bytes after the
+        // matching `34472 0 obj` header, at the first byte of the object body.
+        let pdf = malformed_normal_xref_fixture(NASA_OBJECT_ID, 12, b"[/Indexed 34471 0 R 255 34473 0 R]");
+        let eager = Document::load_mem(&pdf).unwrap();
+        assert!(matches!(
+            eager.get_object((NASA_OBJECT_ID, 0)),
+            Err(crate::Error::ObjectNotFound((NASA_OBJECT_ID, 0)))
+        ));
+
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        for _ in 0..3 {
+            assert!(matches!(
+                reader.resolve_object((NASA_OBJECT_ID, 0)),
+                Err(IndexedReaderError::MissingNormalObjectAtXref {
+                    id: (NASA_OBJECT_ID, 0),
+                    reason: MissingNormalObjectReason::HeaderProbeLimit { .. }
+                })
+            ));
+            assert!(matches!(
+                reader.resolve_object_shared((NASA_OBJECT_ID, 0)).unwrap_err().as_ref(),
+                IndexedReaderError::MissingNormalObjectAtXref {
+                    id: (NASA_OBJECT_ID, 0),
+                    reason: MissingNormalObjectReason::HeaderProbeLimit { .. }
+                }
+            ));
+        }
     }
 
     #[test]
