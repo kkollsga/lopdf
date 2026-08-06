@@ -1892,6 +1892,12 @@ impl IndexedReader {
                 reason: "protected object streams",
             });
         }
+        if !limited_object_stream_filter_supported(descriptor.dictionary()) {
+            return Err(IndexedReaderError::UnsupportedBoundedScalar {
+                id,
+                reason: "object-stream filter chains or predictors outside plain/FlateDecode",
+            });
+        }
         let encoded_len = descriptor
             .encoded_len()
             .ok_or(IndexedReaderError::UnsupportedBoundedScalar {
@@ -3857,6 +3863,21 @@ fn conservative_ast_envelope(framed_bytes: usize) -> u64 {
         .unwrap_or(u64::MAX)
         .saturating_mul(256)
         .saturating_add(4096)
+}
+
+fn limited_object_stream_filter_supported(dictionary: &Dictionary) -> bool {
+    match dictionary.get(b"Filter") {
+        Err(_) => true,
+        Ok(Object::Name(filter)) if filter == b"FlateDecode" => match dictionary.get(b"DecodeParms") {
+            Err(_) | Ok(Object::Null) => true,
+            Ok(Object::Dictionary(params)) => params
+                .get(b"Predictor")
+                .and_then(Object::as_i64)
+                .map_or(true, |predictor| predictor <= 1),
+            Ok(_) => false,
+        },
+        Ok(_) => false,
+    }
 }
 
 fn read_window(
@@ -9745,6 +9766,27 @@ mod tests {
         assert!(reader.resolve_scalar_with_permit((10, 0), &permit).is_err());
         assert!(permit.stats().peak_bytes <= permit.limit_bytes());
         assert_eq!(permit.stats().current_bytes, 0);
+        permit.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_compressed_scalar_refuses_predictor_before_encoded_allocation() {
+        let body = b"<< /Type /Catalog >>";
+        let (first, plain) = object_stream_content(&[(10, body.as_slice())]);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&plain).unwrap();
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 1 /First {first} /Filter /FlateDecode /DecodeParms << /Predictor 12 >>"),
+            &encoder.finish().unwrap(),
+            &[(10, 0)],
+        );
+        let reader = IndexedReader::open(BytesSource::from(fixture.pdf)).unwrap();
+        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        assert!(matches!(
+            reader.resolve_scalar_with_permit((10, 0), &permit),
+            Err(IndexedReaderError::UnsupportedBoundedScalar { .. })
+        ));
+        assert_eq!(permit.stats().peak_bytes, 0);
         permit.close().unwrap();
     }
 
