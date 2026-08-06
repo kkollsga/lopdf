@@ -1915,24 +1915,9 @@ impl IndexedReader {
         match self.resolve_object(id) {
             Ok(object) => Ok(Some(object)),
             Err(
-                error @ IndexedReaderError::ObjectStreamMember {
-                    source:
-                        crate::Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }) | crate::Error::IO(_),
-                    ..
-                },
-            ) => Err(error),
-            Err(
                 IndexedReaderError::MissingNormalObject { .. }
                 | IndexedReaderError::MissingNormalObjectAtXref { .. }
-                | IndexedReaderError::GenerationMismatch { .. }
-                | IndexedReaderError::IndirectObjectMismatch { .. }
-                | IndexedReaderError::InvalidIndirectObject { .. }
-                | IndexedReaderError::IncompleteObject { .. }
-                | IndexedReaderError::NegativeStreamLength { .. }
-                | IndexedReaderError::MissingEndstream { .. }
-                | IndexedReaderError::ResolutionCycle { .. }
-                | IndexedReaderError::ObjectStreamContainerNotStream { .. }
-                | IndexedReaderError::ObjectStreamMember { .. },
+                | IndexedReaderError::GenerationMismatch { .. },
             ) => Ok(None),
             Err(error) => Err(error),
         }
@@ -4964,6 +4949,46 @@ mod tests {
     }
 
     #[test]
+    fn page_map_propagates_a_direct_malformed_root_object() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Catalog /Pages 2 0 R",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+        ]);
+        let eager = Document::load_mem(&pdf).unwrap();
+        assert!(matches!(
+            eager.get_object((1, 0)),
+            Err(crate::Error::ObjectNotFound((1, 0)))
+        ));
+        assert!(eager.page_iter().next().is_none());
+
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let direct = reader.resolve_object((1, 0)).unwrap_err();
+        assert!(matches!(
+            direct,
+            IndexedReaderError::InvalidIndirectObject { id: (1, 0), .. }
+                | IndexedReaderError::IncompleteObject { id: (1, 0), .. }
+        ));
+        let page_map = reader.page_map().unwrap_err();
+        assert_eq!(page_map.to_string(), direct.to_string());
+    }
+
+    #[test]
     fn page_map_uses_physical_kids_order_ignores_count_and_tracks_inheritance() {
         let pdf = object_pdf(&[
             ObjectDef {
@@ -5252,7 +5277,7 @@ mod tests {
     }
 
     #[test]
-    fn page_map_degrades_semantic_object_stream_members_but_propagates_memory_limits() {
+    fn page_map_propagates_malformed_and_decompression_object_stream_failures() {
         let malformed_members = [
             (10, b"<< /Type /Catalog /Pages 11 0 R >>".as_slice()),
             (11, b"<< /Type /Pages /Kids [12 0 R]".as_slice()),
@@ -5267,12 +5292,42 @@ mod tests {
         let eager = Document::load_mem(&malformed.pdf).unwrap();
         let eager_pages: Vec<_> = eager.page_iter().collect();
         let reader = open_reader(&malformed.pdf, ResolverLimits::default());
-        let page_map = PageMap::from_reader(&reader).unwrap();
-        assert_eq!(
-            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
-            eager_pages
+        assert!(eager_pages.is_empty());
+        assert!(matches!(
+            reader.resolve_object((11, 0)),
+            Err(IndexedReaderError::ObjectStreamMember { .. })
+        ));
+        assert!(matches!(
+            PageMap::from_reader(&reader),
+            Err(IndexedReaderError::ObjectStreamMember { .. })
+        ));
+
+        let invalid_filter = object_stream_fixture(
+            "/Type /ObjStm /N 1 /First 0 /Filter /ASCII85Decode",
+            b"uuuuu",
+            &[(10, 0)],
         );
-        assert!(page_map.pages.is_empty());
+        let eager = Document::load_mem(&invalid_filter.pdf).unwrap();
+        assert!(eager.page_iter().next().is_none());
+        let reader = open_reader(&invalid_filter.pdf, ResolverLimits::default());
+        let direct_error = reader.resolve_object((10, 0)).unwrap_err();
+        assert!(
+            matches!(
+                &direct_error,
+                IndexedReaderError::ObjectStreamMember {
+                    source: crate::Error::Decompress(_),
+                    ..
+                }
+            ),
+            "unexpected direct error: {direct_error:?}"
+        );
+        assert!(matches!(
+            PageMap::from_reader(&reader),
+            Err(IndexedReaderError::ObjectStreamMember {
+                source: crate::Error::Decompress(_),
+                ..
+            })
+        ));
 
         let valid_members = [
             (10, b"<< /Type /Catalog /Pages 11 0 R >>".as_slice()),
