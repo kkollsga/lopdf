@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::TryFromIntError;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Maximum `/N` and parsed header-pair count accepted by the selected-member
 /// object-stream parsers.
@@ -28,8 +29,8 @@ pub struct ObjectStream {
 /// Call-local decoded bytes and a compact index for selected ObjStm members.
 /// Invalid unrelated header pairs remain represented instead of rejecting the
 /// complete stream, preserving the selected-member parser's permissive policy.
-pub(crate) struct SelectedObjectStream<'a> {
-    decoded: Cow<'a, [u8]>,
+pub(crate) struct SelectedObjectStream {
+    decoded: Arc<[u8]>,
     first: usize,
     pairs: Vec<(Option<u32>, Option<u32>)>,
 }
@@ -283,7 +284,7 @@ impl ObjectStream {
     /// members without retaining the decoded container beyond the caller.
     pub(crate) fn selected_members_with_limit(
         stream: &Stream, max_decompressed_size: Option<usize>,
-    ) -> Result<SelectedObjectStream<'_>> {
+    ) -> Result<SelectedObjectStream> {
         SelectedObjectStream::new_with_limit(stream, max_decompressed_size)
     }
 
@@ -482,18 +483,18 @@ impl ObjectStream {
     }
 }
 
-impl<'a> SelectedObjectStream<'a> {
-    fn new_with_limit(stream: &'a Stream, max_decompressed_size: Option<usize>) -> Result<Self> {
+impl SelectedObjectStream {
+    fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<Self> {
         // Keep decompression call-local. A batch therefore retains at most the
         // decoded containers it is actively resolving, never a source-wide map.
-        let decoded = if stream.is_compressed() {
+        let decoded: Arc<[u8]> = if stream.is_compressed() {
             match max_decompressed_size {
-                Some(max) => Cow::Owned(stream.decompressed_content_with_limit(max)?),
+                Some(max) => Arc::from(stream.decompressed_content_with_limit(max)?),
                 // Preserve the eager unbounded constructor's fallback to the
                 // original bytes when a filter cannot be decoded.
                 None => match stream.decompressed_content() {
-                    Ok(decoded) => Cow::Owned(decoded),
-                    Err(_) => Cow::Borrowed(stream.content.as_slice()),
+                    Ok(decoded) => Arc::from(decoded),
+                    Err(_) => Arc::from(stream.content.as_slice()),
                 },
             }
         } else {
@@ -502,7 +503,7 @@ impl<'a> SelectedObjectStream<'a> {
             {
                 return Err(DecompressError::MemoryLimitExceeded { limit: max }.into());
             }
-            Cow::Borrowed(stream.content.as_slice())
+            Arc::from(stream.content.as_slice())
         };
 
         if decoded.is_empty() {
@@ -555,6 +556,14 @@ impl<'a> SelectedObjectStream<'a> {
             ));
         }
         Ok(Self { decoded, first, pairs })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.decoded.len().saturating_add(
+            self.pairs
+                .len()
+                .saturating_mul(std::mem::size_of::<(Option<u32>, Option<u32>)>()),
+        )
     }
 
     pub(crate) fn parse_member(&self, expected_id: ObjectId, member_index: u32) -> Result<Object> {

@@ -2,9 +2,10 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
@@ -36,12 +37,69 @@ const DEFAULT_LENGTH_DEPTH_LIMIT: usize = 64;
 const DEFAULT_PAGE_TREE_DEPTH_LIMIT: usize = 256;
 const DEFAULT_PAGE_COUNT_LIMIT: usize = 1_000_000;
 const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
+const SHARED_OBJECT_PROTECTED_PERCENT: usize = 75;
 
 /// Result returned by the indexed random-access reader.
 pub type IndexedReaderResult<T> = std::result::Result<T, IndexedReaderError>;
 
 /// Shareable result returned by batched and shared object resolution.
 pub type SharedIndexedReaderResult<T> = std::result::Result<T, Arc<IndexedReaderError>>;
+
+/// A point-in-time snapshot of the opt-in shared object cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexedObjectCacheStats {
+    /// Object-cell cache hits.
+    pub object_hits: u64,
+    /// Object-cell cache misses.
+    pub object_misses: u64,
+    /// Calls which waited for an in-flight object resolution.
+    pub object_waits: u64,
+    /// Object resolutions performed by cache leaders.
+    pub object_loads: u64,
+    /// Object cells promoted from probation to protected reuse.
+    pub object_promotions: u64,
+    /// Object cells evicted to enforce fixed caps.
+    pub object_evictions: u64,
+    /// Objects deliberately bypassed because one entry was too large.
+    pub object_bypasses: u64,
+    /// Reuses of a cached deterministic object-resolution error.
+    pub negative_hits: u64,
+    /// Transient source failures shared with current waiters but not retained.
+    pub transient_failures: u64,
+    /// Resident probationary object entries.
+    pub probation_entries: usize,
+    /// Approximate resident bytes in probationary object entries.
+    pub probation_bytes: usize,
+    /// Resident protected object entries.
+    pub protected_entries: usize,
+    /// Approximate resident bytes in protected object entries.
+    pub protected_bytes: usize,
+}
+
+/// A point-in-time snapshot of the opt-in decoded object-stream cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexedObjectStreamCacheStats {
+    /// Decoded object-stream cache hits.
+    pub hits: u64,
+    /// Decoded object-stream cache misses.
+    pub misses: u64,
+    /// Calls which waited for an in-flight object-stream decode.
+    pub waits: u64,
+    /// Object-stream decrypt/decode/index operations performed by leaders.
+    pub loads: u64,
+    /// Decoded object-stream cells evicted to enforce configured caps.
+    pub evictions: u64,
+    /// Decoded object streams bypassed because one entry was too large.
+    pub bypasses: u64,
+    /// Transient source failures shared with current waiters but not retained.
+    pub transient_failures: u64,
+    /// Resident decoded object-stream entries.
+    pub entries: usize,
+    /// Resident decoded object-stream bytes.
+    pub bytes: usize,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -251,6 +309,436 @@ impl From<&IndexedReaderOptions> for ResolverLimits {
     }
 }
 
+type SharedCellResult<T> = std::result::Result<Arc<T>, Arc<IndexedReaderError>>;
+
+enum SharedCellState<T> {
+    Loading,
+    Ready(SharedCellResult<T>),
+}
+
+struct SharedCell<T> {
+    state: Mutex<SharedCellState<T>>,
+    ready: Condvar,
+}
+
+impl<T> SharedCell<T> {
+    fn loading() -> Self {
+        Self {
+            state: Mutex::new(SharedCellState::Loading),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CacheSegment {
+    Probation,
+    Protected,
+}
+
+struct CacheEntry<T> {
+    cell: Arc<SharedCell<T>>,
+    segment: CacheSegment,
+    bytes: usize,
+}
+
+struct SharedCacheInner<T> {
+    entries: HashMap<crate::ObjectId, CacheEntry<T>>,
+    probation: VecDeque<crate::ObjectId>,
+    protected: VecDeque<crate::ObjectId>,
+    probation_bytes: usize,
+    protected_bytes: usize,
+}
+
+impl<T> Default for SharedCacheInner<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            probation: VecDeque::new(),
+            protected: VecDeque::new(),
+            probation_bytes: 0,
+            protected_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CacheKind {
+    Object,
+    ObjectStream,
+}
+
+struct SharedCache<T> {
+    inner: Mutex<SharedCacheInner<T>>,
+    max_bytes: usize,
+    max_entries: usize,
+    max_entry_bytes: usize,
+    protected_percent: usize,
+    kind: CacheKind,
+    counters: Arc<CacheCounters>,
+}
+
+#[derive(Default)]
+struct CacheCounters {
+    object_hits: AtomicU64,
+    object_misses: AtomicU64,
+    object_waits: AtomicU64,
+    object_loads: AtomicU64,
+    object_promotions: AtomicU64,
+    object_evictions: AtomicU64,
+    object_bypasses: AtomicU64,
+    negative_hits: AtomicU64,
+    object_transient_failures: AtomicU64,
+    objstm_hits: AtomicU64,
+    objstm_misses: AtomicU64,
+    objstm_waits: AtomicU64,
+    objstm_loads: AtomicU64,
+    objstm_evictions: AtomicU64,
+    objstm_bypasses: AtomicU64,
+    objstm_transient_failures: AtomicU64,
+}
+
+enum PreparedObjectStream {
+    Selected(crate::object_stream::SelectedObjectStream),
+    Raw(Stream),
+    NotStream,
+}
+
+impl PreparedObjectStream {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Selected(selected) => selected.retained_bytes(),
+            Self::Raw(stream) => stream.content.len().saturating_add(std::mem::size_of::<Stream>()),
+            Self::NotStream => std::mem::size_of::<Self>(),
+        }
+    }
+}
+
+impl<T> SharedCache<T> {
+    fn new(
+        max_bytes: usize, max_entries: usize, max_entry_bytes: usize, protected_percent: usize, kind: CacheKind,
+        counters: Arc<CacheCounters>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(SharedCacheInner::default()),
+            max_bytes,
+            max_entries,
+            max_entry_bytes,
+            protected_percent,
+            kind,
+            counters,
+        }
+    }
+
+    fn resolve<F, W>(&self, id: crate::ObjectId, load: F, weight: W) -> SharedCellResult<T>
+    where
+        F: FnOnce() -> SharedCellResult<T>,
+        W: FnOnce(&T) -> usize,
+    {
+        let (cell, leader) = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(entry) = inner.entries.get(&id) {
+                let cell = Arc::clone(&entry.cell);
+                self.record_hit();
+                self.touch(&mut inner, id);
+                (cell, false)
+            } else {
+                self.record_miss();
+                let cell = Arc::new(SharedCell::loading());
+                inner.probation.push_back(id);
+                inner.entries.insert(
+                    id,
+                    CacheEntry {
+                        cell: Arc::clone(&cell),
+                        segment: CacheSegment::Probation,
+                        bytes: 0,
+                    },
+                );
+                (cell, true)
+            }
+        };
+
+        if !leader {
+            let mut state = cell.state.lock().unwrap();
+            if matches!(*state, SharedCellState::Loading) {
+                self.record_wait();
+            }
+            while matches!(*state, SharedCellState::Loading) {
+                state = cell.ready.wait(state).unwrap();
+            }
+            let SharedCellState::Ready(result) = &*state else {
+                unreachable!();
+            };
+            if result.is_err() {
+                self.counters.negative_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            return result.clone();
+        }
+
+        self.record_load();
+        let result = load();
+        let transient = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| is_transient_error(error.as_ref()));
+        let retained_bytes = result.as_ref().ok().map_or(0, |value| weight(value.as_ref()));
+        {
+            let mut state = cell.state.lock().unwrap();
+            *state = SharedCellState::Ready(result.clone());
+            cell.ready.notify_all();
+        }
+
+        let bypass = retained_bytes > self.max_entry_bytes || retained_bytes > self.max_bytes;
+        let mut inner = self.inner.lock().unwrap();
+        if transient || bypass {
+            if transient {
+                match self.kind {
+                    CacheKind::Object => &self.counters.object_transient_failures,
+                    CacheKind::ObjectStream => &self.counters.objstm_transient_failures,
+                }
+                .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.record_bypass();
+            }
+            self.remove_if_same(&mut inner, id, &cell, false);
+        } else {
+            if let Some(entry) = inner.entries.get_mut(&id)
+                && Arc::ptr_eq(&entry.cell, &cell)
+            {
+                entry.bytes = retained_bytes;
+                match entry.segment {
+                    CacheSegment::Probation => {
+                        inner.probation_bytes = inner.probation_bytes.saturating_add(retained_bytes);
+                    }
+                    CacheSegment::Protected => {
+                        inner.protected_bytes = inner.protected_bytes.saturating_add(retained_bytes);
+                    }
+                }
+            }
+            self.enforce_caps(&mut inner);
+        }
+        result
+    }
+
+    fn touch(&self, inner: &mut SharedCacheInner<T>, id: crate::ObjectId) {
+        let Some(segment) = inner.entries.get(&id).map(|entry| entry.segment) else {
+            return;
+        };
+        match segment {
+            CacheSegment::Probation => {
+                remove_key(&mut inner.probation, id);
+                let bytes = inner.entries.get(&id).map_or(0, |entry| entry.bytes);
+                inner.probation_bytes = inner.probation_bytes.saturating_sub(bytes);
+                inner.protected_bytes = inner.protected_bytes.saturating_add(bytes);
+                if let Some(entry) = inner.entries.get_mut(&id) {
+                    entry.segment = CacheSegment::Protected;
+                }
+                inner.protected.push_back(id);
+                if matches!(self.kind, CacheKind::Object) {
+                    self.counters.object_promotions.fetch_add(1, Ordering::Relaxed);
+                }
+                self.demote_protected(inner);
+            }
+            // Protected entries are deliberately FIFO. Avoiding an O(n)
+            // move-to-back on every hot hit keeps the shared fast path
+            // independent of the configured entry cap.
+            CacheSegment::Protected => {}
+        }
+    }
+
+    fn demote_protected(&self, inner: &mut SharedCacheInner<T>) {
+        let protected_byte_cap = self.max_bytes.saturating_mul(self.protected_percent) / 100;
+        let protected_entry_cap = self.max_entries.saturating_mul(self.protected_percent) / 100;
+        while inner.protected_bytes > protected_byte_cap || inner.protected.len() > protected_entry_cap {
+            let Some(id) = inner.protected.pop_front() else {
+                break;
+            };
+            let Some(entry) = inner.entries.get_mut(&id) else {
+                continue;
+            };
+            entry.segment = CacheSegment::Probation;
+            inner.protected_bytes = inner.protected_bytes.saturating_sub(entry.bytes);
+            inner.probation_bytes = inner.probation_bytes.saturating_add(entry.bytes);
+            inner.probation.push_back(id);
+        }
+    }
+
+    fn enforce_caps(&self, inner: &mut SharedCacheInner<T>) {
+        self.demote_protected(inner);
+        let protected_byte_cap = self.max_bytes.saturating_mul(self.protected_percent) / 100;
+        let protected_entry_cap = self.max_entries.saturating_mul(self.protected_percent) / 100;
+        let probation_byte_cap = self.max_bytes.saturating_sub(protected_byte_cap);
+        let probation_entry_cap = self.max_entries.saturating_sub(protected_entry_cap);
+        let mut pinned = 0;
+        while inner.entries.len() > self.max_entries
+            || inner.probation_bytes.saturating_add(inner.protected_bytes) > self.max_bytes
+            || inner.probation_bytes > probation_byte_cap
+            || inner.probation.len() > probation_entry_cap
+        {
+            let candidate = inner.probation.pop_front().or_else(|| inner.protected.pop_front());
+            let Some(id) = candidate else {
+                break;
+            };
+            let Some(entry) = inner.entries.get(&id) else {
+                continue;
+            };
+            if matches!(*entry.cell.state.lock().unwrap(), SharedCellState::Loading) {
+                match entry.segment {
+                    CacheSegment::Probation => inner.probation.push_back(id),
+                    CacheSegment::Protected => inner.protected.push_back(id),
+                }
+                pinned += 1;
+                if pinned >= inner.probation.len().max(1) {
+                    break;
+                }
+                continue;
+            }
+            // Completed cells are safe to unlink even while callers retain
+            // their cell or result Arcs. Only Loading cells must stay mapped
+            // so a second leader cannot start for the same id.
+            self.remove_entry(inner, id, true);
+            pinned = 0;
+        }
+    }
+
+    fn remove_if_same(
+        &self, inner: &mut SharedCacheInner<T>, id: crate::ObjectId, cell: &Arc<SharedCell<T>>, eviction: bool,
+    ) {
+        if inner
+            .entries
+            .get(&id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.cell, cell))
+        {
+            self.remove_entry(inner, id, eviction);
+        }
+    }
+
+    fn remove_entry(&self, inner: &mut SharedCacheInner<T>, id: crate::ObjectId, eviction: bool) {
+        let Some(entry) = inner.entries.remove(&id) else {
+            return;
+        };
+        match entry.segment {
+            CacheSegment::Probation => {
+                remove_key(&mut inner.probation, id);
+                inner.probation_bytes = inner.probation_bytes.saturating_sub(entry.bytes);
+            }
+            CacheSegment::Protected => {
+                remove_key(&mut inner.protected, id);
+                inner.protected_bytes = inner.protected_bytes.saturating_sub(entry.bytes);
+            }
+        }
+        if eviction {
+            self.record_eviction();
+        }
+    }
+
+    fn record_hit(&self) {
+        match self.kind {
+            CacheKind::Object => &self.counters.object_hits,
+            CacheKind::ObjectStream => &self.counters.objstm_hits,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_miss(&self) {
+        match self.kind {
+            CacheKind::Object => &self.counters.object_misses,
+            CacheKind::ObjectStream => &self.counters.objstm_misses,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_wait(&self) {
+        match self.kind {
+            CacheKind::Object => &self.counters.object_waits,
+            CacheKind::ObjectStream => &self.counters.objstm_waits,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_load(&self) {
+        match self.kind {
+            CacheKind::Object => &self.counters.object_loads,
+            CacheKind::ObjectStream => &self.counters.objstm_loads,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_eviction(&self) {
+        match self.kind {
+            CacheKind::Object => &self.counters.object_evictions,
+            CacheKind::ObjectStream => &self.counters.objstm_evictions,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_bypass(&self) {
+        match self.kind {
+            CacheKind::Object => &self.counters.object_bypasses,
+            CacheKind::ObjectStream => &self.counters.objstm_bypasses,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn residency(&self) -> (usize, usize, usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.probation.len(),
+            inner.probation_bytes,
+            inner.protected.len(),
+            inner.protected_bytes,
+        )
+    }
+}
+
+fn remove_key(queue: &mut VecDeque<crate::ObjectId>, id: crate::ObjectId) {
+    if let Some(position) = queue.iter().position(|candidate| *candidate == id) {
+        queue.remove(position);
+    }
+}
+
+fn is_transient_error(error: &IndexedReaderError) -> bool {
+    match error {
+        IndexedReaderError::Source(_) => true,
+        IndexedReaderError::ObjectStreamMember { source, .. }
+        | IndexedReaderError::ObjectStreamBatchSetup { source, .. } => matches!(source, crate::Error::IO(_)),
+        _ => false,
+    }
+}
+
+fn object_retained_bytes(root: &Object) -> usize {
+    let mut bytes = std::mem::size_of::<Object>();
+    let mut pending = vec![root];
+    while let Some(object) = pending.pop() {
+        match object {
+            Object::Name(value) | Object::String(value, _) => {
+                bytes = bytes.saturating_add(value.capacity());
+            }
+            Object::Array(values) => {
+                bytes = bytes.saturating_add(values.capacity().saturating_mul(std::mem::size_of::<Object>()));
+                pending.extend(values);
+            }
+            Object::Dictionary(dictionary) => {
+                for (key, value) in dictionary.iter() {
+                    bytes = bytes.saturating_add(key.capacity());
+                    bytes = bytes.saturating_add(std::mem::size_of::<(Vec<u8>, Object)>());
+                    pending.push(value);
+                }
+            }
+            Object::Stream(stream) => {
+                bytes = bytes.saturating_add(stream.content.capacity());
+                for (key, value) in stream.dict.iter() {
+                    bytes = bytes.saturating_add(key.capacity());
+                    bytes = bytes.saturating_add(std::mem::size_of::<(Vec<u8>, Object)>());
+                    pending.push(value);
+                }
+            }
+            Object::Null | Object::Boolean(_) | Object::Integer(_) | Object::Real(_) | Object::Reference(_) => {}
+        }
+    }
+    bytes
+}
+
 /// Immutable indexed reader over a cursor-free random-access source.
 ///
 /// All reads are synchronous. Custom sources must be thread-safe and must keep
@@ -262,6 +750,9 @@ pub struct IndexedReader {
     index: Arc<PdfIndex>,
     limits: ResolverLimits,
     options: IndexedReaderOptions,
+    object_cache: Option<SharedCache<Object>>,
+    object_stream_cache: Option<SharedCache<PreparedObjectStream>>,
+    cache_counters: Option<Arc<CacheCounters>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -561,6 +1052,9 @@ impl IndexedReader {
             index: Arc::new(index),
             limits,
             options,
+            object_cache: None,
+            object_stream_cache: None,
+            cache_counters: None,
         };
         reader.initialize_encryption(password.as_deref())?;
         Ok(reader)
@@ -623,9 +1117,30 @@ impl IndexedReader {
     }
 
     /// Resolve one full object id into a shareable owned value.
+    ///
+    /// Readers opened by the legacy constructors do not retain this value:
+    /// the `Arc` only makes the returned ownership shareable. When a cached
+    /// constructor configures the bounded resolver caches, concurrent calls
+    /// for the same id are single-flighted and successful or deterministic
+    /// failing results remain reusable until eviction. Source I/O failures are
+    /// shared by calls already waiting on that cell, then discarded so a later
+    /// operation can retry.
     pub fn resolve_object_shared(&self, id: crate::ObjectId) -> SharedIndexedReaderResult<Arc<Object>> {
+        let Some(cache) = &self.object_cache else {
+            let mut state = ResolutionState::default();
+            return self.resolve_inner(id, &mut state).map(Arc::new).map_err(Arc::new);
+        };
+        cache.resolve(id, || self.resolve_object_shared_uncached(id), object_retained_bytes)
+    }
+
+    fn resolve_object_shared_uncached(&self, id: crate::ObjectId) -> SharedIndexedReaderResult<Arc<Object>> {
         let mut state = ResolutionState::default();
-        self.resolve_inner(id, &mut state).map(Arc::new).map_err(Arc::new)
+        match self.index.locations.get(&id.0).cloned() {
+            Some(ObjectLocation64::Compressed { container, index }) if self.object_stream_cache.is_some() => {
+                self.resolve_compressed_shared(id, container, index, &mut state)
+            }
+            _ => self.resolve_inner(id, &mut state).map(Arc::new).map_err(Arc::new),
+        }
     }
 
     /// Resolve each unique requested id into a shareable owned value.
@@ -713,6 +1228,89 @@ impl IndexedReader {
     /// Derive and count actual leaf pages without trusting `/Count`.
     pub fn page_count(&self) -> IndexedReaderResult<usize> {
         self.page_map().map(|pages| pages.len())
+    }
+
+    /// Snapshot counters and residency for the opt-in shared object cache.
+    pub fn object_cache_stats(&self) -> IndexedObjectCacheStats {
+        let Some(counters) = self.cache_counters.as_ref() else {
+            return IndexedObjectCacheStats::default();
+        };
+        let (probation_entries, probation_bytes, protected_entries, protected_bytes) =
+            self.object_cache.as_ref().map_or((0, 0, 0, 0), SharedCache::residency);
+        IndexedObjectCacheStats {
+            object_hits: counters.object_hits.load(Ordering::Relaxed),
+            object_misses: counters.object_misses.load(Ordering::Relaxed),
+            object_waits: counters.object_waits.load(Ordering::Relaxed),
+            object_loads: counters.object_loads.load(Ordering::Relaxed),
+            object_promotions: counters.object_promotions.load(Ordering::Relaxed),
+            object_evictions: counters.object_evictions.load(Ordering::Relaxed),
+            object_bypasses: counters.object_bypasses.load(Ordering::Relaxed),
+            negative_hits: counters.negative_hits.load(Ordering::Relaxed),
+            transient_failures: counters.object_transient_failures.load(Ordering::Relaxed),
+            probation_entries,
+            probation_bytes,
+            protected_entries,
+            protected_bytes,
+        }
+    }
+
+    /// Snapshot counters and residency for the opt-in decoded object-stream cache.
+    pub fn object_stream_cache_stats(&self) -> IndexedObjectStreamCacheStats {
+        let Some(counters) = self.cache_counters.as_ref() else {
+            return IndexedObjectStreamCacheStats::default();
+        };
+        let (entries, bytes) = self
+            .object_stream_cache
+            .as_ref()
+            .map(|cache| {
+                let (probation_entries, probation_bytes, protected_entries, protected_bytes) = cache.residency();
+                (
+                    probation_entries.saturating_add(protected_entries),
+                    probation_bytes.saturating_add(protected_bytes),
+                )
+            })
+            .unwrap_or((0, 0));
+        IndexedObjectStreamCacheStats {
+            hits: counters.objstm_hits.load(Ordering::Relaxed),
+            misses: counters.objstm_misses.load(Ordering::Relaxed),
+            waits: counters.objstm_waits.load(Ordering::Relaxed),
+            loads: counters.objstm_loads.load(Ordering::Relaxed),
+            evictions: counters.objstm_evictions.load(Ordering::Relaxed),
+            bypasses: counters.objstm_bypasses.load(Ordering::Relaxed),
+            transient_failures: counters.objstm_transient_failures.load(Ordering::Relaxed),
+            entries,
+            bytes,
+        }
+    }
+
+    #[allow(dead_code)] // Called by the cached constructors in the integration commit.
+    pub(crate) fn configure_resolution_caches(
+        &mut self, object_bytes: usize, object_entries: usize, object_stream_bytes: usize, object_stream_entries: usize,
+    ) {
+        let counters = Arc::new(CacheCounters::default());
+        self.cache_counters = Some(Arc::clone(&counters));
+        self.object_cache = (object_bytes > 0 && object_entries > 0).then(|| {
+            SharedCache::new(
+                object_bytes,
+                object_entries,
+                // A new item enters probation; do not allow one item to
+                // consume more than the entire one-quarter probation budget.
+                object_bytes.saturating_mul(100 - SHARED_OBJECT_PROTECTED_PERCENT) / 100,
+                SHARED_OBJECT_PROTECTED_PERCENT,
+                CacheKind::Object,
+                Arc::clone(&counters),
+            )
+        });
+        self.object_stream_cache = (object_stream_bytes > 0 && object_stream_entries > 0).then(|| {
+            SharedCache::new(
+                object_stream_bytes,
+                object_stream_entries,
+                object_stream_bytes,
+                0,
+                CacheKind::ObjectStream,
+                counters,
+            )
+        });
     }
 
     fn resolve_dictionary_deref(&self, id: crate::ObjectId) -> IndexedReaderResult<Option<Dictionary>> {
@@ -834,6 +1432,96 @@ impl IndexedReader {
                 source,
             }
         })
+    }
+
+    fn resolve_compressed_shared(
+        &self, id: crate::ObjectId, container_number: u32, index: u32, state: &mut ResolutionState,
+    ) -> SharedIndexedReaderResult<Arc<Object>> {
+        if state.depth >= self.limits.max_length_depth {
+            return Err(Arc::new(IndexedReaderError::ResolutionDepthExceeded {
+                limit: self.limits.max_length_depth,
+            }));
+        }
+        if !state.active.insert(id) {
+            return Err(Arc::new(IndexedReaderError::ResolutionCycle { id }));
+        }
+        state.depth += 1;
+        let result = self.resolve_compressed_shared_inner(id, container_number, index, state);
+        state.depth -= 1;
+        state.active.remove(&id);
+        result
+    }
+
+    fn resolve_compressed_shared_inner(
+        &self, id: crate::ObjectId, container_number: u32, index: u32, state: &mut ResolutionState,
+    ) -> SharedIndexedReaderResult<Arc<Object>> {
+        if id.1 != 0 {
+            return Err(Arc::new(IndexedReaderError::GenerationMismatch { id, indexed: 0 }));
+        }
+        let container = (container_number, 0);
+        if state.depth >= self.limits.max_length_depth {
+            return Err(Arc::new(IndexedReaderError::ResolutionDepthExceeded {
+                limit: self.limits.max_length_depth,
+            }));
+        }
+        if !state.active.insert(container) {
+            return Err(Arc::new(IndexedReaderError::ResolutionCycle { id: container }));
+        }
+        state.depth += 1;
+        let cache = self
+            .object_stream_cache
+            .as_ref()
+            .expect("shared compressed resolution requires its configured cache");
+        let prepared = cache.resolve(
+            container,
+            || {
+                let prepared = match self.resolve_normal(container, state) {
+                    Ok(Object::Stream(stream)) => {
+                        let limit = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
+                        match ObjectStream::selected_members_with_limit(&stream, Some(limit)) {
+                            Ok(selected) => PreparedObjectStream::Selected(selected),
+                            Err(_) => PreparedObjectStream::Raw(stream),
+                        }
+                    }
+                    Ok(_) => PreparedObjectStream::NotStream,
+                    Err(error) => return Err(Arc::new(error)),
+                };
+                Ok(Arc::new(prepared))
+            },
+            PreparedObjectStream::retained_bytes,
+        )?;
+        state.depth -= 1;
+        state.active.remove(&container);
+
+        match prepared.as_ref() {
+            PreparedObjectStream::Selected(selected) => {
+                selected.parse_member(id, index).map(Arc::new).map_err(|source| {
+                    Arc::new(IndexedReaderError::ObjectStreamMember {
+                        id,
+                        container,
+                        index,
+                        source,
+                    })
+                })
+            }
+            PreparedObjectStream::Raw(stream) => {
+                let limit = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
+                ObjectStream::parse_selected_member_with_limit(stream, id, index, Some(limit))
+                    .map(Arc::new)
+                    .map_err(|source| {
+                        Arc::new(IndexedReaderError::ObjectStreamMember {
+                            id,
+                            container,
+                            index,
+                            source,
+                        })
+                    })
+            }
+            PreparedObjectStream::NotStream => Err(Arc::new(IndexedReaderError::ObjectStreamContainerNotStream {
+                id,
+                container,
+            })),
+        }
     }
 
     fn resolve_compressed_group(
@@ -4450,6 +5138,335 @@ mod tests {
         let resolved = reader.resolve_many_shared(&[(10, 0), (10, 0)]);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].1.as_ref().unwrap().as_str().unwrap(), b"two");
+    }
+
+    fn configure_test_caches(reader: &mut IndexedReader, total_bytes: usize, total_entries: usize) {
+        reader.configure_resolution_caches(total_bytes / 2, total_entries / 2, total_bytes / 4, total_entries / 4);
+    }
+
+    #[test]
+    fn shared_scalar_is_uncached_by_default_and_cached_values_promote_when_configured() {
+        let source = Arc::new(TracingBytesSource {
+            bytes: classic_pdf(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+        let first = reader.resolve_object_shared((4, 0)).unwrap();
+        let first_reads = source.requests.lock().unwrap().len();
+        let second = reader.resolve_object_shared((4, 0)).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(source.requests.lock().unwrap().len() > first_reads);
+        assert_eq!(reader.object_cache_stats(), IndexedObjectCacheStats::default());
+
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        source.requests.lock().unwrap().clear();
+        let cached_first = reader.resolve_object_shared((4, 0)).unwrap();
+        let cached_reads = source.requests.lock().unwrap().len();
+        let cached_second = reader.resolve_object_shared((4, 0)).unwrap();
+        assert!(Arc::ptr_eq(&cached_first, &cached_second));
+        assert_eq!(source.requests.lock().unwrap().len(), cached_reads);
+        assert_eq!(cached_first.as_ref(), &reader.resolve_object((4, 0)).unwrap());
+        let stats = reader.object_cache_stats();
+        assert_eq!(stats.object_misses, 1);
+        assert_eq!(stats.object_hits, 1);
+        assert_eq!(stats.object_loads, 1);
+        assert_eq!(stats.object_promotions, 1);
+        assert_eq!(stats.probation_entries, 0);
+        assert_eq!(stats.protected_entries, 1);
+    }
+
+    #[test]
+    fn shared_scalar_negative_caches_fatal_errors_but_retries_transient_sources() {
+        let source = Arc::new(SwitchableFailureSource {
+            bytes: classic_pdf(),
+            mode: AtomicU8::new(0),
+        });
+        let mut reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+
+        let first = reader.resolve_object_shared((99, 0)).unwrap_err();
+        let second = reader.resolve_object_shared((99, 0)).unwrap_err();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(matches!(
+            first.as_ref(),
+            IndexedReaderError::MissingNormalObject { id: (99, 0) }
+        ));
+
+        source.mode.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            reader.resolve_object_shared((4, 0)).unwrap_err().as_ref(),
+            IndexedReaderError::Source(_)
+        ));
+        source.mode.store(0, Ordering::SeqCst);
+        assert_eq!(
+            reader
+                .resolve_object_shared((4, 0))
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Title")
+                .unwrap(),
+            &Object::String(b"base".to_vec(), StringFormat::Literal)
+        );
+        let stats = reader.object_cache_stats();
+        assert_eq!(stats.negative_hits, 1);
+        assert_eq!(stats.transient_failures, 1);
+        assert_eq!(stats.object_misses, 3);
+    }
+
+    #[test]
+    fn shared_scalar_reuses_one_decoded_object_stream_across_members() {
+        let members = [(10, b"(ten)".as_slice()), (11, b"(eleven)".as_slice())];
+        let (first, decoded) = object_stream_content(&members);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&decoded).unwrap();
+        let content = encoder.finish().unwrap();
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 2 /First {first} /Filter /FlateDecode"),
+            &content,
+            &[(10, 0), (11, 1)],
+        );
+        let source = Arc::new(TracingBytesSource {
+            bytes: fixture.pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        source.requests.lock().unwrap().clear();
+
+        assert_eq!(reader.resolve_object_shared((10, 0)).unwrap().as_str().unwrap(), b"ten");
+        let first_reads = source.requests.lock().unwrap().len();
+        assert_eq!(
+            reader.resolve_object_shared((11, 0)).unwrap().as_str().unwrap(),
+            b"eleven"
+        );
+        assert_eq!(source.requests.lock().unwrap().len(), first_reads);
+        assert_eq!(
+            reader.resolve_object((10, 0)).unwrap(),
+            *reader.resolve_object_shared((10, 0)).unwrap()
+        );
+        let stats = reader.object_stream_cache_stats();
+        assert_eq!(stats.loads, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.entries, 1);
+        assert!(stats.bytes >= decoded.len());
+    }
+
+    #[test]
+    fn oversized_streams_bypass_probation_retention() {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Stream(Stream::new(Dictionary::new(), vec![b'x'; 8 * 1024])),
+        );
+        document.max_id = 1;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        let mut reader = IndexedReader::open(BytesSource::from(pdf)).unwrap();
+        // Object half is 4 KiB and probation is one quarter of that (1 KiB).
+        configure_test_caches(&mut reader, 8 * 1024, 64);
+        assert_eq!(
+            reader
+                .resolve_object_shared((1, 0))
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .content
+                .len(),
+            8 * 1024
+        );
+        assert_eq!(
+            reader
+                .resolve_object_shared((1, 0))
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .content
+                .len(),
+            8 * 1024
+        );
+        let stats = reader.object_cache_stats();
+        assert_eq!(stats.object_bypasses, 2);
+        assert_eq!(stats.probation_entries + stats.protected_entries, 0);
+    }
+
+    #[test]
+    fn segmented_cache_promotes_churns_and_stays_within_a_five_thousand_entry_cap() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = SharedCache::new(
+            2 * 1024 * 1024,
+            5_000,
+            512 * 1024,
+            75,
+            CacheKind::Object,
+            Arc::clone(&counters),
+        );
+        for id in 1..=5_100 {
+            assert_eq!(
+                *cache
+                    .resolve((id, 0), || Ok(Arc::new(Object::Integer(i64::from(id)))), |_| 64)
+                    .unwrap(),
+                Object::Integer(i64::from(id))
+            );
+        }
+        let (probation_entries, probation_bytes, protected_entries, protected_bytes) = cache.residency();
+        assert_eq!(probation_entries, 1_250);
+        assert_eq!(protected_entries, 0);
+        assert!(probation_bytes + protected_bytes <= 2 * 1024 * 1024);
+        assert_eq!(counters.object_evictions.load(Ordering::Relaxed), 3_850);
+
+        let promoted = cache
+            .resolve((5_100, 0), || panic!("resident entry must not reload"), |_| 64)
+            .unwrap();
+        assert_eq!(*promoted, Object::Integer(5_100));
+        let (_, _, protected_entries, _) = cache.residency();
+        assert_eq!(protected_entries, 1);
+    }
+
+    #[test]
+    fn single_flight_shares_one_load_and_one_arc_with_waiters() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = Arc::new(SharedCache::new(
+            1024,
+            8,
+            256,
+            75,
+            CacheKind::Object,
+            Arc::clone(&counters),
+        ));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let cache = Arc::clone(&cache);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            threads.push(std::thread::spawn(move || {
+                cache
+                    .resolve(
+                        (1, 0),
+                        || {
+                            entered.wait();
+                            release.wait();
+                            Ok(Arc::new(Object::Integer(42)))
+                        },
+                        |_| 64,
+                    )
+                    .unwrap()
+            }));
+        }
+        entered.wait();
+        while counters.object_waits.load(Ordering::SeqCst) < 3 {
+            std::thread::yield_now();
+        }
+        release.wait();
+        let values: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert!(values.iter().all(|value| Arc::ptr_eq(&values[0], value)));
+        assert_eq!(counters.object_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.object_waits.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn loading_cells_are_not_evicted_while_pinned() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = SharedCache::<Object>::new(64, 1, 64, 75, CacheKind::Object, counters);
+        let pinned = Arc::new(SharedCell::loading());
+        {
+            let mut inner = cache.inner.lock().unwrap();
+            inner.probation.push_back((1, 0));
+            inner.entries.insert(
+                (1, 0),
+                CacheEntry {
+                    cell: Arc::clone(&pinned),
+                    segment: CacheSegment::Probation,
+                    bytes: 0,
+                },
+            );
+            cache.enforce_caps(&mut inner);
+            assert!(inner.entries.contains_key(&(1, 0)));
+        }
+    }
+
+    #[test]
+    fn cached_shared_resolution_preserves_encryption_revisions_two_through_six() {
+        for revision in 2..=6 {
+            let pdf = encrypted_pdf(revision, "owner", "user");
+            let mut reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+            configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+            let legacy = reader.resolve_object((1, 0)).unwrap();
+            let first = reader.resolve_object_shared((1, 0)).unwrap();
+            let second = reader.resolve_object_shared((1, 0)).unwrap();
+            assert_eq!(legacy, *first, "revision {revision}");
+            assert!(Arc::ptr_eq(&first, &second), "revision {revision}");
+        }
+
+        let (pdf, _, _) = encrypted_object_stream_pdf();
+        let mut reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        for id in [(10, 0), (20, 0), (21, 0)] {
+            assert_eq!(
+                reader.resolve_object(id).unwrap(),
+                *reader.resolve_object_shared(id).unwrap()
+            );
+        }
+        assert_eq!(reader.object_stream_cache_stats().loads, 1);
+    }
+
+    #[test]
+    fn cached_object_streams_preserve_duplicate_mismatch_and_malformed_errors() {
+        let duplicate_header = b"10 0 10 6 ";
+        let mut duplicate_content = duplicate_header.to_vec();
+        duplicate_content.extend_from_slice(b"(one) (two)");
+        let duplicate = object_stream_fixture(
+            &format!("/Type /ObjStm /N 2 /First {}", duplicate_header.len()),
+            &duplicate_content,
+            &[(10, 1)],
+        );
+        let mut reader = open_reader(&duplicate.pdf, ResolverLimits::default());
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        assert_eq!(reader.resolve_object_shared((10, 0)).unwrap().as_str().unwrap(), b"two");
+
+        let members = [(10, b"(ten)".as_slice()), (11, b"(eleven)".as_slice())];
+        let (first, content) = object_stream_content(&members);
+        let mismatch = object_stream_fixture(&format!("/Type /ObjStm /N 2 /First {first}"), &content, &[(10, 1)]);
+        let mut reader = open_reader(&mismatch.pdf, ResolverLimits::default());
+        let legacy = reader.resolve_object((10, 0)).unwrap_err().to_string();
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        let first_error = reader.resolve_object_shared((10, 0)).unwrap_err();
+        let second_error = reader.resolve_object_shared((10, 0)).unwrap_err();
+        assert_eq!(first_error.to_string(), legacy);
+        assert!(Arc::ptr_eq(&first_error, &second_error));
+
+        let malformed = object_stream_fixture("/Type /ObjStm /N 1 /First 999", b"10 0 (ten)", &[(10, 0)]);
+        let mut reader = open_reader(&malformed.pdf, ResolverLimits::default());
+        let legacy = reader.resolve_object((10, 0)).unwrap_err().to_string();
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        assert_eq!(reader.resolve_object_shared((10, 0)).unwrap_err().to_string(), legacy);
+    }
+
+    #[test]
+    fn cached_object_stream_transient_source_failure_is_retried() {
+        let members = [(10, b"(ten)".as_slice())];
+        let (first, content) = object_stream_content(&members);
+        let fixture = object_stream_fixture(&format!("/Type /ObjStm /N 1 /First {first}"), &content, &[(10, 0)]);
+        let source = Arc::new(FailOnceSource {
+            bytes: fixture.pdf,
+            armed: AtomicBool::new(false),
+            armed_reads: AtomicUsize::new(0),
+        });
+        let mut reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        source.armed.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            reader.resolve_object_shared((10, 0)).unwrap_err().as_ref(),
+            IndexedReaderError::Source(_)
+        ));
+        assert_eq!(reader.resolve_object_shared((10, 0)).unwrap().as_str().unwrap(), b"ten");
+        assert_eq!(reader.object_stream_cache_stats().transient_failures, 1);
+        assert_eq!(reader.object_stream_cache_stats().loads, 2);
     }
 
     #[test]
