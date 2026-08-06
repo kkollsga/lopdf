@@ -417,6 +417,14 @@ pub enum MissingNormalObjectReason {
         expected: crate::ObjectId,
         actual: crate::ObjectId,
     },
+    #[error(
+        "indirect-object generation mismatch: requested {requested:?}, xref generation {indexed}, header {actual:?}"
+    )]
+    GenerationMismatch {
+        requested: crate::ObjectId,
+        indexed: u16,
+        actual: crate::ObjectId,
+    },
 }
 
 /// Structured failures produced while opening or resolving an indexed PDF.
@@ -1915,9 +1923,7 @@ impl IndexedReader {
         match self.resolve_object(id) {
             Ok(object) => Ok(Some(object)),
             Err(
-                IndexedReaderError::MissingNormalObject { .. }
-                | IndexedReaderError::MissingNormalObjectAtXref { .. }
-                | IndexedReaderError::GenerationMismatch { .. },
+                IndexedReaderError::MissingNormalObject { .. } | IndexedReaderError::MissingNormalObjectAtXref { .. },
             ) => Ok(None),
             Err(error) => Err(error),
         }
@@ -2217,13 +2223,6 @@ impl IndexedReader {
             ObjectLocation64::Normal { offset, generation } => (*offset, *generation),
             _ => return Err(IndexedReaderError::MissingNormalObject { id }),
         };
-        if indexed_generation != id.1 {
-            return Err(IndexedReaderError::GenerationMismatch {
-                id,
-                indexed: indexed_generation,
-            });
-        }
-
         let physical = self
             .index
             .source_origin
@@ -2239,10 +2238,20 @@ impl IndexedReader {
                     limit: INDIRECT_HEADER_LIMIT,
                 },
             })?;
-        if actual != id {
+        if actual.0 != id.0 {
             return Err(IndexedReaderError::MissingNormalObjectAtXref {
                 id,
                 reason: MissingNormalObjectReason::HeaderMismatch { expected: id, actual },
+            });
+        }
+        if actual.1 != id.1 {
+            return Err(IndexedReaderError::MissingNormalObjectAtXref {
+                id,
+                reason: MissingNormalObjectReason::GenerationMismatch {
+                    requested: id,
+                    indexed: indexed_generation,
+                    actual,
+                },
             });
         }
         let header_bytes =
@@ -4259,6 +4268,10 @@ mod tests {
     }
 
     fn object_pdf(definitions: &[ObjectDef<'_>]) -> Vec<u8> {
+        object_pdf_with_root(definitions, (1, 0))
+    }
+
+    fn object_pdf_with_root(definitions: &[ObjectDef<'_>], root: crate::ObjectId) -> Vec<u8> {
         let mut pdf = b"%PDF-1.7\n".to_vec();
         let max_id = definitions.iter().map(|definition| definition.id).max().unwrap_or(0);
         let mut entries = vec![(0, 65535, false); usize::try_from(max_id).unwrap() + 1];
@@ -4270,8 +4283,15 @@ mod tests {
         append_classic(
             &mut pdf,
             &[(0, entries)],
-            &format!("<< /Size {} /Root 1 0 R >>", u64::from(max_id) + 1),
+            &format!("<< /Size {} /Root {} {} R >>", u64::from(max_id) + 1, root.0, root.1),
         );
+        pdf
+    }
+
+    fn xref_number_header_mismatch_fixture() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let offset = push_object(&mut pdf, 2, b"<< /Type /Catalog >>");
+        append_classic(&mut pdf, &[(1, vec![(offset, 0, true)])], "<< /Size 3 /Root 1 0 R >>");
         pdf
     }
 
@@ -5759,7 +5779,14 @@ mod tests {
         assert_eq!(resolved[2].1.as_ref().unwrap().as_str().unwrap(), b"one");
         assert!(matches!(
             resolved[3].1.as_ref().unwrap_err().as_ref(),
-            IndexedReaderError::GenerationMismatch { id: (1, 1), indexed: 0 }
+            IndexedReaderError::MissingNormalObjectAtXref {
+                id: (1, 1),
+                reason: MissingNormalObjectReason::GenerationMismatch {
+                    requested: (1, 1),
+                    indexed: 0,
+                    actual: (1, 0)
+                }
+            }
         ));
         assert!(reader.resolve_many_shared(&[]).is_empty());
     }
@@ -6716,26 +6743,54 @@ mod tests {
     }
 
     #[test]
-    fn xref_and_indirect_header_generations_are_both_validated() {
-        let pdf = object_pdf(&[ObjectDef {
-            id: 1,
-            object_generation: 0,
-            xref_generation: 1,
-            body: b"(generation)",
-        }]);
-        let reader = open_reader(&pdf, ResolverLimits::default());
-
+    fn parsed_normal_header_is_authoritative_over_xref_generation() {
+        let definitions = [
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 1,
+                body: b"<< /Type /Catalog /Pages 2 0 R >>",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+        ];
+        let pdf = object_pdf(&definitions);
+        let eager = Document::load_mem(&pdf).unwrap();
+        assert!(eager.get_object((1, 0)).is_ok());
         assert!(matches!(
-            reader.resolve_object((1, 0)),
-            Err(IndexedReaderError::GenerationMismatch { id: (1, 0), indexed: 1 })
+            eager.get_object((1, 1)),
+            Err(crate::Error::ObjectNotFound((1, 1)))
         ));
+        assert_eq!(eager.page_iter().collect::<Vec<_>>(), vec![(3, 0)]);
+
+        let reader = Arc::new(open_reader(&pdf, ResolverLimits::default()));
         for _ in 0..3 {
+            assert_eq!(
+                reader.resolve_object((1, 0)).unwrap(),
+                eager.get_object((1, 0)).unwrap().clone()
+            );
+            assert_eq!(
+                *reader.resolve_object_shared((1, 0)).unwrap(),
+                eager.get_object((1, 0)).unwrap().clone()
+            );
+            assert_eq!(reader.page_map().unwrap().pages[0].id, (3, 0));
             assert!(matches!(
                 reader.resolve_object((1, 1)),
                 Err(IndexedReaderError::MissingNormalObjectAtXref {
                     id: (1, 1),
-                    reason: MissingNormalObjectReason::HeaderMismatch {
-                        expected: (1, 1),
+                    reason: MissingNormalObjectReason::GenerationMismatch {
+                        requested: (1, 1),
+                        indexed: 1,
                         actual: (1, 0)
                     }
                 })
@@ -6744,13 +6799,101 @@ mod tests {
                 reader.resolve_object_shared((1, 1)).unwrap_err().as_ref(),
                 IndexedReaderError::MissingNormalObjectAtXref {
                     id: (1, 1),
-                    reason: MissingNormalObjectReason::HeaderMismatch {
-                        expected: (1, 1),
+                    reason: MissingNormalObjectReason::GenerationMismatch {
+                        requested: (1, 1),
+                        indexed: 1,
                         actual: (1, 0)
                     }
                 }
             ));
         }
+
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let reader = Arc::clone(&reader);
+                std::thread::spawn(move || {
+                    (
+                        reader.resolve_object((1, 0)).unwrap(),
+                        reader.page_map().unwrap().pages[0].id,
+                        reader.resolve_object((1, 1)).unwrap_err().to_string(),
+                    )
+                })
+            })
+            .collect();
+        let expected_missing = reader.resolve_object((1, 1)).unwrap_err().to_string();
+        for thread in threads {
+            let (object, page, missing) = thread.join().unwrap();
+            assert_eq!(object, eager.get_object((1, 0)).unwrap().clone());
+            assert_eq!(page, (3, 0));
+            assert_eq!(missing, expected_missing);
+        }
+
+        let missing_root = object_pdf_with_root(&definitions, (1, 1));
+        let eager = Document::load_mem(&missing_root).unwrap();
+        assert!(eager.page_iter().next().is_none());
+        let reader = open_reader(&missing_root, ResolverLimits::default());
+        assert!(matches!(
+            reader.resolve_object((1, 1)),
+            Err(IndexedReaderError::MissingNormalObjectAtXref {
+                id: (1, 1),
+                reason: MissingNormalObjectReason::GenerationMismatch {
+                    requested: (1, 1),
+                    indexed: 1,
+                    actual: (1, 0)
+                }
+            })
+        ));
+        assert!(reader.page_map().unwrap().is_empty());
+
+        let mismatch = xref_number_header_mismatch_fixture();
+        let eager = Document::load_mem(&mismatch).unwrap();
+        assert!(matches!(
+            eager.get_object((1, 0)),
+            Err(crate::Error::ObjectNotFound((1, 0)))
+        ));
+        let reader = open_reader(&mismatch, ResolverLimits::default());
+        assert!(matches!(
+            reader.resolve_object((1, 0)),
+            Err(IndexedReaderError::MissingNormalObjectAtXref {
+                id: (1, 0),
+                reason: MissingNormalObjectReason::HeaderMismatch {
+                    expected: (1, 0),
+                    actual: (2, 0)
+                }
+            })
+        ));
+        assert!(reader.page_map().unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_compressed_generation_mismatch_is_not_a_semantic_page_map_omission() {
+        let (first, content) = object_stream_content(&[(10, b"<< /Type /Catalog >>")]);
+        let mut fixture = object_stream_fixture(&format!("/Type /ObjStm /N 1 /First {first}"), &content, &[(10, 0)]);
+        let marker = b"/Root 10 0 R";
+        let root = fixture
+            .pdf
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap();
+        fixture.pdf[root + b"/Root 10 ".len()] = b'1';
+
+        let eager = Document::load_mem(&fixture.pdf).unwrap();
+        assert!(eager.page_iter().next().is_none());
+        let reader = open_reader(&fixture.pdf, ResolverLimits::default());
+        assert!(matches!(
+            reader.resolve_object((10, 1)),
+            Err(IndexedReaderError::GenerationMismatch {
+                id: (10, 1),
+                indexed: 0
+            })
+        ));
+        assert!(matches!(
+            reader.page_map(),
+            Err(IndexedReaderError::GenerationMismatch {
+                id: (10, 1),
+                indexed: 0
+            })
+        ));
     }
 
     #[test]
