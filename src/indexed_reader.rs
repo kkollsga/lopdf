@@ -1642,9 +1642,11 @@ impl IndexedReader {
                     }
                 })
             }
-            Some(ObjectLocation64::Compressed { container, index }) => {
-                self.resolve_compressed(id, container, index, state)
-            }
+            // Descriptor classification runs before a caller has acquired an
+            // encoded-stream lease.  A compressed metadata value would require
+            // reading and decoding its object-stream payload, so fail closed
+            // without touching the container.
+            Some(ObjectLocation64::Compressed { .. }) => Err(IndexedReaderError::MissingNormalObject { id }),
             Some(ObjectLocation64::Free { .. }) | None => Err(IndexedReaderError::MissingNormalObject { id }),
         };
         let resolved = resolved.and_then(|object| self.resolve_filter_value(object, state));
@@ -7003,6 +7005,103 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn stream_descriptor_never_reads_compressed_filter_metadata_before_lease() {
+        const OBJECT_ID: u32 = 1;
+        const CONTAINER_ID: u32 = 5;
+        const XREF_ID: u32 = 6;
+        const FILTER_ID: u32 = 10;
+
+        let object_offset = 1_024_u64;
+        let object =
+            format!("{OBJECT_ID} 0 obj\n<< /Length 5 /Filter {FILTER_ID} 0 R >>\nstream\nhello\nendstream\nendobj\n")
+                .into_bytes();
+
+        let container_offset = 1_024_u64 * 1_024;
+        let container_stream_length = 64_u64 * 1_024 * 1_024 - 1;
+        let container_prefix = format!(
+            "{CONTAINER_ID} 0 obj\n<< /Type /ObjStm /N 1 /First 5 /Length {container_stream_length} >>\nstream\n"
+        )
+        .into_bytes();
+        let container_stream_start = container_offset + u64::try_from(container_prefix.len()).unwrap();
+        let container_stream_end = container_stream_start + container_stream_length;
+        let container_suffix = b"\nendstream\nendobj\n".to_vec();
+
+        let xref_offset = container_stream_end + 1_024_u64 * 1_024;
+        let mut xref_content = Vec::new();
+        for id in 0..=FILTER_ID {
+            match id {
+                OBJECT_ID => {
+                    encode_field(1, 1, &mut xref_content);
+                    encode_field(object_offset, 8, &mut xref_content);
+                    encode_field(0, 4, &mut xref_content);
+                }
+                CONTAINER_ID => {
+                    encode_field(1, 1, &mut xref_content);
+                    encode_field(container_offset, 8, &mut xref_content);
+                    encode_field(0, 4, &mut xref_content);
+                }
+                XREF_ID => {
+                    encode_field(1, 1, &mut xref_content);
+                    encode_field(xref_offset, 8, &mut xref_content);
+                    encode_field(0, 4, &mut xref_content);
+                }
+                FILTER_ID => {
+                    encode_field(2, 1, &mut xref_content);
+                    encode_field(u64::from(CONTAINER_ID), 8, &mut xref_content);
+                    encode_field(0, 4, &mut xref_content);
+                }
+                _ => {
+                    encode_field(0, 1, &mut xref_content);
+                    encode_field(0, 8, &mut xref_content);
+                    encode_field(if id == 0 { 65_535 } else { 0 }, 4, &mut xref_content);
+                }
+            }
+        }
+        let mut xref = format!(
+            "{XREF_ID} 0 obj\n<< /Type /XRef /Size {} /Root {OBJECT_ID} 0 R /W [1 8 4] /Length {} >>\nstream\n",
+            FILTER_ID + 1,
+            xref_content.len()
+        )
+        .into_bytes();
+        xref.extend_from_slice(&xref_content);
+        xref.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        let source_len = xref_offset + u64::try_from(xref.len()).unwrap();
+        let container_region_end = container_stream_end + u64::try_from(container_suffix.len()).unwrap();
+
+        let source = Arc::new(OverlaySource {
+            len: source_len,
+            regions: vec![
+                (0, b"%PDF-1.7\n".to_vec()),
+                (object_offset, object),
+                (container_offset, container_prefix),
+                (container_stream_start, b"10 0 /Crypt".to_vec()),
+                (container_stream_end, container_suffix),
+                (xref_offset, xref),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        source.requests.lock().unwrap().clear();
+
+        let descriptor = reader.resolve_stream_descriptor((OBJECT_ID, 0)).unwrap();
+        assert_eq!(descriptor.protection(), EncodedStreamProtection::UnresolvedFilter);
+        assert!(matches!(
+            descriptor.open_plain_encoded(),
+            Err(IndexedStreamReadError::Protected {
+                protection: EncodedStreamProtection::UnresolvedFilter,
+                ..
+            })
+        ));
+
+        let requests = source.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|(offset, length)| {
+            let end = offset.saturating_add(u64::try_from(*length).unwrap_or(u64::MAX));
+            end <= container_offset || *offset >= container_region_end
+        }));
     }
 
     #[test]
