@@ -36,6 +36,7 @@ const DEFAULT_ENDSTREAM_TAIL_LIMIT: u64 = 64;
 const DEFAULT_LENGTH_DEPTH_LIMIT: usize = 64;
 const DEFAULT_PAGE_TREE_DEPTH_LIMIT: usize = 256;
 const DEFAULT_PAGE_COUNT_LIMIT: usize = 1_000_000;
+const ENCODED_STREAM_CHUNK_LIMIT: usize = 64 * 1_024;
 const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
 const SHARED_OBJECT_PROTECTED_PERCENT: usize = 75;
 
@@ -44,6 +45,242 @@ pub type IndexedReaderResult<T> = std::result::Result<T, IndexedReaderError>;
 
 /// Shareable result returned by batched and shared object resolution.
 pub type SharedIndexedReaderResult<T> = std::result::Result<T, Arc<IndexedReaderError>>;
+
+/// Result returned while opening or reading a bounded encoded stream.
+pub type IndexedStreamReadResult<T> = std::result::Result<T, IndexedStreamReadError>;
+
+/// Classification of an indexed stream's encoded bytes.
+///
+/// Only [`Plain`](Self::Plain) descriptors can currently be opened. Protected
+/// streams continue to use the indexed reader's existing materialized object
+/// path, which performs the required decryption before exposing bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EncodedStreamProtection {
+    /// The encoded bytes are not protected by document or stream encryption.
+    Plain,
+    /// The PDF has an authenticated encryption state, so this stream must use
+    /// the existing decrypting object path.
+    DocumentEncrypted,
+    /// The stream explicitly names the PDF `Crypt` filter.
+    CryptFilter,
+}
+
+/// Structured failures while opening or reading encoded stream bytes.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum IndexedStreamReadError {
+    /// Stream metadata could not be resolved with the scalar reader's bounds
+    /// and degradation rules.
+    #[error(transparent)]
+    Resolve(#[from] IndexedReaderError),
+    /// The object is not a normal xref entry. Compressed objects cannot be
+    /// streams in a conforming PDF and are deliberately not materialized here.
+    #[error("object {id:?} is not an ordinary indexed object")]
+    NotNormalObject { id: crate::ObjectId },
+    /// Scalar resolution degrades this object to a non-stream value.
+    #[error("object {id:?} does not resolve to a bounded stream")]
+    NotStream { id: crate::ObjectId },
+    /// The encoded payload is protected and cannot be exposed as plaintext by
+    /// the L0 streaming seam.
+    #[error("object {id:?} has protected encoded bytes ({protection:?})")]
+    Protected {
+        id: crate::ObjectId,
+        protection: EncodedStreamProtection,
+    },
+    /// The source's reported length changed after the reader captured it.
+    #[error("indexed source length changed: expected {expected}, found {actual}")]
+    SourceLengthChanged { expected: u64, actual: u64 },
+    /// A checked positional source read failed.
+    #[error("indexed stream source error")]
+    Source(#[from] SourceError),
+}
+
+/// Owned metadata and a private checked span for one encoded PDF stream.
+///
+/// The descriptor never owns payload bytes and intentionally exposes neither
+/// the source offset nor encryption key material. It may be moved or shared
+/// across threads; each opened reader has an independent cursor.
+pub struct IndexedStreamDescriptor {
+    id: crate::ObjectId,
+    dictionary: Dictionary,
+    encoded_len: u64,
+    protection: EncodedStreamProtection,
+    source: Arc<dyn RandomAccessSource>,
+    source_len: u64,
+    encoded_start: u64,
+}
+
+impl std::fmt::Debug for IndexedStreamDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexedStreamDescriptor")
+            .field("id", &self.id)
+            .field("dictionary", &self.dictionary)
+            .field("encoded_len", &self.encoded_len)
+            .field("protection", &self.protection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndexedStreamDescriptor {
+    /// Object id whose stream metadata was resolved.
+    pub const fn id(&self) -> crate::ObjectId {
+        self.id
+    }
+
+    /// Cloned stream dictionary. No payload bytes are retained by it.
+    pub const fn dictionary(&self) -> &Dictionary {
+        &self.dictionary
+    }
+
+    /// Checked encoded payload length.
+    pub const fn encoded_len(&self) -> u64 {
+        self.encoded_len
+    }
+
+    /// Whether the encoded bytes can be opened by the L0 plain reader.
+    pub const fn protection(&self) -> EncodedStreamProtection {
+        self.protection
+    }
+
+    /// Open an independent bounded reader for unencrypted encoded bytes.
+    ///
+    /// Protected streams fail before any payload read. Decoding PDF filter
+    /// chains is intentionally outside this reader's contract.
+    pub fn open_plain_encoded(&self) -> IndexedStreamReadResult<EncodedStreamReader> {
+        if self.protection != EncodedStreamProtection::Plain {
+            return Err(IndexedStreamReadError::Protected {
+                id: self.id,
+                protection: self.protection,
+            });
+        }
+        let actual = self.source.len()?;
+        if actual != self.source_len {
+            return Err(IndexedStreamReadError::SourceLengthChanged {
+                expected: self.source_len,
+                actual,
+            });
+        }
+        Ok(EncodedStreamReader {
+            id: self.id,
+            source: Arc::clone(&self.source),
+            source_len: self.source_len,
+            encoded_start: self.encoded_start,
+            encoded_len: self.encoded_len,
+            position: 0,
+        })
+    }
+}
+
+/// Cursor over one descriptor's checked encoded stream span.
+///
+/// A call fills at most 64 KiB, even when the caller supplies a larger buffer.
+/// The reader retries interrupted and partial positional reads without a
+/// shared source cursor.
+pub struct EncodedStreamReader {
+    id: crate::ObjectId,
+    source: Arc<dyn RandomAccessSource>,
+    source_len: u64,
+    encoded_start: u64,
+    encoded_len: u64,
+    position: u64,
+}
+
+impl std::fmt::Debug for EncodedStreamReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EncodedStreamReader")
+            .field("id", &self.id)
+            .field("encoded_len", &self.encoded_len)
+            .field("position", &self.position)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EncodedStreamReader {
+    /// Return the number of encoded bytes not yet read.
+    pub const fn remaining(&self) -> u64 {
+        self.encoded_len - self.position
+    }
+
+    /// Fill a bounded chunk from the encoded payload.
+    pub fn read_chunk(&mut self, output: &mut [u8]) -> IndexedStreamReadResult<usize> {
+        if output.is_empty() || self.position == self.encoded_len {
+            return Ok(0);
+        }
+        let actual_len = self.source.len()?;
+        if actual_len != self.source_len {
+            return Err(IndexedStreamReadError::SourceLengthChanged {
+                expected: self.source_len,
+                actual: actual_len,
+            });
+        }
+        let requested = output
+            .len()
+            .min(ENCODED_STREAM_CHUNK_LIMIT)
+            .min(usize::try_from(self.remaining()).unwrap_or(usize::MAX));
+        let absolute = self
+            .encoded_start
+            .checked_add(self.position)
+            .ok_or(SourceError::RangeOverflow {
+                offset: self.encoded_start,
+                length: self.position,
+            })?;
+        let mut completed = 0;
+        while completed < requested {
+            let offset = absolute
+                .checked_add(u64::try_from(completed).map_err(|_| SourceError::RangeOverflow {
+                    offset: absolute,
+                    length: u64::MAX,
+                })?)
+                .ok_or(SourceError::RangeOverflow {
+                    offset: absolute,
+                    length: u64::try_from(requested).unwrap_or(u64::MAX),
+                })?;
+            let remaining = requested - completed;
+            match self.source.read_at(offset, &mut output[completed..requested]) {
+                Ok(0) => {
+                    return Err(SourceError::UnexpectedEof {
+                        offset: absolute,
+                        expected: u64::try_from(requested).unwrap_or(u64::MAX),
+                        actual: u64::try_from(completed).unwrap_or(u64::MAX),
+                    }
+                    .into());
+                }
+                Ok(read) if read > remaining => {
+                    return Err(SourceError::InvalidReadCount {
+                        returned: read,
+                        buffer_len: remaining,
+                    }
+                    .into());
+                }
+                Ok(read) => completed += read,
+                Err(SourceError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let actual_len = self.source.len()?;
+        if actual_len != self.source_len {
+            return Err(IndexedStreamReadError::SourceLengthChanged {
+                expected: self.source_len,
+                actual: actual_len,
+            });
+        }
+        let completed_u64 = u64::try_from(completed).map_err(|_| SourceError::RangeOverflow {
+            offset: absolute,
+            length: u64::MAX,
+        })?;
+        self.position = self
+            .position
+            .checked_add(completed_u64)
+            .ok_or(SourceError::RangeOverflow {
+                offset: self.position,
+                length: completed_u64,
+            })?;
+        Ok(completed)
+    }
+}
 
 /// A point-in-time snapshot of all bounded indexed-reader caches.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1282,6 +1519,46 @@ impl IndexedReader {
         self.resolve_inner(id, &mut state)
     }
 
+    /// Resolve bounded metadata for one ordinary stream without reading its
+    /// encoded payload.
+    ///
+    /// Compressed object-stream members are unavailable through this seam.
+    /// Missing or malformed stream lengths and `endstream` framing follow the
+    /// same degradation and resource-limit decisions as [`Self::resolve_object`].
+    pub fn resolve_stream_descriptor(&self, id: crate::ObjectId) -> IndexedStreamReadResult<IndexedStreamDescriptor> {
+        if matches!(
+            self.index.locations.get(&id.0),
+            Some(ObjectLocation64::Compressed { .. })
+        ) {
+            return Err(IndexedStreamReadError::NotNormalObject { id });
+        }
+        let mut state = ResolutionState::default();
+        let (body_offset, source_len, parsed) = self.resolve_normal_framed(id)?;
+        let metadata = self.finish_stream_metadata(id, body_offset, source_len, parsed, &mut state)?;
+        let (dictionary, encoded_start, encoded_len) = match metadata {
+            FramedStreamMetadata::Span {
+                dictionary,
+                encoded_start,
+                encoded_len,
+            } => (dictionary, encoded_start, encoded_len),
+            FramedStreamMetadata::MissingLength {
+                dictionary,
+                encoded_start,
+            } => (dictionary, encoded_start, 0),
+            FramedStreamMetadata::Scalar(_) => return Err(IndexedStreamReadError::NotStream { id }),
+        };
+        let protection = classify_encoded_stream_protection(&dictionary, self.index.encryption_state.is_some());
+        Ok(IndexedStreamDescriptor {
+            id,
+            dictionary,
+            encoded_len,
+            protection,
+            source: Arc::clone(&self.source),
+            source_len,
+            encoded_start,
+        })
+    }
+
     /// Resolve one full object id into a shareable owned value.
     ///
     /// Readers opened by the legacy constructors do not retain this value:
@@ -1825,6 +2102,11 @@ impl IndexedReader {
     }
 
     fn resolve_normal_plain(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
+        let (body_offset, source_len, parsed) = self.resolve_normal_framed(id)?;
+        self.finish_object(id, body_offset, source_len, parsed, state)
+    }
+
+    fn resolve_normal_framed(&self, id: crate::ObjectId) -> IndexedReaderResult<(u64, u64, ParsedObject)> {
         let location = self
             .index
             .locations
@@ -1861,7 +2143,8 @@ impl IndexedReader {
         let body_offset = physical
             .checked_add(header_bytes)
             .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
-        self.resolve_body(id, body_offset, source_len, state)
+        let parsed = self.resolve_body_frame(id, body_offset, source_len)?;
+        Ok((body_offset, source_len, parsed))
     }
 
     fn initialize_encryption(&mut self, password: Option<&[u8]>) -> IndexedReaderResult<()> {
@@ -1906,9 +2189,9 @@ impl IndexedReader {
         Ok(())
     }
 
-    fn resolve_body(
-        &self, id: crate::ObjectId, body_offset: u64, source_len: u64, state: &mut ResolutionState,
-    ) -> IndexedReaderResult<Object> {
+    fn resolve_body_frame(
+        &self, id: crate::ObjectId, body_offset: u64, source_len: u64,
+    ) -> IndexedReaderResult<ParsedObject> {
         let remaining = source_len.checked_sub(body_offset).ok_or(SourceError::OutOfBounds {
             offset: body_offset,
             length: 0,
@@ -1927,8 +2210,7 @@ impl IndexedReader {
                 });
             }
             if frame_status == FrameStatus::Ready {
-                let parsed = parse_object_body(&window, id, body_offset)?;
-                return self.finish_object(id, body_offset, source_len, parsed, state);
+                return parse_object_body(&window, id, body_offset);
             }
 
             let current = u64::try_from(window.len()).map_err(|_| IndexedReaderError::ObjectLimitExceeded {
@@ -1974,13 +2256,49 @@ impl IndexedReader {
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64, parsed: ParsedObject,
         state: &mut ResolutionState,
     ) -> IndexedReaderResult<Object> {
+        match self.finish_stream_metadata(id, body_offset, source_len, parsed, state)? {
+            FramedStreamMetadata::Scalar(object) => Ok(object),
+            FramedStreamMetadata::MissingLength {
+                dictionary,
+                encoded_start,
+            } => {
+                let relative_stream_start = encoded_start.checked_sub(self.index.source_origin).ok_or(
+                    IndexedReaderError::InvalidIndirectObject {
+                        id,
+                        offset: encoded_start,
+                    },
+                )?;
+                let stream_start =
+                    usize::try_from(relative_stream_start).map_err(|_| IndexedReaderError::InvalidIndirectObject {
+                        id,
+                        offset: encoded_start,
+                    })?;
+                Ok(Object::Stream(Stream::with_position(dictionary, stream_start)))
+            }
+            FramedStreamMetadata::Span {
+                dictionary,
+                encoded_start,
+                encoded_len,
+            } => {
+                let content = self
+                    .source
+                    .read_range(encoded_start, encoded_len, self.limits.max_stream_bytes)?;
+                Ok(Object::Stream(Stream::new(dictionary, content)))
+            }
+        }
+    }
+
+    fn finish_stream_metadata(
+        &self, id: crate::ObjectId, body_offset: u64, source_len: u64, parsed: ParsedObject,
+        state: &mut ResolutionState,
+    ) -> IndexedReaderResult<FramedStreamMetadata> {
         let ParsedObject {
             object,
             consumed,
             stream_prefix,
         } = parsed;
         let Some(stream_prefix) = stream_prefix else {
-            return Ok(object);
+            return Ok(FramedStreamMetadata::Scalar(object));
         };
         let Object::Dictionary(dictionary) = object else {
             return Err(IndexedReaderError::InvalidIndirectObject {
@@ -2005,21 +2323,10 @@ impl IndexedReader {
             // This matches the eager loader's degradation for a missing,
             // malformed, dangling, cyclic, or over-depth /Length: retain the
             // stream dictionary and expose empty owned content.
-            // Stream positions in eager `Document` objects are relative to the
-            // PDF header, even when transport junk precedes it. The indexed
-            // source offsets are physical, so rebase before exposing parity.
-            let relative_stream_start = stream_start.checked_sub(self.index.source_origin).ok_or(
-                IndexedReaderError::InvalidIndirectObject {
-                    id,
-                    offset: stream_start,
-                },
-            )?;
-            let stream_start =
-                usize::try_from(relative_stream_start).map_err(|_| IndexedReaderError::InvalidIndirectObject {
-                    id,
-                    offset: stream_start,
-                })?;
-            return Ok(Object::Stream(Stream::with_position(dictionary, stream_start)));
+            return Ok(FramedStreamMetadata::MissingLength {
+                dictionary,
+                encoded_start: stream_start,
+            });
         };
         if length < 0 {
             return Err(IndexedReaderError::NegativeStreamLength { id, length });
@@ -2040,7 +2347,7 @@ impl IndexedReader {
                 offset: stream_start,
             })?;
         if stream_end > source_len {
-            return Ok(Object::Dictionary(dictionary));
+            return Ok(FramedStreamMetadata::Scalar(Object::Dictionary(dictionary)));
         }
         match validate_endstream(
             self.source.as_ref(),
@@ -2049,13 +2356,16 @@ impl IndexedReader {
             self.limits.max_endstream_tail_bytes,
         )? {
             EndstreamStatus::Found => {}
-            EndstreamStatus::Missing => return Ok(Object::Dictionary(dictionary)),
+            EndstreamStatus::Missing => {
+                return Ok(FramedStreamMetadata::Scalar(Object::Dictionary(dictionary)));
+            }
             EndstreamStatus::LimitExceeded => return Err(IndexedReaderError::MissingEndstream { id }),
         }
-        let content = self
-            .source
-            .read_range(stream_start, length, self.limits.max_stream_bytes)?;
-        Ok(Object::Stream(Stream::new(dictionary, content)))
+        Ok(FramedStreamMetadata::Span {
+            dictionary,
+            encoded_start: stream_start,
+            encoded_len: length,
+        })
     }
 
     fn resolve_stream_length(
@@ -2145,6 +2455,36 @@ struct ParsedObject {
     object: Object,
     consumed: usize,
     stream_prefix: Option<u64>,
+}
+
+enum FramedStreamMetadata {
+    Scalar(Object),
+    MissingLength {
+        dictionary: Dictionary,
+        encoded_start: u64,
+    },
+    Span {
+        dictionary: Dictionary,
+        encoded_start: u64,
+        encoded_len: u64,
+    },
+}
+
+fn classify_encoded_stream_protection(dictionary: &Dictionary, document_encrypted: bool) -> EncodedStreamProtection {
+    let explicitly_crypt = dictionary.get(b"Filter").ok().is_some_and(|filter| {
+        filter.as_name().ok() == Some(b"Crypt")
+            || filter
+                .as_array()
+                .ok()
+                .is_some_and(|filters| filters.iter().any(|filter| filter.as_name().ok() == Some(b"Crypt")))
+    });
+    if explicitly_crypt {
+        EncodedStreamProtection::CryptFilter
+    } else if document_encrypted {
+        EncodedStreamProtection::DocumentEncrypted
+    } else {
+        EncodedStreamProtection::Plain
+    }
 }
 
 impl PdfIndex {
@@ -3847,7 +4187,10 @@ mod tests {
         );
         document.objects.insert(
             (2, 0),
-            Object::Stream(Stream::new(dictionary! {}, b"encrypted stream".to_vec())),
+            Object::Stream(Stream::new(
+                dictionary! { "Type" => "Metadata" },
+                b"encrypted stream".to_vec(),
+            )),
         );
         document.objects.insert(
             (3, 0),
@@ -6258,6 +6601,200 @@ mod tests {
         }
     }
 
+    fn read_all_encoded(descriptor: &IndexedStreamDescriptor, chunk_bytes: usize) -> Vec<u8> {
+        let mut reader = descriptor.open_plain_encoded().unwrap();
+        let mut chunk = vec![0; chunk_bytes];
+        let mut bytes = Vec::new();
+        loop {
+            let read = reader.read_chunk(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn stream_descriptors_match_scalar_direct_indirect_zero_and_degraded_lengths() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Kind /Direct >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 3 0 R /Kind /Indirect >>\nstream\nworld\nendstream",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"5",
+            },
+            ObjectDef {
+                id: 4,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 0 /Kind /Zero >>\nstream\n\nendstream",
+            },
+            ObjectDef {
+                id: 5,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Kind /Missing >>\nstream\nignored\nendstream",
+            },
+            ObjectDef {
+                id: 6,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length (bad) /Kind /Malformed >>\nstream\nignored\nendstream",
+            },
+            ObjectDef {
+                id: 7,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 8 0 R /Kind /Cycle >>\nstream\nignored\nendstream",
+            },
+            ObjectDef {
+                id: 8,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"7 0 R",
+            },
+            ObjectDef {
+                id: 9,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 99 >>\nstream\nshort\nendstream",
+            },
+        ]);
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        for id in [1, 2, 4, 5, 6, 7] {
+            let scalar = reader.resolve_object((id, 0)).unwrap();
+            let scalar = scalar.as_stream().unwrap();
+            let descriptor = reader.resolve_stream_descriptor((id, 0)).unwrap();
+            assert_eq!(
+                descriptor.dictionary().get(b"Kind").unwrap(),
+                scalar.dict.get(b"Kind").unwrap()
+            );
+            assert_eq!(descriptor.encoded_len(), u64::try_from(scalar.content.len()).unwrap());
+            assert_eq!(read_all_encoded(&descriptor, 3), scalar.content);
+        }
+        assert_eq!(
+            reader
+                .resolve_stream_descriptor((2, 0))
+                .unwrap()
+                .dictionary()
+                .get(b"Length")
+                .unwrap(),
+            &Object::Reference((3, 0))
+        );
+        assert!(matches!(reader.resolve_object((9, 0)).unwrap(), Object::Dictionary(_)));
+        assert!(matches!(
+            reader.resolve_stream_descriptor((9, 0)),
+            Err(IndexedStreamReadError::NotStream { id: (9, 0) })
+        ));
+        assert!(matches!(
+            reader.resolve_stream_descriptor((3, 0)),
+            Err(IndexedStreamReadError::NotStream { id: (3, 0) })
+        ));
+        assert!(matches!(
+            reader.resolve_stream_descriptor((99, 0)),
+            Err(IndexedStreamReadError::Resolve(
+                IndexedReaderError::MissingNormalObject { id: (99, 0) }
+            ))
+        ));
+    }
+
+    #[test]
+    fn stream_descriptors_preserve_scalar_resource_and_endstream_errors() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length -1 >>\nstream\n\nendstream",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 20 >>\nstream\n01234567890123456789\nendstream",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 >>\nstream\nhello\nendst",
+            },
+        ]);
+        let reader = open_reader(
+            &pdf,
+            ResolverLimits {
+                max_stream_bytes: 10,
+                max_endstream_tail_bytes: 6,
+                ..ResolverLimits::default()
+            },
+        );
+        for id in [1, 2, 3] {
+            let scalar = reader.resolve_object((id, 0)).unwrap_err().to_string();
+            let descriptor = reader.resolve_stream_descriptor((id, 0)).unwrap_err().to_string();
+            assert!(
+                descriptor.contains(&scalar),
+                "scalar={scalar:?}, descriptor={descriptor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_descriptor_rejects_objstm_and_protected_payloads_before_open_read() {
+        let (first, content) = object_stream_content(&[(10, b"(member)")]);
+        let fixture = object_stream_fixture(&format!("/Type /ObjStm /N 1 /First {first}"), &content, &[(10, 0)]);
+        let reader = open_reader(&fixture.pdf, ResolverLimits::default());
+        assert!(matches!(
+            reader.resolve_stream_descriptor((10, 0)),
+            Err(IndexedStreamReadError::NotNormalObject { id: (10, 0) })
+        ));
+
+        let crypt = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Length 5 /Filter [/ASCIIHexDecode /Crypt] >>\nstream\nhello\nendstream",
+        }]);
+        let descriptor = open_reader(&crypt, ResolverLimits::default())
+            .resolve_stream_descriptor((1, 0))
+            .unwrap();
+        assert_eq!(descriptor.protection(), EncodedStreamProtection::CryptFilter);
+        assert!(matches!(
+            descriptor.open_plain_encoded(),
+            Err(IndexedStreamReadError::Protected {
+                protection: EncodedStreamProtection::CryptFilter,
+                ..
+            })
+        ));
+
+        for revision in 2..=6 {
+            let pdf = encrypted_pdf(revision, "owner", "user");
+            let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+            let descriptor = reader.resolve_stream_descriptor((2, 0)).unwrap();
+            assert!(descriptor.dictionary().has_type(b"Metadata"));
+            assert_eq!(descriptor.protection(), EncodedStreamProtection::DocumentEncrypted);
+            assert!(matches!(
+                descriptor.open_plain_encoded(),
+                Err(IndexedStreamReadError::Protected {
+                    protection: EncodedStreamProtection::DocumentEncrypted,
+                    ..
+                })
+            ));
+        }
+    }
+
     #[test]
     fn stream_keyword_split_across_initial_window_grows_before_classifying_dictionary() {
         let target = usize::try_from(INITIAL_OBJECT_WINDOW).unwrap() - 3;
@@ -6898,6 +7435,73 @@ mod tests {
         );
         let total: u64 = requests.iter().map(|(_, length)| u64::try_from(*length).unwrap()).sum();
         assert!(total <= stream_length + 8 * 1_024);
+    }
+
+    #[test]
+    fn hundred_megabyte_stream_descriptor_has_bounded_lookahead_and_chunk_reads() {
+        let source_len = 200_u64 * 1_024 * 1_024;
+        let object_offset = 1_024_u64 * 1_024;
+        let stream_length = 100_u64 * 1_024 * 1_024;
+        let object_prefix =
+            format!("1 0 obj\n<< /Type /XObject /Subtype /Image /Length {stream_length} >>\nstream\n").into_bytes();
+        let stream_start = object_offset + u64::try_from(object_prefix.len()).unwrap();
+        let stream_end = stream_start + stream_length;
+        let xref = source_len - 512;
+        let xref_bytes = format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .into_bytes();
+        let source = Arc::new(OverlaySource {
+            len: source_len,
+            regions: vec![
+                (0, b"%PDF-1.7\n".to_vec()),
+                (object_offset, object_prefix),
+                (stream_end, b"\nendstream\nendobj\n".to_vec()),
+                (xref, xref_bytes),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+        let reader = IndexedReader::open_with_limits(
+            source.clone(),
+            ResolverLimits {
+                max_stream_bytes: 128 * 1_024 * 1_024,
+                ..ResolverLimits::default()
+            },
+        )
+        .unwrap();
+        source.requests.lock().unwrap().clear();
+
+        let descriptor = reader.resolve_stream_descriptor((1, 0)).unwrap();
+        assert_eq!(descriptor.encoded_len(), stream_length);
+        let metadata_requests = source.requests.lock().unwrap().clone();
+        assert!(metadata_requests.iter().all(|(_, length)| *length <= 64 * 1_024));
+        assert!(
+            !metadata_requests
+                .iter()
+                .any(|(offset, length)| *offset == stream_start && u64::try_from(*length).unwrap() == stream_length)
+        );
+        let lookahead: u64 = metadata_requests
+            .iter()
+            .filter_map(|(offset, length)| {
+                let end = offset.checked_add(u64::try_from(*length).ok()?)?;
+                (*offset < stream_start && end > stream_start).then_some(end - stream_start)
+            })
+            .sum();
+        assert!(lookahead <= 64 * 1_024);
+
+        source.requests.lock().unwrap().clear();
+        let mut encoded = descriptor.open_plain_encoded().unwrap();
+        let mut output = vec![0xff; 128 * 1_024];
+        assert_eq!(encoded.read_chunk(&mut output).unwrap(), 64 * 1_024);
+        assert!(output[..64 * 1_024].iter().all(|byte| *byte == 0));
+        assert!(
+            source
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, length)| *length <= 64 * 1_024)
+        );
     }
 
     #[test]

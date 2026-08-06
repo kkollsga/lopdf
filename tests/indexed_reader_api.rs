@@ -1,9 +1,12 @@
 use lopdf::{
-    BytesSource, Dictionary, Document, IndexedReader, IndexedReaderCacheOptions, IndexedReaderError,
-    IndexedReaderOptions, Object, RandomAccessSource, SourceError, Stream, dictionary,
+    BytesSource, Dictionary, Document, EncodedStreamProtection, IndexedReader, IndexedReaderCacheOptions,
+    IndexedReaderError, IndexedReaderOptions, IndexedStreamDescriptor, IndexedStreamReadError, Object,
+    RandomAccessSource, SourceError, Stream, dictionary,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
+
+fn assert_send<T: Send>() {}
 
 fn generated_pdf() -> Vec<u8> {
     let mut document = Document::with_version("1.7");
@@ -67,6 +70,184 @@ fn stream_pdf(streams: usize, stream_bytes: usize) -> Vec<u8> {
     let mut pdf = Vec::new();
     document.save_to(&mut pdf).unwrap();
     pdf
+}
+
+struct AdversarialStreamSource {
+    bytes: Arc<[u8]>,
+    max_read: AtomicUsize,
+    interrupt_once: AtomicBool,
+    mode: AtomicUsize,
+    shortened_len: AtomicBool,
+    requests: Mutex<Vec<usize>>,
+}
+
+impl RandomAccessSource for AdversarialStreamSource {
+    fn len(&self) -> Result<u64, SourceError> {
+        let length = self.bytes.len() - usize::from(self.shortened_len.load(Ordering::SeqCst));
+        Ok(u64::try_from(length).unwrap())
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, SourceError> {
+        self.requests.lock().unwrap().push(out.len());
+        if self.interrupt_once.swap(false, Ordering::SeqCst) {
+            return Err(SourceError::Io(std::io::Error::from(std::io::ErrorKind::Interrupted)));
+        }
+        match self.mode.load(Ordering::SeqCst) {
+            1 => return Ok(0),
+            2 => return Ok(out.len() + 1),
+            _ => {}
+        }
+        let start = usize::try_from(offset).unwrap();
+        let limit = match self.max_read.load(Ordering::SeqCst) {
+            0 => out.len(),
+            value => value.min(out.len()),
+        };
+        let read = limit.min(self.bytes.len().saturating_sub(start));
+        out[..read].copy_from_slice(&self.bytes[start..start + read]);
+        Ok(read)
+    }
+}
+
+#[test]
+fn encoded_stream_descriptor_reads_exact_bounded_chunks_without_materializing_payload() {
+    assert_send_sync::<IndexedStreamDescriptor>();
+    assert_send::<lopdf::EncodedStreamReader>();
+
+    let pdf = stream_pdf(1, 192 * 1024 + 17);
+    let reader = IndexedReader::open(BytesSource::from(pdf)).unwrap();
+    let scalar = reader.resolve_object((1, 0)).unwrap();
+    let scalar = scalar.as_stream().unwrap();
+    let descriptor = reader.resolve_stream_descriptor((1, 0)).unwrap();
+
+    assert_eq!(descriptor.id(), (1, 0));
+    assert_eq!(descriptor.dictionary(), &scalar.dict);
+    assert_eq!(descriptor.encoded_len(), u64::try_from(scalar.content.len()).unwrap());
+    assert_eq!(descriptor.protection(), EncodedStreamProtection::Plain);
+    let debug = format!("{descriptor:?}");
+    assert!(!debug.contains("encoded_start"));
+    assert!(!debug.contains("source_len"));
+
+    drop(reader);
+    let mut encoded = descriptor.open_plain_encoded().unwrap();
+    let mut output = Vec::new();
+    let mut oversized = vec![0; 256 * 1024];
+    loop {
+        let read = encoded.read_chunk(&mut oversized).unwrap();
+        if read == 0 {
+            break;
+        }
+        assert!(read <= 64 * 1024);
+        output.extend_from_slice(&oversized[..read]);
+    }
+    assert_eq!(encoded.remaining(), 0);
+    assert_eq!(output, scalar.content);
+}
+
+#[test]
+fn four_stream_readers_overlap_without_a_shared_cursor_or_lock() {
+    let pdf = stream_pdf(4, 128 * 1024);
+    let source = Arc::new(BarrierSource {
+        bytes: Arc::from(pdf),
+        enabled: AtomicBool::new(false),
+        synchronized_calls: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        peak_active: AtomicUsize::new(0),
+        barrier: Barrier::new(4),
+    });
+    let erased: Arc<dyn RandomAccessSource> = source.clone();
+    let reader = IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+    let descriptors: Vec<_> = (1..=4)
+        .map(|id| reader.resolve_stream_descriptor((id, 0)).unwrap())
+        .collect();
+    source.enable();
+    let threads: Vec<_> = descriptors
+        .into_iter()
+        .map(|descriptor| {
+            std::thread::spawn(move || {
+                let mut stream = descriptor.open_plain_encoded().unwrap();
+                let mut chunk = vec![0; 64 * 1024];
+                let read = stream.read_chunk(&mut chunk).unwrap();
+                (read, chunk[0])
+            })
+        })
+        .collect();
+    let values: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+    assert!(values.iter().all(|(read, _)| *read == 64 * 1024));
+    assert_eq!(
+        values.iter().map(|(_, byte)| *byte).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert!(source.peak_active.load(Ordering::SeqCst) >= 4);
+}
+
+#[test]
+fn encoded_stream_reader_retries_partial_and_interrupted_reads_and_fails_closed() {
+    let pdf = stream_pdf(1, 128 * 1024 + 3);
+    let source = Arc::new(AdversarialStreamSource {
+        bytes: Arc::from(pdf),
+        max_read: AtomicUsize::new(0),
+        interrupt_once: AtomicBool::new(false),
+        mode: AtomicUsize::new(0),
+        shortened_len: AtomicBool::new(false),
+        requests: Mutex::new(Vec::new()),
+    });
+    let erased: Arc<dyn RandomAccessSource> = source.clone();
+    let reader = IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+    let expected = reader
+        .resolve_object((1, 0))
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .content
+        .clone();
+    let descriptor = reader.resolve_stream_descriptor((1, 0)).unwrap();
+
+    source.requests.lock().unwrap().clear();
+    source.max_read.store(7, Ordering::SeqCst);
+    source.interrupt_once.store(true, Ordering::SeqCst);
+    let mut stream = descriptor.open_plain_encoded().unwrap();
+    let mut actual = Vec::new();
+    let mut chunk = vec![0; 80 * 1024];
+    loop {
+        let read = stream.read_chunk(&mut chunk).unwrap();
+        if read == 0 {
+            break;
+        }
+        actual.extend_from_slice(&chunk[..read]);
+    }
+    assert_eq!(actual, expected);
+    assert!(
+        source
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|length| *length <= 64 * 1024)
+    );
+
+    source.max_read.store(0, Ordering::SeqCst);
+    source.mode.store(2, Ordering::SeqCst);
+    let mut stream = descriptor.open_plain_encoded().unwrap();
+    assert!(matches!(
+        stream.read_chunk(&mut chunk),
+        Err(IndexedStreamReadError::Source(SourceError::InvalidReadCount { .. }))
+    ));
+
+    source.mode.store(1, Ordering::SeqCst);
+    let mut stream = descriptor.open_plain_encoded().unwrap();
+    assert!(matches!(
+        stream.read_chunk(&mut chunk),
+        Err(IndexedStreamReadError::Source(SourceError::UnexpectedEof { .. }))
+    ));
+
+    source.mode.store(0, Ordering::SeqCst);
+    source.shortened_len.store(true, Ordering::SeqCst);
+    let requests_before = source.requests.lock().unwrap().len();
+    assert!(matches!(
+        descriptor.open_plain_encoded(),
+        Err(IndexedStreamReadError::SourceLengthChanged { .. })
+    ));
+    assert_eq!(source.requests.lock().unwrap().len(), requests_before);
 }
 
 #[test]
