@@ -502,8 +502,10 @@ pub enum IndexedReaderError {
     Source(#[from] SourceError),
     #[error("invalid PDF header in the first {limit} bytes")]
     InvalidHeader { limit: u64 },
-    #[error("invalid startxref in the last {limit} bytes")]
+    #[error("failed parsing cross reference table")]
     InvalidStartXref { limit: u64 },
+    #[error("failed parsing cross reference table")]
+    StartXrefOutOfBounds { offset: u64, logical_len: u64 },
     #[error("invalid cross-reference structure at offset {offset}")]
     InvalidXref { offset: u64 },
     #[error("incomplete cross-reference structure at offset {offset}")]
@@ -3996,6 +3998,26 @@ impl PdfIndex {
         let source_len = source.len()?;
         let (source_origin, version) = read_header(source.as_ref(), source_len)?;
         let xref_start = read_startxref(source.as_ref(), source_len)?;
+        let logical_len = source_len
+            .checked_sub(source_origin)
+            .ok_or(IndexedReaderError::InvalidHeader {
+                limit: HEADER_SCAN_LIMIT,
+            })?;
+        if xref_start > logical_len {
+            return Err(IndexedReaderError::StartXrefOutOfBounds {
+                offset: xref_start,
+                logical_len,
+            });
+        }
+        // The logical bound above makes this addition mathematically safe, but
+        // keep it checked so a prefixed source can never wrap before I/O if the
+        // surrounding invariants change.
+        source_origin
+            .checked_add(xref_start)
+            .ok_or(IndexedReaderError::StartXrefOutOfBounds {
+                offset: xref_start,
+                logical_len,
+            })?;
 
         let mut locations = BTreeMap::new();
         let mut seen = HashSet::new();
@@ -6194,6 +6216,10 @@ mod tests {
         pdf
     }
 
+    fn malformed_startxref_pdf(value: &str) -> Vec<u8> {
+        format!("%PDF-1.7\nstartxref\n{value}\n%%EOF\n").into_bytes()
+    }
+
     fn object_pdf(definitions: &[ObjectDef<'_>]) -> Vec<u8> {
         object_pdf_with_root(definitions, (1, 0))
     }
@@ -7541,7 +7567,10 @@ mod tests {
         out_of_bounds.splice(marker..end, b"999999999".iter().copied());
         assert!(matches!(
             PdfIndex::open(Arc::new(BytesSource::from(out_of_bounds))),
-            Err(IndexedReaderError::InvalidXref { .. })
+            Err(IndexedReaderError::StartXrefOutOfBounds {
+                offset: 999_999_999,
+                ..
+            })
         ));
 
         let (mut bad_prev, offsets) = basic_body();
@@ -7555,6 +7584,134 @@ mod tests {
             PdfIndex::open(Arc::new(BytesSource::from(bad_prev))),
             Err(IndexedReaderError::InvalidTrailerOffset { key: "Prev" })
         ));
+    }
+
+    #[test]
+    fn initial_startxref_out_of_bounds_matches_eager_and_retains_u64_fields() {
+        let cases = [
+            ("18446744073709551615", u64::MAX),
+            ("999999999", 999_999_999),
+            ("9223372036854775807", i64::MAX as u64),
+            ("9223372036854775808", (i64::MAX as u64) + 1),
+        ];
+
+        for (text, expected_offset) in cases {
+            let pdf = malformed_startxref_pdf(text);
+            let logical_len = u64::try_from(pdf.len()).unwrap();
+            let eager = Document::load_mem(&pdf).unwrap_err();
+            let lazy = PdfIndex::open(Arc::new(BytesSource::from(pdf))).err().unwrap();
+
+            assert_eq!(eager.to_string(), "failed parsing cross reference table");
+            assert_eq!(lazy.to_string(), eager.to_string());
+            assert!(matches!(
+                lazy,
+                IndexedReaderError::StartXrefOutOfBounds { offset, logical_len: actual_len }
+                    if offset == expected_offset && actual_len == logical_len
+            ));
+        }
+
+        assert_eq!(malformed_startxref_pdf("18446744073709551615").len(), 46);
+    }
+
+    #[test]
+    fn invalid_textual_startxref_matches_eager_without_losing_parse_classification() {
+        for text in ["-1", "18446744073709551616"] {
+            let pdf = malformed_startxref_pdf(text);
+            let eager = Document::load_mem(&pdf).unwrap_err();
+            let lazy = PdfIndex::open(Arc::new(BytesSource::from(pdf))).err().unwrap();
+
+            assert_eq!(eager.to_string(), "failed parsing cross reference table");
+            assert_eq!(lazy.to_string(), eager.to_string());
+            assert!(matches!(lazy, IndexedReaderError::InvalidStartXref { .. }));
+        }
+    }
+
+    #[test]
+    fn prefixed_max_startxref_is_checked_in_logical_coordinates() {
+        let prefix = b"ignored transport prefix\n";
+        let mut pdf = prefix.to_vec();
+        pdf.extend_from_slice(&malformed_startxref_pdf("18446744073709551615"));
+        let logical_len = u64::try_from(pdf.len() - prefix.len()).unwrap();
+
+        let eager = Document::load_mem(&pdf).unwrap_err();
+        let lazy = PdfIndex::open(Arc::new(BytesSource::from(pdf))).err().unwrap();
+        assert_eq!(lazy.to_string(), eager.to_string());
+        assert!(matches!(
+            lazy,
+            IndexedReaderError::StartXrefOutOfBounds { offset: u64::MAX, logical_len: actual_len }
+                if actual_len == logical_len
+        ));
+    }
+
+    #[test]
+    fn initial_startxref_boundaries_do_not_change_equal_or_in_range_behavior() {
+        const SOURCE_LEN: usize = 128;
+        for (offset, is_out_of_bounds) in [(127_u64, false), (128, false), (129, true)] {
+            let mut pdf = malformed_startxref_pdf(&offset.to_string());
+            pdf.resize(SOURCE_LEN, b' ');
+            let error = PdfIndex::open(Arc::new(BytesSource::from(pdf))).err().unwrap();
+            if is_out_of_bounds {
+                assert!(matches!(
+                    error,
+                    IndexedReaderError::StartXrefOutOfBounds {
+                        offset: 129,
+                        logical_len: 128
+                    }
+                ));
+            } else {
+                assert!(!matches!(error, IndexedReaderError::StartXrefOutOfBounds { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_bounds_startxref_stops_after_the_bounded_header_and_tail_reads() {
+        let bytes = malformed_startxref_pdf("18446744073709551615");
+        let source = Arc::new(TracingBytesSource {
+            bytes,
+            requests: Mutex::new(Vec::new()),
+        });
+        let error = PdfIndex::open(source.clone()).err().unwrap();
+        assert!(matches!(
+            error,
+            IndexedReaderError::StartXrefOutOfBounds {
+                offset: u64::MAX,
+                logical_len: 46
+            }
+        ));
+
+        let requests = source.requests.lock().unwrap();
+        assert_eq!(requests.as_slice(), &[(0, 46), (0, 46)]);
+        assert!(
+            requests
+                .iter()
+                .all(|(_, length)| *length <= usize::try_from(TAIL_SCAN_LIMIT).unwrap())
+        );
+        assert!(!requests.iter().any(|(offset, _)| *offset == u64::MAX));
+    }
+
+    #[test]
+    fn sparse_valid_startxref_above_i64_max_remains_supported() {
+        let xref = (i64::MAX as u64) + 1;
+        let tail =
+            format!("xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n{xref}\n%%EOF\n").into_bytes();
+        let len = xref.checked_add(u64::try_from(tail.len()).unwrap()).unwrap();
+        let source = Arc::new(OverlaySource {
+            len,
+            regions: vec![(0, b"%PDF-1.7\n".to_vec()), (xref, tail)],
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let index = PdfIndex::open(source.clone()).unwrap();
+        assert_eq!(index.xref_start, xref);
+        assert!(
+            source
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(offset, _)| *offset == xref)
+        );
     }
 
     #[test]
