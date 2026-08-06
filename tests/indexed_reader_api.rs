@@ -1,6 +1,6 @@
 use lopdf::{
-    BytesSource, Document, IndexedReader, IndexedReaderError, IndexedReaderOptions, Object, RandomAccessSource,
-    SourceError, dictionary,
+    BytesSource, Document, IndexedReader, IndexedReaderCacheOptions, IndexedReaderError, IndexedReaderOptions, Object,
+    RandomAccessSource, SourceError, dictionary,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -66,6 +66,61 @@ fn public_api_opens_owned_bytes_and_reports_only_scalar_metadata() {
     );
     assert_eq!(pages.get(0).unwrap().inherited().resources(), Some((2, 0)));
     assert_eq!(reader.resolve_object((7, 0)).unwrap().as_dict().unwrap().len(), 1);
+}
+
+#[test]
+fn cached_api_is_opt_in_bounded_and_matches_uncached_results() {
+    let pdf = generated_pdf();
+    let uncached = IndexedReader::open(BytesSource::from(pdf.clone())).unwrap();
+    let cache_options = IndexedReaderCacheOptions::new(4 * 64 * 1024, 16);
+    assert_eq!(cache_options.max_bytes(), 4 * 64 * 1024);
+    assert_eq!(cache_options.max_entries(), 16);
+    assert_eq!(
+        format!("{cache_options:?}"),
+        "IndexedReaderCacheOptions { max_bytes: 262144, max_entries: 16 }"
+    );
+    assert_eq!(IndexedReaderCacheOptions::default().max_bytes(), 32 * 1024 * 1024);
+    assert_eq!(IndexedReaderCacheOptions::default().max_entries(), 16 * 1024);
+
+    let cached =
+        IndexedReader::open_cached(BytesSource::from(pdf), IndexedReaderOptions::default(), cache_options).unwrap();
+    for _ in 0..3 {
+        assert_eq!(cached.page_map().unwrap(), uncached.page_map().unwrap());
+        for id in 1..=7 {
+            assert_eq!(
+                cached.resolve_object((id, 0)).unwrap(),
+                uncached.resolve_object((id, 0)).unwrap()
+            );
+        }
+    }
+
+    let stats = cached.cache_stats();
+    assert!(stats.source().hits() > 0);
+    assert!(stats.source().loads() > 0);
+    assert!(stats.source().retained_bytes() <= cache_options.max_bytes() / 4);
+    assert!(stats.source().retained_entries() <= cache_options.max_entries() / 4);
+    assert_eq!(uncached.cache_stats(), Default::default());
+}
+
+#[test]
+fn zero_cache_constructor_has_legacy_value_and_error_parity() {
+    let pdf = generated_pdf();
+    let uncached = IndexedReader::open(BytesSource::from(pdf.clone())).unwrap();
+    let cached = IndexedReader::open_cached(
+        BytesSource::from(pdf),
+        IndexedReaderOptions::default(),
+        IndexedReaderCacheOptions::new(0, 0),
+    )
+    .unwrap();
+    assert_eq!(cached.page_map().unwrap(), uncached.page_map().unwrap());
+    assert_eq!(
+        cached.resolve_object((7, 0)).unwrap(),
+        uncached.resolve_object((7, 0)).unwrap()
+    );
+    let stats = cached.cache_stats();
+    assert_eq!(stats.source().retained_bytes(), 0);
+    assert_eq!(stats.source().retained_entries(), 0);
+    assert!(stats.source().bypass_reads() > 0);
 }
 
 #[test]

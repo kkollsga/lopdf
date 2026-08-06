@@ -10,7 +10,10 @@ use thiserror::Error;
 
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
 use crate::source::{RandomAccessSource, SourceError};
+use crate::source_cache::CachedSource;
 use crate::{Dictionary, Object, ObjectStream, Stream};
+
+pub use crate::source_cache::{IndexedReaderCacheOptions, IndexedReaderCacheStats, IndexedReaderSourceCacheStats};
 
 const HEADER_SCAN_LIMIT: u64 = 1_024;
 const HEADER_PARSE_OVERLAP: u64 = 64;
@@ -244,6 +247,7 @@ impl From<&IndexedReaderOptions> for ResolverLimits {
 /// and page maps are owned, so independent calls may run concurrently.
 pub struct IndexedReader {
     source: Arc<dyn RandomAccessSource>,
+    cached_source: Option<Arc<CachedSource>>,
     index: Arc<PdfIndex>,
     limits: ResolverLimits,
     options: IndexedReaderOptions,
@@ -542,12 +546,38 @@ impl IndexedReader {
         let password = options.password.take();
         let mut reader = Self {
             source,
+            cached_source: None,
             index: Arc::new(index),
             limits,
             options,
         };
         reader.initialize_encryption(password.as_deref())?;
         Ok(reader)
+    }
+
+    /// Open a source with explicit reader limits and a bounded cache budget.
+    pub fn open_cached<S: RandomAccessSource>(
+        source: S, options: IndexedReaderOptions, cache_options: IndexedReaderCacheOptions,
+    ) -> IndexedReaderResult<Self> {
+        Self::open_shared_cached(Arc::new(source), options, cache_options)
+    }
+
+    /// Open a shared source with explicit reader limits and a bounded cache budget.
+    pub fn open_shared_cached(
+        source: Arc<dyn RandomAccessSource>, options: IndexedReaderOptions, cache_options: IndexedReaderCacheOptions,
+    ) -> IndexedReaderResult<Self> {
+        let cached_source = Arc::new(CachedSource::new(source, cache_options)?);
+        let erased: Arc<dyn RandomAccessSource> = cached_source.clone();
+        let mut reader = Self::from_erased_source(erased, options)?;
+        reader.cached_source = Some(cached_source);
+        Ok(reader)
+    }
+
+    /// Return a snapshot of cache counters, or zero counters for an uncached reader.
+    pub fn cache_stats(&self) -> IndexedReaderCacheStats {
+        self.cached_source
+            .as_ref()
+            .map_or_else(IndexedReaderCacheStats::default, |source| source.stats())
     }
 
     fn open_with_limits(source: Arc<dyn RandomAccessSource>, limits: ResolverLimits) -> IndexedReaderResult<Self> {
