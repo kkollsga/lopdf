@@ -2191,11 +2191,71 @@ impl IndexedReader {
     fn resolve_normal_scalar_limited(
         &self, id: crate::ObjectId, permit: &ScalarResolutionPermit,
     ) -> IndexedReaderResult<BoundedScalar> {
-        let (_, _, parsed, mut object_charge) = self.parse_normal_at_limited(id, permit)?;
-        if parsed.stream_prefix.is_some() {
-            return Err(IndexedReaderError::NotScalarObject { id });
+        let (body_offset, source_len, parsed, object_charge) = self.parse_normal_at_limited(id, permit)?;
+        let ParsedObject {
+            mut object,
+            consumed,
+            stream_prefix,
+        } = parsed;
+        if let Some(stream_prefix) = stream_prefix {
+            let Object::Dictionary(dictionary) = object else {
+                return Err(IndexedReaderError::InvalidIndirectObject {
+                    id,
+                    offset: body_offset,
+                });
+            };
+            let encoded_start = body_offset
+                .checked_add(u64::try_from(consumed).unwrap_or(u64::MAX))
+                .and_then(|offset| offset.checked_add(stream_prefix))
+                .ok_or(IndexedReaderError::InvalidIndirectObject {
+                    id,
+                    offset: body_offset,
+                })?;
+            let mut length_state = ResolutionState::default();
+            let Some(length) = self.resolve_stream_length_limited(&dictionary, permit, &mut length_state)? else {
+                return Err(IndexedReaderError::NotScalarObject { id });
+            };
+            if length < 0 {
+                return Err(IndexedReaderError::NegativeStreamLength { id, length });
+            }
+            let length = u64::try_from(length).map_err(|_| IndexedReaderError::NegativeStreamLength { id, length })?;
+            if length > self.limits.max_stream_bytes {
+                return Err(IndexedReaderError::StreamLimitExceeded {
+                    id,
+                    length,
+                    limit: self.limits.max_stream_bytes,
+                });
+            }
+            let encoded_end = checked_stream_end(id, encoded_start, length)?;
+            if encoded_end > source_len {
+                object = Object::Dictionary(dictionary);
+                return self.finish_bounded_scalar(id, object, object_charge, permit);
+            }
+            let tail_bytes = self
+                .limits
+                .max_endstream_tail_bytes
+                .min(source_len.saturating_sub(encoded_end));
+            let tail_charge = permit.reserve(id, tail_bytes, "scalar-stream-end-marker")?;
+            let status = validate_endstream(
+                self.source.as_ref(),
+                source_len,
+                encoded_end,
+                self.limits.max_endstream_tail_bytes,
+            )?;
+            drop(tail_charge);
+            match status {
+                EndstreamStatus::Found => return Err(IndexedReaderError::NotScalarObject { id }),
+                EndstreamStatus::Missing => object = Object::Dictionary(dictionary),
+                EndstreamStatus::LimitExceeded => return Err(IndexedReaderError::MissingEndstream { id }),
+            }
         }
-        let mut object = parsed.object;
+        self.finish_bounded_scalar(id, object, object_charge, permit)
+    }
+
+    fn finish_bounded_scalar(
+        &self, id: crate::ObjectId, mut object: Object, mut object_charge: ScalarCharge,
+        permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<BoundedScalar> {
         if self.index.encrypt_object_id != Some(id)
             && let Some(encryption_state) = &self.index.encryption_state
         {
@@ -6111,6 +6171,15 @@ enum EndstreamStatus {
     LimitExceeded,
 }
 
+fn checked_stream_end(id: crate::ObjectId, encoded_start: u64, encoded_len: u64) -> IndexedReaderResult<u64> {
+    encoded_start
+        .checked_add(encoded_len)
+        .ok_or(IndexedReaderError::InvalidIndirectObject {
+            id,
+            offset: encoded_start,
+        })
+}
+
 fn validate_endstream(
     source: &dyn RandomAccessSource, source_len: u64, offset: u64, limit: u64,
 ) -> IndexedReaderResult<EndstreamStatus> {
@@ -6153,6 +6222,8 @@ mod tests {
     #[cfg(any(unix, windows))]
     use std::io::{Seek, SeekFrom};
     use std::sync::Mutex;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     type ClassicEntry = (u64, u16, bool);
@@ -6356,6 +6427,113 @@ mod tests {
         }
         .unwrap();
         document.encrypt(&state).unwrap();
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn encrypted_malformed_dictionary_pdf(revision: u8, owner: &str, user: &str) -> Vec<u8> {
+        encrypted_pdf_fixture(revision, owner, user, b"encrypted stream", true)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn encrypted_pdf_fixture(
+        revision: u8, owner: &str, user: &str, stream_content: &[u8], malformed_dictionary: bool,
+    ) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::String(b"encrypted string".to_vec(), StringFormat::Literal),
+        );
+        document.objects.insert(
+            (2, 0),
+            Object::Stream(Stream::new(
+                dictionary! { "Type" => "Metadata" },
+                stream_content.to_vec(),
+            )),
+        );
+        let root = if malformed_dictionary {
+            dictionary! {
+                "Type" => "Catalog",
+                "Length" => 5,
+                "Sentinel" => Object::string_literal("malformed dictionary secret"),
+            }
+        } else {
+            dictionary! { "Type" => "Catalog", "Sentinel" => Object::Reference((1, 0)) }
+        };
+        document.objects.insert((3, 0), Object::Dictionary(root));
+        document.max_id = 3;
+        document.trailer.set("Root", Object::Reference((3, 0)));
+        let id = vec![0x42; 16];
+        document.trailer.set(
+            "ID",
+            Object::Array(vec![
+                Object::String(id.clone(), StringFormat::Literal),
+                Object::String(id, StringFormat::Literal),
+            ]),
+        );
+
+        let aes128: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+        let aes256: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+        let file_key = [0x5a; 32];
+        let state = match revision {
+            2 => EncryptionState::try_from(EncryptionVersion::V1 {
+                document: &document,
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            3 => EncryptionState::try_from(EncryptionVersion::V2 {
+                document: &document,
+                owner_password: owner,
+                user_password: user,
+                key_length: 128,
+                permissions: Permissions::PRINTABLE,
+            }),
+            4 => EncryptionState::try_from(EncryptionVersion::V4 {
+                document: &document,
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes128)]),
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            #[allow(deprecated)]
+            5 => EncryptionState::try_from(EncryptionVersion::R5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256.clone())]),
+                file_encryption_key: &file_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            6 => EncryptionState::try_from(EncryptionVersion::V5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256)]),
+                file_encryption_key: &file_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: owner,
+                user_password: user,
+                permissions: Permissions::PRINTABLE,
+            }),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        document.encrypt(&state).unwrap();
+        if malformed_dictionary {
+            let Object::Dictionary(dictionary) = document.objects.remove(&(3, 0)).unwrap() else {
+                unreachable!("the encrypted malformed fixture root stays a dictionary")
+            };
+            document
+                .objects
+                .insert((3, 0), Object::Stream(Stream::new(dictionary, b"hello".to_vec())));
+        }
         let mut pdf = Vec::new();
         document.save_to(&mut pdf).unwrap();
         pdf
@@ -10456,6 +10634,13 @@ mod tests {
         armed_reads: AtomicUsize,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    struct FailingOffsetSource {
+        bytes: Vec<u8>,
+        fail_offset: AtomicU64,
+        requests: Mutex<Vec<(u64, usize)>>,
+    }
+
     impl RandomAccessSource for FailOnceSource {
         fn len(&self) -> Result<u64, SourceError> {
             Ok(u64::try_from(self.bytes.len()).unwrap())
@@ -10469,6 +10654,30 @@ mod tests {
                 }
             }
             let offset = usize::try_from(offset).unwrap();
+            let length = output.len().min(self.bytes.len().saturating_sub(offset));
+            output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
+            Ok(length)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl RandomAccessSource for FailingOffsetSource {
+        fn len(&self) -> Result<u64, SourceError> {
+            Ok(u64::try_from(self.bytes.len()).unwrap())
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<usize, SourceError> {
+            self.requests.lock().unwrap().push((offset, output.len()));
+            if offset == self.fail_offset.load(Ordering::SeqCst) {
+                return Err(SourceError::Io(std::io::Error::other(
+                    "injected bounded tail read failure",
+                )));
+            }
+            let offset = usize::try_from(offset).map_err(|_| SourceError::OutOfBounds {
+                offset,
+                length: u64::try_from(output.len()).unwrap_or(u64::MAX),
+                source_len: u64::try_from(self.bytes.len()).unwrap(),
+            })?;
             let length = output.len().min(self.bytes.len().saturating_sub(offset));
             output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
             Ok(length)
@@ -11693,6 +11902,320 @@ mod tests {
         assert_eq!(permit.stats().current_bytes, scalar.retained_bytes());
         drop(scalar);
         assert_eq!(permit.close().unwrap().current_bytes, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_scalar_classifies_stream_framing_like_eager_without_reading_payloads() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 4 /Kind /DirectBad >>\nstream\nvalue\nendstream",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 3 0 R /Kind /IndirectBad >>\nstream\nvalue\nendstream",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"4",
+            },
+            ObjectDef {
+                id: 4,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 1000000 /Kind /PastSource >>\nstream\nshort",
+            },
+            ObjectDef {
+                id: 5,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Kind /Valid >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 6,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Kind /Missing >>\nstream\nignored\nendstream",
+            },
+            ObjectDef {
+                id: 7,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length (bad) /Kind /InvalidLength >>\nstream\nignored\nendstream",
+            },
+        ]);
+        let eager = Document::load_mem(&pdf).unwrap();
+        let source = Arc::new(TracingBytesSource {
+            bytes: pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+
+        for id in [(1, 0), (2, 0), (4, 0)] {
+            source.requests.lock().unwrap().clear();
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            let scalar = reader.resolve_scalar_with_permit(id, &permit).unwrap();
+            assert!(matches!(scalar.as_object(), Object::Dictionary(_)));
+            assert_eq!(scalar.as_object(), eager.get_object(id).unwrap());
+            assert!(
+                source
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, bytes)| *bytes <= 64 * 1024)
+            );
+            drop(scalar);
+            assert_eq!(permit.close().unwrap().current_bytes, 0);
+        }
+
+        for id in [(5, 0), (6, 0), (7, 0)] {
+            source.requests.lock().unwrap().clear();
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            assert!(matches!(
+                reader.resolve_scalar_with_permit(id, &permit),
+                Err(IndexedReaderError::NotScalarObject { id: actual }) if actual == id
+            ));
+            assert!(
+                source
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, bytes)| *bytes <= 64 * 1024)
+            );
+            assert_eq!(permit.close().unwrap().current_bytes, 0);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_scalar_stream_tail_refusal_is_retryable_and_preserves_fatal_limits() {
+        let mut bad_tail = b"<< /Length 5 /Kind /BadTail >>\nstream\nhello\nnot-endstream".to_vec();
+        bad_tail.resize(bad_tail.len() + 16 * 1024, b'x');
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: &bad_tail,
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 >>\nstream\nhello\nendst",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length -1 >>\nstream\n\nendstream",
+            },
+            ObjectDef {
+                id: 4,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 20 >>\nstream\n01234567890123456789\nendstream",
+            },
+        ]);
+        let reader = open_reader(
+            &pdf,
+            ResolverLimits {
+                max_endstream_tail_bytes: 8 * 1024,
+                ..ResolverLimits::default()
+            },
+        );
+        let generous = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        let scalar = reader.resolve_scalar_with_permit((1, 0), &generous).unwrap();
+        let peak = scalar.peak_bytes();
+        drop(scalar);
+        generous.close().unwrap();
+
+        let refused = crate::ScalarResolutionPermit::new(peak - 1);
+        assert!(matches!(
+            reader.resolve_scalar_with_permit((1, 0), &refused),
+            Err(IndexedReaderError::ScalarResourceLimit {
+                phase: "scalar-stream-end-marker",
+                ..
+            })
+        ));
+        assert_eq!(refused.stats().current_bytes, 0);
+        refused.close().unwrap();
+
+        let retry = crate::ScalarResolutionPermit::new(peak);
+        let scalar = reader.resolve_scalar_with_permit((1, 0), &retry).unwrap();
+        drop(scalar);
+        assert_eq!(retry.close().unwrap().current_bytes, 0);
+
+        let tail_limited = open_reader(
+            &pdf,
+            ResolverLimits {
+                max_endstream_tail_bytes: 4,
+                ..ResolverLimits::default()
+            },
+        );
+        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        assert!(matches!(
+            tail_limited.resolve_scalar_with_permit((2, 0), &permit),
+            Err(IndexedReaderError::MissingEndstream { id: (2, 0) })
+        ));
+        assert_eq!(permit.close().unwrap().current_bytes, 0);
+
+        let size_limited = open_reader(
+            &pdf,
+            ResolverLimits {
+                max_stream_bytes: 10,
+                ..ResolverLimits::default()
+            },
+        );
+        for (id, expected) in [((3, 0), "negative"), ((4, 0), "size")] {
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            let error = size_limited.resolve_scalar_with_permit(id, &permit).unwrap_err();
+            match expected {
+                "negative" => assert!(matches!(
+                    error,
+                    IndexedReaderError::NegativeStreamLength { id: (3, 0), length: -1 }
+                )),
+                "size" => assert!(matches!(
+                    error,
+                    IndexedReaderError::StreamLimitExceeded {
+                        id: (4, 0),
+                        length: 20,
+                        limit: 10
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(permit.close().unwrap().current_bytes, 0);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_scalar_stream_tail_source_failure_releases_and_retries() {
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Length 5 /Kind /BadTail >>\nstream\nhello\nnot-endstream",
+        }]);
+        let encoded_start = pdf
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .unwrap()
+            + b"stream\n".len();
+        let encoded_end = u64::try_from(encoded_start + 5).unwrap();
+        let source = Arc::new(FailingOffsetSource {
+            bytes: pdf,
+            fail_offset: AtomicU64::new(u64::MAX),
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+
+        source.fail_offset.store(encoded_end, Ordering::SeqCst);
+        source.requests.lock().unwrap().clear();
+        let failed = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        assert!(matches!(
+            reader.resolve_scalar_with_permit((1, 0), &failed),
+            Err(IndexedReaderError::Source(SourceError::Io(_)))
+        ));
+        assert!(
+            source
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, bytes)| *bytes <= 64 * 1024)
+        );
+        assert_eq!(failed.close().unwrap().current_bytes, 0);
+
+        source.fail_offset.store(u64::MAX, Ordering::SeqCst);
+        let retry = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        let scalar = reader.resolve_scalar_with_permit((1, 0), &retry).unwrap();
+        assert!(matches!(scalar.as_object(), Object::Dictionary(_)));
+        drop(scalar);
+        assert_eq!(retry.close().unwrap().current_bytes, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_scalar_stream_overflow_and_permit_lifecycle_errors_stay_fatal() {
+        assert!(matches!(
+            checked_stream_end((7, 0), u64::MAX - 1, 2),
+            Err(IndexedReaderError::InvalidIndirectObject {
+                id: (7, 0),
+                offset
+            }) if offset == u64::MAX - 1
+        ));
+
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Length 5 >>\nstream\nhello\nnot-endstream",
+        }]);
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let cancelled = crate::ScalarResolutionPermit::new(1024 * 1024);
+        cancelled.cancel();
+        assert!(matches!(
+            reader.resolve_scalar_with_permit((1, 0), &cancelled),
+            Err(IndexedReaderError::ScalarResolutionCancelled { .. })
+        ));
+        assert_eq!(cancelled.close().unwrap().current_bytes, 0);
+
+        let closed = crate::ScalarResolutionPermit::new(1024 * 1024);
+        closed.close().unwrap();
+        assert!(matches!(
+            reader.resolve_scalar_with_permit((1, 0), &closed),
+            Err(IndexedReaderError::ScalarResolutionClosed { .. })
+        ));
+        assert_eq!(closed.stats().current_bytes, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_scalar_decrypts_a_malformed_stream_dictionary() {
+        for revision in 2..=6 {
+            let mut pdf = encrypted_malformed_dictionary_pdf(revision, "owner", "user");
+            let object_start = pdf
+                .windows(b"3 0 obj".len())
+                .position(|window| window == b"3 0 obj")
+                .unwrap();
+            let marker = object_start
+                + pdf[object_start..]
+                    .windows(b"endstream".len())
+                    .position(|window| window == b"endstream")
+                    .unwrap();
+            pdf[marker..marker + b"endstream".len()].copy_from_slice(b"badstream");
+            let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
+            let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            let scalar = reader.resolve_scalar_with_permit((3, 0), &permit).unwrap();
+            assert_eq!(scalar.as_object(), eager.get_object((3, 0)).unwrap());
+            assert_eq!(
+                scalar
+                    .as_object()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Sentinel")
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                b"malformed dictionary secret"
+            );
+            drop(scalar);
+            assert_eq!(permit.close().unwrap().current_bytes, 0);
+        }
     }
 
     fn assert_scalar_preflight_bounds_retained(input: &[u8]) {
