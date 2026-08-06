@@ -340,8 +340,7 @@ impl CachedSource {
         let entry = {
             let mut cache = lock_unpoisoned(&self.cache);
             if cache.entries.contains_key(&chunk_offset) {
-                cache.clock = cache.clock.wrapping_add(1);
-                let stamp = cache.clock;
+                let stamp = next_lru_stamp(&mut cache);
                 let (entry, ready) = {
                     let record = cache.entries.get_mut(&chunk_offset).expect("entry just found");
                     let ready = record.ready_len.is_some();
@@ -351,16 +350,16 @@ impl CachedSource {
                     (Arc::clone(&record.entry), ready)
                 };
                 if ready {
-                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    saturating_add(&self.stats.hits, 1);
                     cache.ready_lru.push_back((chunk_offset, stamp));
                     compact_lru(&mut cache, self.max_entries);
                 } else {
-                    self.stats.duplicate_loads_avoided.fetch_add(1, Ordering::Relaxed);
-                    self.stats.waits.fetch_add(1, Ordering::Relaxed);
+                    saturating_add(&self.stats.duplicate_loads_avoided, 1);
+                    saturating_add(&self.stats.waits, 1);
                 }
                 Some(entry)
             } else {
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                saturating_add(&self.stats.misses, 1);
                 self.evict_for(&mut cache, chunk_len);
                 if self.max_entries == 0
                     || chunk_len > self.max_bytes
@@ -387,18 +386,20 @@ impl CachedSource {
                     );
                     cache.in_flight_bytes += chunk_len;
                     cache.in_flight_entries += 1;
-                    self.stats.loads.fetch_add(1, Ordering::Relaxed);
+                    saturating_add(&self.stats.loads, 1);
                     self.record_peaks(&cache);
                     drop(cache);
 
                     let result = self.load_chunk(chunk_offset, chunk_len);
+                    let shared_error = result.as_ref().err().map(SharedSourceError::from);
                     let mut cache = lock_unpoisoned(&self.cache);
                     cache.in_flight_bytes -= chunk_len;
                     cache.in_flight_entries -= 1;
                     match result {
                         Ok(bytes) => {
-                            cache.clock = cache.clock.wrapping_add(1);
-                            let stamp = cache.clock;
+                            let stamp = next_lru_stamp(&mut cache);
+                            let mut state = lock_unpoisoned(&entry.state);
+                            *state = EntryState::Ready(Arc::clone(&bytes));
                             let record = cache.entries.get_mut(&chunk_offset).expect("loading entry retained");
                             record.ready_len = Some(chunk_len);
                             record.last_used = stamp;
@@ -406,17 +407,25 @@ impl CachedSource {
                             cache.retained_entries += 1;
                             cache.ready_lru.push_back((chunk_offset, stamp));
                             self.record_peaks(&cache);
-                            drop(cache);
-                            *lock_unpoisoned(&entry.state) = EntryState::Ready(Arc::clone(&bytes));
+                            drop(state);
                             entry.ready.notify_all();
+                            drop(cache);
                             return Ok(bytes);
                         }
                         Err(error) => {
-                            cache.entries.remove(&chunk_offset);
-                            drop(cache);
-                            let shared = SharedSourceError::from(&error);
-                            *lock_unpoisoned(&entry.state) = EntryState::Failed(shared);
+                            let shared = shared_error.expect("error snapshot captured before publication");
+                            let mut state = lock_unpoisoned(&entry.state);
+                            *state = EntryState::Failed(shared);
+                            drop(state);
                             entry.ready.notify_all();
+                            if cache
+                                .entries
+                                .get(&chunk_offset)
+                                .is_some_and(|record| Arc::ptr_eq(&record.entry, &entry))
+                            {
+                                cache.entries.remove(&chunk_offset);
+                            }
+                            drop(cache);
                             return Err(error);
                         }
                     }
@@ -456,9 +465,7 @@ impl CachedSource {
         let mut completed = 0_usize;
         while completed < output.len() {
             let remaining = output.len() - completed;
-            self.stats
-                .requested_bytes
-                .fetch_add(remaining as u64, Ordering::Relaxed);
+            saturating_add(&self.stats.requested_bytes, remaining as u64);
             let read_offset = offset.checked_add(completed as u64).ok_or(SourceError::RangeOverflow {
                 offset,
                 length: expected,
@@ -486,8 +493,8 @@ impl CachedSource {
     }
 
     fn load_bypass_chunk(&self, offset: u64, length: u64) -> SourceResult<Arc<Vec<u8>>> {
-        self.stats.bypass_reads.fetch_add(1, Ordering::Relaxed);
-        self.stats.bypass_bytes.fetch_add(length, Ordering::Relaxed);
+        saturating_add(&self.stats.bypass_reads, 1);
+        saturating_add(&self.stats.bypass_bytes, length);
         self.load_chunk(offset, length)
     }
 
@@ -513,7 +520,7 @@ impl CachedSource {
             cache.entries.remove(&offset);
             cache.retained_bytes = cache.retained_bytes.saturating_sub(length);
             cache.retained_entries = cache.retained_entries.saturating_sub(1);
-            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+            saturating_add(&self.stats.evictions, 1);
         }
     }
 
@@ -540,9 +547,7 @@ impl RandomAccessSource for CachedSource {
             offset,
             length: u64::MAX,
         })?;
-        self.stats
-            .logical_requested_bytes
-            .fetch_add(requested, Ordering::Relaxed);
+        saturating_add(&self.stats.logical_requested_bytes, requested);
         if offset > self.source_len {
             return Err(SourceError::OutOfBounds {
                 offset,
@@ -554,9 +559,9 @@ impl RandomAccessSource for CachedSource {
             return Ok(0);
         }
         if requested > SOURCE_CHUNK_BYTES {
-            self.stats.bypass_reads.fetch_add(1, Ordering::Relaxed);
-            self.stats.bypass_bytes.fetch_add(requested, Ordering::Relaxed);
-            self.stats.requested_bytes.fetch_add(requested, Ordering::Relaxed);
+            saturating_add(&self.stats.bypass_reads, 1);
+            saturating_add(&self.stats.bypass_bytes, requested);
+            saturating_add(&self.stats.requested_bytes, requested);
             return self.source.read_at(offset, output);
         }
 
@@ -613,6 +618,37 @@ fn compact_lru(cache: &mut CacheState, max_entries: usize) {
     cache.ready_lru = current.into();
 }
 
+fn next_lru_stamp(cache: &mut CacheState) -> u64 {
+    if cache.clock == u64::MAX {
+        let mut current: Vec<_> = cache
+            .entries
+            .iter()
+            .filter_map(|(offset, record)| record.ready_len.map(|_| (*offset, record.last_used)))
+            .collect();
+        current.sort_unstable_by_key(|(_, stamp)| *stamp);
+        cache.ready_lru.clear();
+        for (index, (offset, _)) in current.into_iter().enumerate() {
+            let stamp = u64::try_from(index).unwrap_or(u64::MAX - 1).saturating_add(1);
+            if let Some(record) = cache.entries.get_mut(&offset) {
+                record.last_used = stamp;
+            }
+            cache.ready_lru.push_back((offset, stamp));
+            cache.clock = stamp;
+        }
+        if cache.ready_lru.is_empty() {
+            cache.clock = 0;
+        }
+    }
+    cache.clock = cache.clock.saturating_add(1);
+    cache.clock
+}
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -623,8 +659,9 @@ fn wait_unpoisoned<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexG
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
 
     use super::*;
     use crate::BytesSource;
@@ -734,6 +771,37 @@ mod tests {
     }
 
     #[test]
+    fn post_publication_readers_are_all_hits_and_never_waiters() {
+        let erased: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(bytes(1)));
+        let cached =
+            Arc::new(CachedSource::new(erased, IndexedReaderCacheOptions::new(4 * SOURCE_CHUNK_BYTES, 8)).unwrap());
+        cached.read_range(0, 32, 32).unwrap();
+        let before = cached.stats();
+        let start = Arc::new(Barrier::new(5));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let cached = Arc::clone(&cached);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    cached.read_range(17, 32, 32).unwrap()
+                })
+            })
+            .collect();
+        start.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let after = cached.stats();
+        assert_eq!(after.source().hits() - before.source().hits(), 4);
+        assert_eq!(after.source().waits(), before.source().waits());
+        assert_eq!(
+            after.source().duplicate_loads_avoided(),
+            before.source().duplicate_loads_avoided()
+        );
+    }
+
+    #[test]
     fn four_independent_chunks_overlap_without_a_shared_io_lock() {
         let source = Arc::new(GatedSource {
             bytes: bytes(4),
@@ -826,6 +894,140 @@ mod tests {
         assert_eq!(cached.read_range(0, 32, 32).unwrap(), source.bytes[..32]);
         assert_eq!(source.reads.load(Ordering::SeqCst), 2);
         assert_eq!(cached.stats().source().loads(), 2);
+    }
+
+    #[derive(Debug)]
+    struct BlockingError {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl fmt::Display for BlockingError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.entered.wait();
+            self.release.wait();
+            formatter.write_str("first load failed")
+        }
+    }
+
+    impl std::error::Error for BlockingError {}
+
+    struct FailurePublicationRaceSource {
+        bytes: Arc<[u8]>,
+        reads: AtomicUsize,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl RandomAccessSource for FailurePublicationRaceSource {
+        fn len(&self) -> SourceResult<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(SourceError::Io(std::io::Error::other(BlockingError {
+                    entered: Arc::clone(&self.entered),
+                    release: Arc::clone(&self.release),
+                })));
+            }
+            let start = offset as usize;
+            output.copy_from_slice(&self.bytes[start..start + output.len()]);
+            Ok(output.len())
+        }
+    }
+
+    #[test]
+    fn failing_load_is_published_once_to_waiters_before_a_later_retry() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let source = Arc::new(FailurePublicationRaceSource {
+            bytes: bytes(1),
+            reads: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let cached =
+            Arc::new(CachedSource::new(erased, IndexedReaderCacheOptions::new(4 * SOURCE_CHUNK_BYTES, 8)).unwrap());
+
+        let first_cached = Arc::clone(&cached);
+        let first = std::thread::spawn(move || first_cached.read_range(0, 32, 32));
+        entered.wait();
+
+        let second_cached = Arc::clone(&cached);
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = second_cached.read_range(0, 32, 32);
+            done_tx.send(()).unwrap();
+            result
+        });
+        for _ in 0..10_000 {
+            if cached.stats().source().waits() == 1 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(cached.stats().source().waits(), 1);
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        release.wait();
+        assert!(matches!(first.join().unwrap(), Err(SourceError::Io(_))));
+        assert!(matches!(second.join().unwrap(), Err(SourceError::Io(_))));
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+
+        assert_eq!(cached.read_range(0, 32, 32).unwrap(), source.bytes[..32]);
+        assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(cached.stats().source().loads(), 2);
+    }
+
+    #[test]
+    fn cumulative_counters_saturate_under_concurrent_updates() {
+        let counters = SourceCacheCounters::default();
+        let cumulative = [
+            &counters.hits,
+            &counters.misses,
+            &counters.loads,
+            &counters.duplicate_loads_avoided,
+            &counters.waits,
+            &counters.evictions,
+            &counters.bypass_reads,
+            &counters.logical_requested_bytes,
+            &counters.requested_bytes,
+            &counters.bypass_bytes,
+        ];
+        for counter in cumulative {
+            counter.store(u64::MAX - 1, Ordering::Relaxed);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| saturating_add(counter, 1));
+                }
+            });
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn lru_clock_rebases_at_overflow_without_evicting_the_hot_chunk() {
+        let data = bytes(3);
+        let cached = CachedSource::new(
+            Arc::new(BytesSource::new(data)),
+            IndexedReaderCacheOptions::new(8 * SOURCE_CHUNK_BYTES, 8),
+        )
+        .unwrap();
+        cached.read_range(0, 32, 32).unwrap();
+        cached.read_range(SOURCE_CHUNK_BYTES, 32, 32).unwrap();
+        lock_unpoisoned(&cached.cache).clock = u64::MAX - 1;
+        cached.read_range(0, 32, 32).unwrap();
+        cached.read_range(SOURCE_CHUNK_BYTES, 32, 32).unwrap();
+        cached.read_range(2 * SOURCE_CHUNK_BYTES, 32, 32).unwrap();
+
+        let cache = lock_unpoisoned(&cached.cache);
+        assert!(!cache.entries.contains_key(&0));
+        assert!(cache.entries.contains_key(&SOURCE_CHUNK_BYTES));
+        assert!(cache.entries.contains_key(&(2 * SOURCE_CHUNK_BYTES)));
+        assert!(cache.clock < u64::MAX);
     }
 
     struct OverreportingSource;
