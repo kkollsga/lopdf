@@ -519,6 +519,21 @@ pub enum IndexedReaderError {
     IncompleteObject { id: crate::ObjectId, offset: u64 },
     #[error("object {id:?} exceeds the {limit}-byte parser limit")]
     ObjectLimitExceeded { id: crate::ObjectId, limit: u64 },
+    #[error(
+        "scalar resolution for object {id:?} needs {requested} simultaneous bytes during {phase}, exceeding limit {limit}"
+    )]
+    ScalarResourceLimit {
+        id: crate::ObjectId,
+        requested: u64,
+        limit: u64,
+        phase: &'static str,
+    },
+    #[error("scalar resolution for object {id:?} was cancelled during {phase}")]
+    ScalarResolutionCancelled { id: crate::ObjectId, phase: &'static str },
+    #[error("scalar-resolution permit is closed for object {id:?} during {phase}")]
+    ScalarResolutionClosed { id: crate::ObjectId, phase: &'static str },
+    #[error("object {id:?} is not a scalar object")]
+    NotScalarObject { id: crate::ObjectId },
     #[error("stream in object {id:?} declares {length} bytes, exceeding the {limit}-byte limit")]
     StreamLimitExceeded {
         id: crate::ObjectId,

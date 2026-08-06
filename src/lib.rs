@@ -35,6 +35,7 @@ mod parser;
 mod parser_aux;
 mod reader;
 mod save_options;
+mod scalar_budget;
 mod source_cache;
 
 #[cfg(feature = "font_embedding")]
@@ -62,6 +63,7 @@ pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, Object
 pub use outlines::Outline;
 pub use reader::{PdfMetadata, Reader};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
+pub use scalar_budget::{BoundedScalar, ScalarResolutionPermit, ScalarResolutionStats};
 #[cfg(any(unix, windows))]
 pub use source::FileSource;
 pub use source::{BytesSource, RandomAccessSource, SourceError, SourceResult};
