@@ -63,7 +63,9 @@ pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, Object
 pub use outlines::Outline;
 pub use reader::{PdfMetadata, Reader};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
-pub use scalar_budget::{BoundedScalar, ScalarResolutionPermit, ScalarResolutionStats};
+pub use scalar_budget::{
+    BoundedScalar, BoundedStream, BoundedStreamContent, ScalarResolutionPermit, ScalarResolutionStats,
+};
 #[cfg(any(unix, windows))]
 pub use source::FileSource;
 pub use source::{BytesSource, RandomAccessSource, SourceError, SourceResult};

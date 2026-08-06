@@ -1,7 +1,7 @@
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{IndexedReaderError, IndexedReaderResult, Object, ObjectId};
+use crate::{IndexedReaderError, IndexedReaderResult, Object, ObjectId, Stream};
 
 /// A snapshot of one call-local scalar-resolution allowance.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -52,6 +52,24 @@ pub struct BoundedScalar {
     _charge: ScalarCharge,
 }
 
+/// One fully materialized stream whose dictionary and content allocations
+/// remain charged to the permit which admitted the resolution.
+pub struct BoundedStream {
+    stream: Stream,
+    retained_bytes: u64,
+    peak_bytes: u64,
+    _dictionary_charge: ScalarCharge,
+    content_charge: ScalarCharge,
+}
+
+/// A materialized stream payload moved out without copying. Its allocation
+/// remains charged until this owner is dropped.
+pub struct BoundedStreamContent {
+    bytes: Vec<u8>,
+    peak_bytes: u64,
+    _charge: ScalarCharge,
+}
+
 impl std::fmt::Debug for BoundedScalar {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -91,6 +109,84 @@ impl BoundedScalar {
             peak_bytes,
             _charge: charge,
         }
+    }
+}
+
+impl std::fmt::Debug for BoundedStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundedStream")
+            .field("id", &self.stream.start_position)
+            .field("content_bytes", &self.stream.content.len())
+            .field("retained_bytes", &self.retained_bytes)
+            .field("peak_bytes", &self.peak_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundedStream {
+    pub const fn as_stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    pub const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    pub const fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    pub fn into_content(self) -> BoundedStreamContent {
+        let Self {
+            stream,
+            peak_bytes,
+            _dictionary_charge,
+            content_charge,
+            ..
+        } = self;
+        let Stream { content, .. } = stream;
+        drop(_dictionary_charge);
+        BoundedStreamContent {
+            bytes: content,
+            peak_bytes,
+            _charge: content_charge,
+        }
+    }
+
+    pub(crate) fn new(
+        stream: Stream, retained_bytes: u64, peak_bytes: u64, dictionary_charge: ScalarCharge,
+        content_charge: ScalarCharge,
+    ) -> Self {
+        Self {
+            stream,
+            retained_bytes,
+            peak_bytes,
+            _dictionary_charge: dictionary_charge,
+            content_charge,
+        }
+    }
+}
+
+impl BoundedStreamContent {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn allocation_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    pub const fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
     }
 }
 
