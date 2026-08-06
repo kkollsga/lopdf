@@ -144,6 +144,7 @@ pub struct IndexedStreamDescriptor {
     source: Arc<dyn RandomAccessSource>,
     source_len: u64,
     encoded_start: u64,
+    metadata_frame_bytes: u64,
 }
 
 impl std::fmt::Debug for IndexedStreamDescriptor {
@@ -185,6 +186,23 @@ impl IndexedStreamDescriptor {
     /// Whether the encoded bytes can be opened by the L0 plain reader.
     pub const fn protection(&self) -> EncodedStreamProtection {
         self.protection
+    }
+
+    /// Conservative simultaneous-allocation bound for resolving this normal
+    /// stream through [`IndexedReader::resolve_stream_with_permit`]. The bound
+    /// covers frame growth, dictionary AST/transients, encoded content, and
+    /// the worst supported AES decryption overlap without scaling a tiny
+    /// object by an arbitrary global multiplier.
+    pub fn bounded_resolution_bytes(&self) -> Option<u64> {
+        let encoded = self.encoded_len()?;
+        let dictionary = u64::try_from(dictionary_retained_bytes(&self.dictionary)).unwrap_or(u64::MAX);
+        let metadata_window = self.metadata_frame_bytes.max(INITIAL_OBJECT_WINDOW);
+        let metadata_peak = metadata_window
+            .saturating_mul(3)
+            .saturating_add(dictionary.saturating_mul(2))
+            .saturating_add(INDIRECT_HEADER_LIMIT);
+        let content_peak = dictionary.saturating_add(encoded.saturating_mul(3)).saturating_add(64);
+        Some(metadata_peak.max(content_peak))
     }
 
     /// Open an independent bounded reader for unencrypted encoded bytes.
@@ -2277,12 +2295,16 @@ impl IndexedReader {
             return Err(IndexedStreamReadError::NotNormalObject { id });
         }
         let mut state = ResolutionState::default();
-        let metadata = (|| {
+        let metadata: IndexedReaderResult<(FramedStreamMetadata, u64)> = (|| {
             let (body_offset, source_len, parsed) = self.resolve_normal_framed(id)?;
-            self.finish_stream_metadata(id, body_offset, source_len, parsed, &mut state)
+            let metadata_frame_bytes = u64::try_from(parsed.consumed)
+                .unwrap_or(u64::MAX)
+                .saturating_add(parsed.stream_prefix.unwrap_or(0));
+            let metadata = self.finish_stream_metadata(id, body_offset, source_len, parsed, &mut state)?;
+            Ok((metadata, metadata_frame_bytes))
         })();
         self.ensure_stream_source_len()?;
-        let metadata = metadata?;
+        let (metadata, metadata_frame_bytes) = metadata?;
         let (dictionary, encoded_start, encoded_length) = match metadata {
             FramedStreamMetadata::Span {
                 dictionary,
@@ -2309,6 +2331,7 @@ impl IndexedReader {
             source: Arc::clone(&self.source),
             source_len: self.index.source_len,
             encoded_start,
+            metadata_frame_bytes,
         })
     }
 
