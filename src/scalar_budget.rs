@@ -118,6 +118,10 @@ impl ScalarResolutionPermit {
         stats(&lock_unpoisoned(&self.inner.state))
     }
 
+    pub fn limit_bytes(&self) -> u64 {
+        lock_unpoisoned(&self.inner.state).limit_bytes
+    }
+
     pub fn close(&self) -> Result<ScalarResolutionStats, String> {
         let mut state = lock_unpoisoned(&self.inner.state);
         if state.current_bytes != 0 {
@@ -130,9 +134,7 @@ impl ScalarResolutionPermit {
         Ok(stats(&state))
     }
 
-    pub(crate) fn reserve(
-        &self, id: ObjectId, bytes: u64, phase: &'static str,
-    ) -> IndexedReaderResult<ScalarCharge> {
+    pub(crate) fn reserve(&self, id: ObjectId, bytes: u64, phase: &'static str) -> IndexedReaderResult<ScalarCharge> {
         let mut state = lock_unpoisoned(&self.inner.state);
         if state.cancelled {
             return Err(IndexedReaderError::ScalarResolutionCancelled { id, phase });
