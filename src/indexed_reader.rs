@@ -376,6 +376,8 @@ struct SharedCache<T> {
     protected_percent: usize,
     kind: CacheKind,
     counters: Arc<CacheCounters>,
+    #[cfg(test)]
+    after_publish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -427,6 +429,8 @@ impl<T> SharedCache<T> {
             protected_percent,
             kind,
             counters,
+            #[cfg(test)]
+            after_publish_hook: Mutex::new(None),
         }
     }
 
@@ -469,8 +473,12 @@ impl<T> SharedCache<T> {
             let SharedCellState::Ready(result) = &*state else {
                 unreachable!();
             };
-            if result.is_err() {
-                self.counters.negative_hits.fetch_add(1, Ordering::Relaxed);
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| !is_transient_error(error.as_ref()))
+            {
+                atomic_saturating_increment(&self.counters.negative_hits);
             }
             return result.clone();
         }
@@ -482,21 +490,14 @@ impl<T> SharedCache<T> {
             .err()
             .is_some_and(|error| is_transient_error(error.as_ref()));
         let retained_bytes = result.as_ref().ok().map_or(0, |value| weight(value.as_ref()));
-        {
-            let mut state = cell.state.lock().unwrap();
-            *state = SharedCellState::Ready(result.clone());
-            cell.ready.notify_all();
-        }
-
         let bypass = retained_bytes > self.max_entry_bytes || retained_bytes > self.max_bytes;
         let mut inner = self.inner.lock().unwrap();
         if transient || bypass {
             if transient {
-                match self.kind {
+                atomic_saturating_increment(match self.kind {
                     CacheKind::Object => &self.counters.object_transient_failures,
                     CacheKind::ObjectStream => &self.counters.objstm_transient_failures,
-                }
-                .fetch_add(1, Ordering::Relaxed);
+                });
             } else {
                 self.record_bypass();
             }
@@ -517,6 +518,18 @@ impl<T> SharedCache<T> {
             }
             self.enforce_caps(&mut inner);
         }
+        {
+            let mut state = cell.state.lock().unwrap();
+            *state = SharedCellState::Ready(result.clone());
+            cell.ready.notify_all();
+        }
+        drop(inner);
+        #[cfg(test)]
+        let hook = self.after_publish_hook.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook();
+        }
         result
     }
 
@@ -535,7 +548,7 @@ impl<T> SharedCache<T> {
                 }
                 inner.protected.push_back(id);
                 if matches!(self.kind, CacheKind::Object) {
-                    self.counters.object_promotions.fetch_add(1, Ordering::Relaxed);
+                    atomic_saturating_increment(&self.counters.object_promotions);
                 }
                 self.demote_protected(inner);
             }
@@ -633,51 +646,45 @@ impl<T> SharedCache<T> {
     }
 
     fn record_hit(&self) {
-        match self.kind {
+        atomic_saturating_increment(match self.kind {
             CacheKind::Object => &self.counters.object_hits,
             CacheKind::ObjectStream => &self.counters.objstm_hits,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     fn record_miss(&self) {
-        match self.kind {
+        atomic_saturating_increment(match self.kind {
             CacheKind::Object => &self.counters.object_misses,
             CacheKind::ObjectStream => &self.counters.objstm_misses,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     fn record_wait(&self) {
-        match self.kind {
+        atomic_saturating_increment(match self.kind {
             CacheKind::Object => &self.counters.object_waits,
             CacheKind::ObjectStream => &self.counters.objstm_waits,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     fn record_load(&self) {
-        match self.kind {
+        atomic_saturating_increment(match self.kind {
             CacheKind::Object => &self.counters.object_loads,
             CacheKind::ObjectStream => &self.counters.objstm_loads,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     fn record_eviction(&self) {
-        match self.kind {
+        atomic_saturating_increment(match self.kind {
             CacheKind::Object => &self.counters.object_evictions,
             CacheKind::ObjectStream => &self.counters.objstm_evictions,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     fn record_bypass(&self) {
-        match self.kind {
+        atomic_saturating_increment(match self.kind {
             CacheKind::Object => &self.counters.object_bypasses,
             CacheKind::ObjectStream => &self.counters.objstm_bypasses,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     fn residency(&self) -> (usize, usize, usize, usize) {
@@ -689,6 +696,12 @@ impl<T> SharedCache<T> {
             inner.protected_bytes,
         )
     }
+}
+
+fn atomic_saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
 }
 
 fn remove_key(queue: &mut VecDeque<crate::ObjectId>, id: crate::ObjectId) {
@@ -5367,6 +5380,114 @@ mod tests {
         assert!(values.iter().all(|value| Arc::ptr_eq(&values[0], value)));
         assert_eq!(counters.object_loads.load(Ordering::Relaxed), 1);
         assert_eq!(counters.object_waits.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn transient_failure_is_shared_only_with_waiters_then_post_publication_retries() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = Arc::new(SharedCache::new(
+            1024,
+            8,
+            256,
+            75,
+            CacheKind::Object,
+            Arc::clone(&counters),
+        ));
+        let load_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_load = Arc::new(std::sync::Barrier::new(2));
+        let published = Arc::new(std::sync::Barrier::new(2));
+        let release_publisher = Arc::new(std::sync::Barrier::new(2));
+        {
+            let published = Arc::clone(&published);
+            let release_publisher = Arc::clone(&release_publisher);
+            *cache.after_publish_hook.lock().unwrap() = Some(Arc::new(move || {
+                published.wait();
+                release_publisher.wait();
+            }));
+        }
+
+        let leader_cache = Arc::clone(&cache);
+        let leader_entered = Arc::clone(&load_entered);
+        let leader_release = Arc::clone(&release_load);
+        let leader = std::thread::spawn(move || {
+            leader_cache.resolve(
+                (1, 0),
+                || {
+                    leader_entered.wait();
+                    leader_release.wait();
+                    Err(Arc::new(IndexedReaderError::Source(SourceError::Io(
+                        std::io::Error::other("transient"),
+                    ))))
+                },
+                |_| 64,
+            )
+        });
+        load_entered.wait();
+
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                std::thread::spawn(move || {
+                    cache.resolve((1, 0), || panic!("waiter must not become a second leader"), |_| 64)
+                })
+            })
+            .collect();
+        while counters.object_waits.load(Ordering::SeqCst) < 2 {
+            std::thread::yield_now();
+        }
+        release_load.wait();
+        published.wait();
+
+        let waiter_errors: Vec<_> = waiters
+            .into_iter()
+            .map(|waiter| waiter.join().unwrap().unwrap_err())
+            .collect();
+        assert!(Arc::ptr_eq(&waiter_errors[0], &waiter_errors[1]));
+
+        let retried = cache
+            .resolve((1, 0), || Ok(Arc::new(Object::Integer(42))), |_| 64)
+            .unwrap();
+        assert_eq!(*retried, Object::Integer(42));
+
+        release_publisher.wait();
+        let leader_error = leader.join().unwrap().unwrap_err();
+        assert!(Arc::ptr_eq(&leader_error, &waiter_errors[0]));
+        assert_eq!(counters.object_loads.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.object_misses.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.object_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.object_waits.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.object_transient_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.negative_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fatal_failure_remains_negative_cached_with_shared_identity_and_count() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = SharedCache::<Object>::new(1024, 8, 256, 75, CacheKind::Object, Arc::clone(&counters));
+        let first = cache
+            .resolve(
+                (99, 0),
+                || Err(Arc::new(IndexedReaderError::MissingNormalObject { id: (99, 0) })),
+                |_| 64,
+            )
+            .unwrap_err();
+        let second = cache
+            .resolve((99, 0), || panic!("fatal negative entry must not reload"), |_| 64)
+            .unwrap_err();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(counters.object_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.object_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.object_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.negative_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.object_transient_failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn public_cache_counters_saturate_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        atomic_saturating_increment(&counter);
+        atomic_saturating_increment(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
