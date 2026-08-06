@@ -1712,12 +1712,6 @@ impl IndexedReader {
                 phase: "permit-not-empty",
             });
         }
-        if self.index.encryption_state.is_some() {
-            return Err(IndexedReaderError::UnsupportedBoundedScalar {
-                id,
-                reason: "encrypted scalar objects",
-            });
-        }
         match self.index.locations.get(&id.0).cloned() {
             Some(ObjectLocation64::Normal { .. }) => self.resolve_normal_scalar_limited(id, permit),
             Some(ObjectLocation64::Compressed { container, index }) => {
@@ -1734,8 +1728,13 @@ impl IndexedReader {
         if parsed.stream_prefix.is_some() {
             return Err(IndexedReaderError::NotScalarObject { id });
         }
-        let object = parsed.object;
-        debug_assert!(self.index.encryption_state.is_none());
+        let mut object = parsed.object;
+        if self.index.encrypt_object_id != Some(id)
+            && let Some(encryption_state) = &self.index.encryption_state
+        {
+            encryption::decrypt_object(encryption_state, id, &mut object)
+                .map_err(|source| IndexedReaderError::ObjectDecryption { id, source })?;
+        }
         let retained = u64::try_from(scalar_object_retained_bytes(&object)).unwrap_or(u64::MAX);
         if retained > object_charge.bytes() {
             return Err(IndexedReaderError::ScalarResourceLimit {
@@ -1920,6 +1919,14 @@ impl IndexedReader {
                 id,
                 reason: "object streams without a direct nonnegative /Length",
             })?;
+        let encoded_limit = self.limits.max_stream_bytes.min(permit.limit_bytes());
+        if encoded_len > encoded_limit {
+            return Err(IndexedReaderError::StreamLimitExceeded {
+                id: container_id,
+                length: encoded_len,
+                limit: encoded_limit,
+            });
+        }
         let encoded_start = body_offset
             .checked_add(u64::try_from(consumed).unwrap_or(u64::MAX))
             .and_then(|offset| offset.checked_add(stream_prefix))
@@ -3915,10 +3922,12 @@ struct ScalarAstPreflight {
 impl ScalarAstPreflight {
     fn reserved_bytes(self, decrypts_strings: bool) -> u64 {
         let decryption_overlap = if decrypts_strings {
-            // Decryption allocates one plaintext Vec while the corresponding
-            // ciphertext Vec and the rest of the AST remain live. The fixed
-            // tail covers the largest supported object-key/IV workspace.
-            self.largest_string_bytes.saturating_add(64)
+            // AES decryption can hold the ciphertext plus two plaintext-sized
+            // Vec allocations at once (the working buffer and the unpadded
+            // result). RC4 needs less. The fixed tail covers object-key/IV
+            // workspace, so this is a conservative bound for every supported
+            // string crypt filter.
+            self.largest_string_bytes.saturating_mul(2).saturating_add(64)
         } else {
             0
         };
@@ -10438,25 +10447,23 @@ mod tests {
     }
 
     #[test]
-    fn bounded_scalar_refuses_encryption_before_any_call_local_allocation() {
-        let pdf = encrypted_pdf(2, "owner", "user");
-        let reader = IndexedReader::open_with_options(
-            BytesSource::from(pdf),
-            IndexedReaderOptions {
-                password: Some(b"user".to_vec()),
-                ..IndexedReaderOptions::default()
-            },
-        )
-        .unwrap();
-        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
-        assert!(matches!(
-            reader.resolve_scalar_with_permit((1, 0), &permit),
-            Err(IndexedReaderError::UnsupportedBoundedScalar {
-                reason: "encrypted scalar objects",
-                ..
-            })
-        ));
-        assert_eq!(permit.stats().peak_bytes, 0);
-        permit.close().unwrap();
+    fn bounded_scalar_decrypts_normal_strings_with_proven_overlap() {
+        for revision in 2..=6 {
+            let pdf = encrypted_pdf(revision, "owner", "user");
+            let reader = IndexedReader::open_with_options(
+                BytesSource::from(pdf),
+                IndexedReaderOptions {
+                    password: Some(b"user".to_vec()),
+                    ..IndexedReaderOptions::default()
+                },
+            )
+            .unwrap();
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            let scalar = reader.resolve_scalar_with_permit((1, 0), &permit).unwrap();
+            assert_eq!(scalar.as_object().as_str().unwrap(), b"encrypted string");
+            assert!(scalar.peak_bytes() <= permit.limit_bytes());
+            drop(scalar);
+            permit.close().unwrap();
+        }
     }
 }
