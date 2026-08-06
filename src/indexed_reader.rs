@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[cfg(feature = "rayon")]
@@ -16,7 +16,7 @@ use crate::source::{RandomAccessSource, SourceError};
 use crate::source_cache::CachedSource;
 use crate::{Dictionary, Object, ObjectStream, Stream};
 
-pub use crate::source_cache::{IndexedReaderCacheOptions, IndexedReaderCacheStats, IndexedReaderSourceCacheStats};
+pub use crate::source_cache::{IndexedReaderCacheOptions, IndexedReaderSourceCacheStats};
 
 const HEADER_SCAN_LIMIT: u64 = 1_024;
 const HEADER_PARSE_OVERLAP: u64 = 64;
@@ -45,6 +45,56 @@ pub type IndexedReaderResult<T> = std::result::Result<T, IndexedReaderError>;
 /// Shareable result returned by batched and shared object resolution.
 pub type SharedIndexedReaderResult<T> = std::result::Result<T, Arc<IndexedReaderError>>;
 
+/// A point-in-time snapshot of all bounded indexed-reader caches.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexedReaderCacheStats {
+    source: IndexedReaderSourceCacheStats,
+    object: IndexedObjectCacheStats,
+    object_stream: IndexedObjectStreamCacheStats,
+    current_bytes: u64,
+    peak_bytes: u64,
+    current_entries: usize,
+    peak_entries: usize,
+}
+
+impl IndexedReaderCacheStats {
+    /// Counters for the aligned positional source-chunk cache.
+    pub const fn source(&self) -> &IndexedReaderSourceCacheStats {
+        &self.source
+    }
+
+    /// Counters for resolved objects.
+    pub const fn object(&self) -> &IndexedObjectCacheStats {
+        &self.object
+    }
+
+    /// Counters for decoded object streams.
+    pub const fn object_stream(&self) -> &IndexedObjectStreamCacheStats {
+        &self.object_stream
+    }
+
+    /// Bytes currently retained or reserved across all cache partitions.
+    pub const fn current_bytes(&self) -> u64 {
+        self.current_bytes
+    }
+
+    /// Sum of the bounded per-partition byte high-water marks.
+    pub const fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    /// Entries currently retained or loading across all cache partitions.
+    pub const fn current_entries(&self) -> usize {
+        self.current_entries
+    }
+
+    /// Sum of the bounded per-partition entry high-water marks.
+    pub const fn peak_entries(&self) -> usize {
+        self.peak_entries
+    }
+}
+
 /// A point-in-time snapshot of the opt-in shared object cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -61,7 +111,7 @@ pub struct IndexedObjectCacheStats {
     pub object_promotions: u64,
     /// Object cells evicted to enforce fixed caps.
     pub object_evictions: u64,
-    /// Objects deliberately bypassed because one entry was too large.
+    /// Objects bypassed because one entry was too large or all cells were loading.
     pub object_bypasses: u64,
     /// Reuses of a cached deterministic object-resolution error.
     pub negative_hits: u64,
@@ -75,6 +125,10 @@ pub struct IndexedObjectCacheStats {
     pub protected_entries: usize,
     /// Approximate resident bytes in protected object entries.
     pub protected_bytes: usize,
+    /// Peak resident entries after enforcing the fixed cache caps.
+    pub peak_entries: usize,
+    /// Peak approximate resident bytes after enforcing the fixed cache caps.
+    pub peak_bytes: usize,
 }
 
 /// A point-in-time snapshot of the opt-in decoded object-stream cache.
@@ -91,7 +145,7 @@ pub struct IndexedObjectStreamCacheStats {
     pub loads: u64,
     /// Decoded object-stream cells evicted to enforce configured caps.
     pub evictions: u64,
-    /// Decoded object streams bypassed because one entry was too large.
+    /// Decoded object streams bypassed because one entry was too large or all cells were loading.
     pub bypasses: u64,
     /// Transient source failures shared with current waiters but not retained.
     pub transient_failures: u64,
@@ -99,6 +153,10 @@ pub struct IndexedObjectStreamCacheStats {
     pub entries: usize,
     /// Resident decoded object-stream bytes.
     pub bytes: usize,
+    /// Peak resident decoded object-stream entries.
+    pub peak_entries: usize,
+    /// Peak resident decoded object-stream bytes.
+    pub peak_bytes: usize,
 }
 
 #[cfg(test)]
@@ -348,6 +406,7 @@ struct SharedCacheInner<T> {
     protected: VecDeque<crate::ObjectId>,
     probation_bytes: usize,
     protected_bytes: usize,
+    loading_entries: usize,
 }
 
 impl<T> Default for SharedCacheInner<T> {
@@ -358,6 +417,7 @@ impl<T> Default for SharedCacheInner<T> {
             protected: VecDeque::new(),
             probation_bytes: 0,
             protected_bytes: 0,
+            loading_entries: 0,
         }
     }
 }
@@ -391,6 +451,8 @@ struct CacheCounters {
     object_bypasses: AtomicU64,
     negative_hits: AtomicU64,
     object_transient_failures: AtomicU64,
+    object_peak_entries: AtomicUsize,
+    object_peak_bytes: AtomicUsize,
     objstm_hits: AtomicU64,
     objstm_misses: AtomicU64,
     objstm_waits: AtomicU64,
@@ -398,6 +460,8 @@ struct CacheCounters {
     objstm_evictions: AtomicU64,
     objstm_bypasses: AtomicU64,
     objstm_transient_failures: AtomicU64,
+    objstm_peak_entries: AtomicUsize,
+    objstm_peak_bytes: AtomicUsize,
 }
 
 enum PreparedObjectStream {
@@ -448,6 +512,16 @@ impl<T> SharedCache<T> {
                 (cell, false)
             } else {
                 self.record_miss();
+                while inner.entries.len() >= self.max_entries
+                    && inner.loading_entries < inner.entries.len()
+                    && self.evict_one_ready(&mut inner)
+                {}
+                if inner.entries.len() >= self.max_entries {
+                    self.record_bypass();
+                    self.record_load();
+                    drop(inner);
+                    return load();
+                }
                 let cell = Arc::new(SharedCell::loading());
                 inner.probation.push_back(id);
                 inner.entries.insert(
@@ -458,6 +532,8 @@ impl<T> SharedCache<T> {
                         bytes: 0,
                     },
                 );
+                inner.loading_entries = inner.loading_entries.saturating_add(1);
+                self.record_residency_peaks(&inner);
                 (cell, true)
             }
         };
@@ -492,6 +568,7 @@ impl<T> SharedCache<T> {
         let retained_bytes = result.as_ref().ok().map_or(0, |value| weight(value.as_ref()));
         let bypass = retained_bytes > self.max_entry_bytes || retained_bytes > self.max_bytes;
         let mut inner = self.inner.lock().unwrap();
+        inner.loading_entries = inner.loading_entries.saturating_sub(1);
         if transient || bypass {
             if transient {
                 atomic_saturating_increment(match self.kind {
@@ -517,6 +594,7 @@ impl<T> SharedCache<T> {
                 }
             }
             self.enforce_caps(&mut inner);
+            self.record_residency_peaks(&inner);
         }
         {
             let mut state = cell.state.lock().unwrap();
@@ -614,6 +692,28 @@ impl<T> SharedCache<T> {
         }
     }
 
+    fn evict_one_ready(&self, inner: &mut SharedCacheInner<T>) -> bool {
+        let candidates = inner.probation.len().saturating_add(inner.protected.len());
+        for _ in 0..candidates {
+            let Some(id) = inner.probation.pop_front().or_else(|| inner.protected.pop_front()) else {
+                return false;
+            };
+            let Some(entry) = inner.entries.get(&id) else {
+                continue;
+            };
+            if matches!(*entry.cell.state.lock().unwrap(), SharedCellState::Loading) {
+                match entry.segment {
+                    CacheSegment::Probation => inner.probation.push_back(id),
+                    CacheSegment::Protected => inner.protected.push_back(id),
+                }
+                continue;
+            }
+            self.remove_entry(inner, id, true);
+            return true;
+        }
+        false
+    }
+
     fn remove_if_same(
         &self, inner: &mut SharedCacheInner<T>, id: crate::ObjectId, cell: &Arc<SharedCell<T>>, eviction: bool,
     ) {
@@ -696,12 +796,31 @@ impl<T> SharedCache<T> {
             inner.protected_bytes,
         )
     }
+
+    fn record_residency_peaks(&self, inner: &SharedCacheInner<T>) {
+        let entries = inner.entries.len();
+        let bytes = inner.probation_bytes.saturating_add(inner.protected_bytes);
+        let (peak_entries, peak_bytes) = match self.kind {
+            CacheKind::Object => (&self.counters.object_peak_entries, &self.counters.object_peak_bytes),
+            CacheKind::ObjectStream => (&self.counters.objstm_peak_entries, &self.counters.objstm_peak_bytes),
+        };
+        peak_entries.fetch_max(entries, Ordering::Relaxed);
+        peak_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
 }
 
 fn atomic_saturating_increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
     });
+}
+
+fn usize_from_u64_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn u64_from_usize_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn remove_key(queue: &mut VecDeque<crate::ObjectId>, id: crate::ObjectId) {
@@ -1088,14 +1207,48 @@ impl IndexedReader {
         let erased: Arc<dyn RandomAccessSource> = cached_source.clone();
         let mut reader = Self::from_erased_source(erased, options)?;
         reader.cached_source = Some(cached_source);
+        reader.configure_resolution_caches(
+            usize_from_u64_saturating(cache_options.object_max_bytes()),
+            cache_options.object_max_entries(),
+            usize_from_u64_saturating(cache_options.object_stream_max_bytes()),
+            cache_options.object_stream_max_entries(),
+        );
         Ok(reader)
     }
 
     /// Return a snapshot of cache counters, or zero counters for an uncached reader.
     pub fn cache_stats(&self) -> IndexedReaderCacheStats {
-        self.cached_source
-            .as_ref()
-            .map_or_else(IndexedReaderCacheStats::default, |source| source.stats())
+        let Some(source) = self.cached_source.as_ref() else {
+            return IndexedReaderCacheStats::default();
+        };
+        let source = source.stats();
+        let object = self.object_cache_stats();
+        let object_stream = self.object_stream_cache_stats();
+        let object_bytes = object.probation_bytes.saturating_add(object.protected_bytes);
+        let object_entries = object.probation_entries.saturating_add(object.protected_entries);
+        IndexedReaderCacheStats {
+            current_bytes: source
+                .retained_bytes()
+                .saturating_add(source.in_flight_bytes())
+                .saturating_add(u64_from_usize_saturating(object_bytes))
+                .saturating_add(u64_from_usize_saturating(object_stream.bytes)),
+            peak_bytes: source
+                .peak_bytes()
+                .saturating_add(u64_from_usize_saturating(object.peak_bytes))
+                .saturating_add(u64_from_usize_saturating(object_stream.peak_bytes)),
+            current_entries: source
+                .retained_entries()
+                .saturating_add(source.in_flight_entries())
+                .saturating_add(object_entries)
+                .saturating_add(object_stream.entries),
+            peak_entries: source
+                .peak_entries()
+                .saturating_add(object.peak_entries)
+                .saturating_add(object_stream.peak_entries),
+            source,
+            object,
+            object_stream,
+        }
     }
 
     fn open_with_limits(source: Arc<dyn RandomAccessSource>, limits: ResolverLimits) -> IndexedReaderResult<Self> {
@@ -1264,6 +1417,8 @@ impl IndexedReader {
             probation_bytes,
             protected_entries,
             protected_bytes,
+            peak_entries: counters.object_peak_entries.load(Ordering::Relaxed),
+            peak_bytes: counters.object_peak_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -1293,6 +1448,8 @@ impl IndexedReader {
             transient_failures: counters.objstm_transient_failures.load(Ordering::Relaxed),
             entries,
             bytes,
+            peak_entries: counters.objstm_peak_entries.load(Ordering::Relaxed),
+            peak_bytes: counters.objstm_peak_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -5268,6 +5425,43 @@ mod tests {
     }
 
     #[test]
+    fn cached_constructor_wires_every_partition_into_unified_stats() {
+        let members = [(10, b"(ten)".as_slice()), (11, b"(eleven)".as_slice())];
+        let (first, decoded) = object_stream_content(&members);
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 2 /First {first}"),
+            &decoded,
+            &[(10, 0), (11, 1)],
+        );
+        let options = IndexedReaderCacheOptions::new(8 * 1024 * 1024, 1024);
+        let reader =
+            IndexedReader::open_cached(BytesSource::from(fixture.pdf), IndexedReaderOptions::default(), options)
+                .unwrap();
+
+        assert_eq!(reader.resolve_object_shared((10, 0)).unwrap().as_str().unwrap(), b"ten");
+        assert_eq!(
+            reader.resolve_object_shared((11, 0)).unwrap().as_str().unwrap(),
+            b"eleven"
+        );
+        assert_eq!(reader.resolve_object_shared((10, 0)).unwrap().as_str().unwrap(), b"ten");
+
+        let stats = reader.cache_stats();
+        assert!(stats.source().loads() > 0);
+        assert_eq!(stats.object().object_loads, 2);
+        assert_eq!(stats.object().object_hits, 1);
+        assert_eq!(stats.object_stream().loads, 1);
+        assert_eq!(stats.object_stream().hits, 1);
+        assert_eq!(stats.object_stream().entries, 1);
+        assert!(stats.object_stream().bytes >= decoded.len());
+        assert_eq!(*stats.object(), reader.object_cache_stats());
+        assert_eq!(*stats.object_stream(), reader.object_stream_cache_stats());
+        assert!(stats.current_bytes() <= options.max_bytes());
+        assert!(stats.peak_bytes() <= options.max_bytes());
+        assert!(stats.current_entries() <= options.max_entries());
+        assert!(stats.peak_entries() <= options.max_entries());
+    }
+
+    #[test]
     fn oversized_streams_bypass_probation_retention() {
         let mut document = Document::with_version("1.7");
         document.objects.insert(
@@ -5509,6 +5703,49 @@ mod tests {
             cache.enforce_caps(&mut inner);
             assert!(inner.entries.contains_key(&(1, 0)));
         }
+    }
+
+    #[test]
+    fn loading_entry_saturation_bypasses_without_exceeding_the_entry_cap() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = Arc::new(SharedCache::<Object>::new(
+            1024,
+            2,
+            512,
+            75,
+            CacheKind::Object,
+            Arc::clone(&counters),
+        ));
+        let entered = Arc::new(std::sync::Barrier::new(5));
+        let release = Arc::new(std::sync::Barrier::new(5));
+        let threads: Vec<_> = (1..=4)
+            .map(|id| {
+                let cache = Arc::clone(&cache);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    cache.resolve(
+                        (id, 0),
+                        || {
+                            entered.wait();
+                            release.wait();
+                            Ok(Arc::new(Object::Integer(i64::from(id))))
+                        },
+                        |_| 64,
+                    )
+                })
+            })
+            .collect();
+        entered.wait();
+        let (probation_entries, _, protected_entries, _) = cache.residency();
+        assert_eq!(probation_entries + protected_entries, 2);
+        assert_eq!(counters.object_peak_entries.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.object_bypasses.load(Ordering::Relaxed), 2);
+        release.wait();
+        for thread in threads {
+            assert!(thread.join().unwrap().is_ok());
+        }
+        assert_eq!(counters.object_loads.load(Ordering::Relaxed), 4);
     }
 
     #[test]

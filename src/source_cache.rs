@@ -40,6 +40,22 @@ impl IndexedReaderCacheOptions {
     pub(crate) const fn source_max_entries(&self) -> usize {
         self.max_entries / 4
     }
+
+    pub(crate) const fn object_max_bytes(&self) -> u64 {
+        self.max_bytes / 2
+    }
+
+    pub(crate) const fn object_max_entries(&self) -> usize {
+        self.max_entries / 2
+    }
+
+    pub(crate) const fn object_stream_max_bytes(&self) -> u64 {
+        self.max_bytes - self.source_max_bytes() - self.object_max_bytes()
+    }
+
+    pub(crate) const fn object_stream_max_entries(&self) -> usize {
+        self.max_entries - self.source_max_entries() - self.object_max_entries()
+    }
 }
 
 impl Default for IndexedReaderCacheOptions {
@@ -55,20 +71,6 @@ impl std::fmt::Debug for IndexedReaderCacheOptions {
             .field("max_bytes", &self.max_bytes)
             .field("max_entries", &self.max_entries)
             .finish()
-    }
-}
-
-/// Read-only counters for the indexed reader's bounded caches.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct IndexedReaderCacheStats {
-    source: IndexedReaderSourceCacheStats,
-}
-
-impl IndexedReaderCacheStats {
-    /// Counters for the aligned positional source-chunk cache.
-    pub const fn source(&self) -> &IndexedReaderSourceCacheStats {
-        &self.source
     }
 }
 
@@ -90,6 +92,7 @@ pub struct IndexedReaderSourceCacheStats {
     in_flight_bytes: u64,
     peak_retained_bytes: u64,
     peak_in_flight_bytes: u64,
+    peak_bytes: u64,
     retained_entries: usize,
     in_flight_entries: usize,
     peak_entries: usize,
@@ -118,6 +121,7 @@ impl IndexedReaderSourceCacheStats {
         in_flight_bytes: u64,
         peak_retained_bytes: u64,
         peak_in_flight_bytes: u64,
+        peak_bytes: u64,
         retained_entries: usize,
         in_flight_entries: usize,
         peak_entries: usize,
@@ -293,6 +297,7 @@ struct SourceCacheCounters {
     bypass_bytes: AtomicU64,
     peak_retained_bytes: AtomicU64,
     peak_in_flight_bytes: AtomicU64,
+    peak_bytes: AtomicU64,
     peak_entries: AtomicUsize,
 }
 
@@ -311,28 +316,27 @@ impl CachedSource {
         })
     }
 
-    pub(crate) fn stats(&self) -> IndexedReaderCacheStats {
+    pub(crate) fn stats(&self) -> IndexedReaderSourceCacheStats {
         let state = lock_unpoisoned(&self.cache);
-        IndexedReaderCacheStats {
-            source: IndexedReaderSourceCacheStats {
-                hits: self.stats.hits.load(Ordering::Relaxed),
-                misses: self.stats.misses.load(Ordering::Relaxed),
-                loads: self.stats.loads.load(Ordering::Relaxed),
-                duplicate_loads_avoided: self.stats.duplicate_loads_avoided.load(Ordering::Relaxed),
-                waits: self.stats.waits.load(Ordering::Relaxed),
-                evictions: self.stats.evictions.load(Ordering::Relaxed),
-                bypass_reads: self.stats.bypass_reads.load(Ordering::Relaxed),
-                logical_requested_bytes: self.stats.logical_requested_bytes.load(Ordering::Relaxed),
-                requested_bytes: self.stats.requested_bytes.load(Ordering::Relaxed),
-                bypass_bytes: self.stats.bypass_bytes.load(Ordering::Relaxed),
-                retained_bytes: state.retained_bytes,
-                in_flight_bytes: state.in_flight_bytes,
-                peak_retained_bytes: self.stats.peak_retained_bytes.load(Ordering::Relaxed),
-                peak_in_flight_bytes: self.stats.peak_in_flight_bytes.load(Ordering::Relaxed),
-                retained_entries: state.retained_entries,
-                in_flight_entries: state.in_flight_entries,
-                peak_entries: self.stats.peak_entries.load(Ordering::Relaxed),
-            },
+        IndexedReaderSourceCacheStats {
+            hits: self.stats.hits.load(Ordering::Relaxed),
+            misses: self.stats.misses.load(Ordering::Relaxed),
+            loads: self.stats.loads.load(Ordering::Relaxed),
+            duplicate_loads_avoided: self.stats.duplicate_loads_avoided.load(Ordering::Relaxed),
+            waits: self.stats.waits.load(Ordering::Relaxed),
+            evictions: self.stats.evictions.load(Ordering::Relaxed),
+            bypass_reads: self.stats.bypass_reads.load(Ordering::Relaxed),
+            logical_requested_bytes: self.stats.logical_requested_bytes.load(Ordering::Relaxed),
+            requested_bytes: self.stats.requested_bytes.load(Ordering::Relaxed),
+            bypass_bytes: self.stats.bypass_bytes.load(Ordering::Relaxed),
+            retained_bytes: state.retained_bytes,
+            in_flight_bytes: state.in_flight_bytes,
+            peak_retained_bytes: self.stats.peak_retained_bytes.load(Ordering::Relaxed),
+            peak_in_flight_bytes: self.stats.peak_in_flight_bytes.load(Ordering::Relaxed),
+            peak_bytes: self.stats.peak_bytes.load(Ordering::Relaxed),
+            retained_entries: state.retained_entries,
+            in_flight_entries: state.in_flight_entries,
+            peak_entries: self.stats.peak_entries.load(Ordering::Relaxed),
         }
     }
 
@@ -531,6 +535,10 @@ impl CachedSource {
         self.stats
             .peak_in_flight_bytes
             .fetch_max(cache.in_flight_bytes, Ordering::Relaxed);
+        self.stats.peak_bytes.fetch_max(
+            cache.retained_bytes.saturating_add(cache.in_flight_bytes),
+            Ordering::Relaxed,
+        );
         self.stats
             .peak_entries
             .fetch_max(cache.entries.len(), Ordering::Relaxed);
@@ -729,11 +737,11 @@ mod tests {
         }
         assert_eq!(source.reads.load(Ordering::SeqCst), 1);
         let stats = cached.stats();
-        assert_eq!(stats.source().loads(), 1);
-        assert_eq!(stats.source().hits(), 2);
-        assert_eq!(stats.source().retained_bytes(), SOURCE_CHUNK_BYTES);
-        assert!(stats.source().logical_requested_bytes() >= 3 * 512);
-        assert_eq!(stats.source().requested_bytes(), SOURCE_CHUNK_BYTES);
+        assert_eq!(stats.loads(), 1);
+        assert_eq!(stats.hits(), 2);
+        assert_eq!(stats.retained_bytes(), SOURCE_CHUNK_BYTES);
+        assert!(stats.logical_requested_bytes() >= 3 * 512);
+        assert_eq!(stats.requested_bytes(), SOURCE_CHUNK_BYTES);
     }
 
     #[test]
@@ -753,21 +761,21 @@ mod tests {
             threads.push(std::thread::spawn(move || cached.read_range(100, 512, 512).unwrap()));
         }
         for _ in 0..10_000 {
-            if cached.stats().source().waits() == 3 {
+            if cached.stats().waits() == 3 {
                 break;
             }
             std::thread::yield_now();
         }
-        assert_eq!(cached.stats().source().waits(), 3);
+        assert_eq!(cached.stats().waits(), 3);
         source.gate.wait();
         for thread in threads {
             assert_eq!(thread.join().unwrap(), source.bytes[100..612]);
         }
         assert_eq!(source.reads.load(Ordering::SeqCst), 1);
         let stats = cached.stats();
-        assert_eq!(stats.source().loads(), 1);
-        assert_eq!(stats.source().duplicate_loads_avoided(), 3);
-        assert_eq!(stats.source().waits(), 3);
+        assert_eq!(stats.loads(), 1);
+        assert_eq!(stats.duplicate_loads_avoided(), 3);
+        assert_eq!(stats.waits(), 3);
     }
 
     #[test]
@@ -793,12 +801,9 @@ mod tests {
             thread.join().unwrap();
         }
         let after = cached.stats();
-        assert_eq!(after.source().hits() - before.source().hits(), 4);
-        assert_eq!(after.source().waits(), before.source().waits());
-        assert_eq!(
-            after.source().duplicate_loads_avoided(),
-            before.source().duplicate_loads_avoided()
-        );
+        assert_eq!(after.hits() - before.hits(), 4);
+        assert_eq!(after.waits(), before.waits());
+        assert_eq!(after.duplicate_loads_avoided(), before.duplicate_loads_avoided());
     }
 
     #[test]
@@ -823,7 +828,7 @@ mod tests {
             assert_eq!(thread.join().unwrap(), source.bytes[start..start + 64]);
         }
         assert_eq!(source.reads.load(Ordering::SeqCst), 4);
-        assert_eq!(cached.stats().source().peak_in_flight_bytes(), 4 * SOURCE_CHUNK_BYTES);
+        assert_eq!(cached.stats().peak_in_flight_bytes(), 4 * SOURCE_CHUNK_BYTES);
     }
 
     #[test]
@@ -835,11 +840,11 @@ mod tests {
         cached.read_range(2 * SOURCE_CHUNK_BYTES + 9, 32, 32).unwrap();
         assert_eq!(&pinned[9..41], &bytes(1)[9..41]);
         let stats = cached.stats();
-        assert_eq!(stats.source().retained_entries(), 2);
-        assert_eq!(stats.source().retained_bytes(), 2 * SOURCE_CHUNK_BYTES);
-        assert_eq!(stats.source().evictions(), 1);
-        assert!(stats.source().peak_retained_bytes() <= 2 * SOURCE_CHUNK_BYTES);
-        assert!(stats.source().peak_entries() <= 2);
+        assert_eq!(stats.retained_entries(), 2);
+        assert_eq!(stats.retained_bytes(), 2 * SOURCE_CHUNK_BYTES);
+        assert_eq!(stats.evictions(), 1);
+        assert!(stats.peak_retained_bytes() <= 2 * SOURCE_CHUNK_BYTES);
+        assert!(stats.peak_entries() <= 2);
     }
 
     #[test]
@@ -852,10 +857,10 @@ mod tests {
         cached.read_exact_at(0, &mut output).unwrap();
         assert_eq!(output, data[..output.len()]);
         let stats = cached.stats();
-        assert_eq!(stats.source().retained_bytes(), 0);
-        assert_eq!(stats.source().retained_entries(), 0);
-        assert!(stats.source().bypass_reads() >= 2);
-        assert!(stats.source().bypass_bytes() > SOURCE_CHUNK_BYTES);
+        assert_eq!(stats.retained_bytes(), 0);
+        assert_eq!(stats.retained_entries(), 0);
+        assert!(stats.bypass_reads() >= 2);
+        assert!(stats.bypass_bytes() > SOURCE_CHUNK_BYTES);
     }
 
     struct FailOnceSource {
@@ -893,7 +898,7 @@ mod tests {
         assert_eq!(source.reads.load(Ordering::SeqCst), 1);
         assert_eq!(cached.read_range(0, 32, 32).unwrap(), source.bytes[..32]);
         assert_eq!(source.reads.load(Ordering::SeqCst), 2);
-        assert_eq!(cached.stats().source().loads(), 2);
+        assert_eq!(cached.stats().loads(), 2);
     }
 
     #[derive(Debug)]
@@ -963,12 +968,12 @@ mod tests {
             result
         });
         for _ in 0..10_000 {
-            if cached.stats().source().waits() == 1 {
+            if cached.stats().waits() == 1 {
                 break;
             }
             std::thread::yield_now();
         }
-        assert_eq!(cached.stats().source().waits(), 1);
+        assert_eq!(cached.stats().waits(), 1);
         assert_eq!(source.reads.load(Ordering::SeqCst), 1);
         assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
 
@@ -979,7 +984,7 @@ mod tests {
 
         assert_eq!(cached.read_range(0, 32, 32).unwrap(), source.bytes[..32]);
         assert_eq!(source.reads.load(Ordering::SeqCst), 2);
-        assert_eq!(cached.stats().source().loads(), 2);
+        assert_eq!(cached.stats().loads(), 2);
     }
 
     #[test]
@@ -1092,6 +1097,6 @@ mod tests {
             panic!("expected source change I/O error");
         };
         assert_eq!(error.to_string(), "source changed");
-        assert_eq!(cached.stats().source().hits(), 0);
+        assert_eq!(cached.stats().hits(), 0);
     }
 }
