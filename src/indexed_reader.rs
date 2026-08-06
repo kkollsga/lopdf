@@ -64,6 +64,9 @@ pub enum EncodedStreamProtection {
     DocumentEncrypted,
     /// The stream explicitly names the PDF `Crypt` filter.
     CryptFilter,
+    /// Filter metadata is malformed or could not be resolved within the
+    /// indexed reader's ordinary reference and resource limits.
+    UnresolvedFilter,
 }
 
 /// Structured failures while opening or reading encoded stream bytes.
@@ -100,7 +103,9 @@ pub enum IndexedStreamReadError {
 ///
 /// The descriptor never owns payload bytes and intentionally exposes neither
 /// the source offset nor encryption key material. It may be moved or shared
-/// across threads; each opened reader has an independent cursor.
+/// across threads; each opened reader has an independent cursor. Length checks
+/// cannot detect a same-length byte rewrite, so the source's immutable-byte
+/// contract remains required for the descriptor's entire lifetime.
 pub struct IndexedStreamDescriptor {
     id: crate::ObjectId,
     dictionary: Dictionary,
@@ -1526,6 +1531,7 @@ impl IndexedReader {
     /// Missing or malformed stream lengths and `endstream` framing follow the
     /// same degradation and resource-limit decisions as [`Self::resolve_object`].
     pub fn resolve_stream_descriptor(&self, id: crate::ObjectId) -> IndexedStreamReadResult<IndexedStreamDescriptor> {
+        self.ensure_stream_source_len()?;
         if matches!(
             self.index.locations.get(&id.0),
             Some(ObjectLocation64::Compressed { .. })
@@ -1533,8 +1539,12 @@ impl IndexedReader {
             return Err(IndexedStreamReadError::NotNormalObject { id });
         }
         let mut state = ResolutionState::default();
-        let (body_offset, source_len, parsed) = self.resolve_normal_framed(id)?;
-        let metadata = self.finish_stream_metadata(id, body_offset, source_len, parsed, &mut state)?;
+        let metadata = (|| {
+            let (body_offset, source_len, parsed) = self.resolve_normal_framed(id)?;
+            self.finish_stream_metadata(id, body_offset, source_len, parsed, &mut state)
+        })();
+        self.ensure_stream_source_len()?;
+        let metadata = metadata?;
         let (dictionary, encoded_start, encoded_len) = match metadata {
             FramedStreamMetadata::Span {
                 dictionary,
@@ -1547,16 +1557,100 @@ impl IndexedReader {
             } => (dictionary, encoded_start, 0),
             FramedStreamMetadata::Scalar(_) => return Err(IndexedStreamReadError::NotStream { id }),
         };
-        let protection = classify_encoded_stream_protection(&dictionary, self.index.encryption_state.is_some());
+        let protection = self.classify_encoded_stream_protection(&dictionary);
+        self.ensure_stream_source_len()?;
         Ok(IndexedStreamDescriptor {
             id,
             dictionary,
             encoded_len,
             protection,
             source: Arc::clone(&self.source),
-            source_len,
+            source_len: self.index.source_len,
             encoded_start,
         })
+    }
+
+    fn ensure_stream_source_len(&self) -> IndexedStreamReadResult<()> {
+        let actual = self.source.len()?;
+        if actual != self.index.source_len {
+            return Err(IndexedStreamReadError::SourceLengthChanged {
+                expected: self.index.source_len,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn classify_encoded_stream_protection(&self, dictionary: &Dictionary) -> EncodedStreamProtection {
+        if self.index.encryption_state.is_some() {
+            return EncodedStreamProtection::DocumentEncrypted;
+        }
+        let Ok(filter) = dictionary.get(b"Filter") else {
+            return EncodedStreamProtection::Plain;
+        };
+        let mut state = ResolutionState::default();
+        match self.classify_filter_value(filter.clone(), &mut state) {
+            Ok(FilterProtection::Plain) => EncodedStreamProtection::Plain,
+            Ok(FilterProtection::Crypt) => EncodedStreamProtection::CryptFilter,
+            Err(()) => EncodedStreamProtection::UnresolvedFilter,
+        }
+    }
+
+    fn classify_filter_value(
+        &self, filter: Object, state: &mut ResolutionState,
+    ) -> std::result::Result<FilterProtection, ()> {
+        let filter = self.resolve_filter_value(filter, state).map_err(|_| ())?;
+        match filter {
+            Object::Name(name) if name == b"Crypt" => Ok(FilterProtection::Crypt),
+            Object::Name(_) => Ok(FilterProtection::Plain),
+            Object::Array(filters) => {
+                let mut protection = FilterProtection::Plain;
+                for filter in filters {
+                    if self.classify_filter_value(filter, state)? == FilterProtection::Crypt {
+                        protection = FilterProtection::Crypt;
+                    }
+                }
+                Ok(protection)
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn resolve_filter_value(&self, object: Object, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
+        let Object::Reference(id) = object else {
+            return Ok(object);
+        };
+        if state.depth >= self.limits.max_length_depth {
+            return Err(IndexedReaderError::ResolutionDepthExceeded {
+                limit: self.limits.max_length_depth,
+            });
+        }
+        if !state.active.insert(id) {
+            return Err(IndexedReaderError::ResolutionCycle { id });
+        }
+        state.depth += 1;
+        let resolved = match self.index.locations.get(&id.0).cloned() {
+            Some(ObjectLocation64::Normal { .. }) => {
+                self.resolve_normal_framed(id).and_then(|(body_offset, _, parsed)| {
+                    if parsed.stream_prefix.is_some() {
+                        Err(IndexedReaderError::InvalidIndirectObject {
+                            id,
+                            offset: body_offset,
+                        })
+                    } else {
+                        Ok(parsed.object)
+                    }
+                })
+            }
+            Some(ObjectLocation64::Compressed { container, index }) => {
+                self.resolve_compressed(id, container, index, state)
+            }
+            Some(ObjectLocation64::Free { .. }) | None => Err(IndexedReaderError::MissingNormalObject { id }),
+        };
+        let resolved = resolved.and_then(|object| self.resolve_filter_value(object, state));
+        state.depth -= 1;
+        state.active.remove(&id);
+        resolved
     }
 
     /// Resolve one full object id into a shareable owned value.
@@ -2470,21 +2564,10 @@ enum FramedStreamMetadata {
     },
 }
 
-fn classify_encoded_stream_protection(dictionary: &Dictionary, document_encrypted: bool) -> EncodedStreamProtection {
-    let explicitly_crypt = dictionary.get(b"Filter").ok().is_some_and(|filter| {
-        filter.as_name().ok() == Some(b"Crypt")
-            || filter
-                .as_array()
-                .ok()
-                .is_some_and(|filters| filters.iter().any(|filter| filter.as_name().ok() == Some(b"Crypt")))
-    });
-    if explicitly_crypt {
-        EncodedStreamProtection::CryptFilter
-    } else if document_encrypted {
-        EncodedStreamProtection::DocumentEncrypted
-    } else {
-        EncodedStreamProtection::Plain
-    }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FilterProtection {
+    Plain,
+    Crypt,
 }
 
 impl PdfIndex {
@@ -6761,23 +6844,150 @@ mod tests {
             Err(IndexedStreamReadError::NotNormalObject { id: (10, 0) })
         ));
 
-        let crypt = object_pdf(&[ObjectDef {
-            id: 1,
-            object_generation: 0,
-            xref_generation: 0,
-            body: b"<< /Length 5 /Filter [/ASCIIHexDecode /Crypt] >>\nstream\nhello\nendstream",
-        }]);
-        let descriptor = open_reader(&crypt, ResolverLimits::default())
-            .resolve_stream_descriptor((1, 0))
-            .unwrap();
-        assert_eq!(descriptor.protection(), EncodedStreamProtection::CryptFilter);
-        assert!(matches!(
-            descriptor.open_plain_encoded(),
-            Err(IndexedStreamReadError::Protected {
-                protection: EncodedStreamProtection::CryptFilter,
-                ..
-            })
-        ));
+        let filters = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter 2 0 R >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"/Crypt",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter 4 0 R >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 4,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"[/FlateDecode 5 0 R]",
+            },
+            ObjectDef {
+                id: 5,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"/Crypt",
+            },
+            ObjectDef {
+                id: 6,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter [7 0 R /FlateDecode] >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 7,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"/ASCIIHexDecode",
+            },
+            ObjectDef {
+                id: 8,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter 99 0 R >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 9,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter 10 0 R >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 10,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"9 0 R",
+            },
+            ObjectDef {
+                id: 11,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter 12 1 R >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 12,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"/Crypt",
+            },
+            ObjectDef {
+                id: 13,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter 42 >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 14,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter /Crypt /DecodeParms << /Name /Identity >> >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 15,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter [16 0 R /FlateDecode] >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 16,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"/Crypt",
+            },
+            ObjectDef {
+                id: 17,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter [/FlateDecode 99 0 R] >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 18,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 5 /Filter 19 0 R >>\nstream\nhello\nendstream",
+            },
+            ObjectDef {
+                id: 19,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"[/FlateDecode /ASCIIHexDecode]",
+            },
+        ]);
+        let reader = open_reader(&filters, ResolverLimits::default());
+        for id in [1, 3, 14, 15] {
+            let descriptor = reader.resolve_stream_descriptor((id, 0)).unwrap();
+            assert_eq!(descriptor.protection(), EncodedStreamProtection::CryptFilter);
+            assert!(matches!(
+                descriptor.open_plain_encoded(),
+                Err(IndexedStreamReadError::Protected {
+                    protection: EncodedStreamProtection::CryptFilter,
+                    ..
+                })
+            ));
+        }
+        for id in [8, 9, 11, 13, 17] {
+            let descriptor = reader.resolve_stream_descriptor((id, 0)).unwrap();
+            assert_eq!(descriptor.protection(), EncodedStreamProtection::UnresolvedFilter);
+            assert!(matches!(
+                descriptor.open_plain_encoded(),
+                Err(IndexedStreamReadError::Protected {
+                    protection: EncodedStreamProtection::UnresolvedFilter,
+                    ..
+                })
+            ));
+        }
+        for id in [6, 18] {
+            let descriptor = reader.resolve_stream_descriptor((id, 0)).unwrap();
+            assert_eq!(descriptor.protection(), EncodedStreamProtection::Plain);
+            assert_eq!(read_all_encoded(&descriptor, 64 * 1_024), b"hello");
+        }
 
         for revision in 2..=6 {
             let pdf = encrypted_pdf(revision, "owner", "user");

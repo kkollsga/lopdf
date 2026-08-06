@@ -200,6 +200,14 @@ fn encoded_stream_reader_retries_partial_and_interrupted_reads_and_fails_closed(
         .unwrap()
         .content
         .clone();
+    source.requests.lock().unwrap().clear();
+    source.shortened_len.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        reader.resolve_stream_descriptor((1, 0)),
+        Err(IndexedStreamReadError::SourceLengthChanged { .. })
+    ));
+    assert!(source.requests.lock().unwrap().is_empty());
+    source.shortened_len.store(false, Ordering::SeqCst);
     let descriptor = reader.resolve_stream_descriptor((1, 0)).unwrap();
 
     source.requests.lock().unwrap().clear();
@@ -248,6 +256,14 @@ fn encoded_stream_reader_retries_partial_and_interrupted_reads_and_fails_closed(
         Err(IndexedStreamReadError::SourceLengthChanged { .. })
     ));
     assert_eq!(source.requests.lock().unwrap().len(), requests_before);
+
+    source.shortened_len.store(false, Ordering::SeqCst);
+    let mut stream = descriptor.open_plain_encoded().unwrap();
+    source.shortened_len.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        stream.read_chunk(&mut chunk),
+        Err(IndexedStreamReadError::SourceLengthChanged { .. })
+    ));
 }
 
 #[test]
