@@ -3886,15 +3886,23 @@ impl DirectObjectFramer {
         };
     }
 
-    fn fallback_two_integers(&mut self, scalar_completion: usize, second_completion: usize) {
+    fn fallback_two_integers(&mut self, second_token_start: usize, second_completion: usize) {
+        let probe_position = self.position;
         let top_level = self.container_depth == 0;
-        self.position = scalar_completion;
+        self.position = second_token_start;
         self.finish_value(false);
         if top_level || self.status != FrameStatus::NeedMore {
             return;
         }
-        self.position = second_completion;
-        self.finish_value(false);
+        // The failed `n n R` probe only proves the first integer is scalar.
+        // Keep the already-scanned second integer as a possible object number
+        // so it can begin a following reference such as `255 34473 0 R`.
+        // Resuming at the probe boundary avoids replaying the token, comments,
+        // or whitespace.
+        self.position = probe_position;
+        self.lex = FrameLex::ReferenceGap {
+            scalar_completion: second_completion,
+        };
     }
 
     fn advance_literal(&mut self, input: &[u8], mut depth: usize, escaped: bool) {
@@ -7011,6 +7019,40 @@ mod tests {
     }
 
     #[test]
+    fn scalar_before_reference_in_array_matches_eager_nasa_shape() {
+        let pdf = object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"[/Indexed 2 0 R 255 3 0 R]",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"/DeviceRGB",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Length 0 >>\nstream\n\nendstream",
+            },
+        ]);
+        let eager = Document::load_mem(&pdf).unwrap();
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        assert_eq!(
+            reader.resolve_object((1, 0)).unwrap(),
+            eager.get_object((1, 0)).unwrap().clone()
+        );
+        assert!(matches!(
+            reader.resolve_stream_descriptor((1, 0)),
+            Err(IndexedStreamReadError::NotStream { id: (1, 0) })
+        ));
+    }
+
+    #[test]
     fn direct_indirect_and_nested_lengths_read_exact_owned_content() {
         let pdf = object_pdf(&[
             ObjectDef {
@@ -8627,6 +8669,7 @@ mod tests {
     fn direct_object_framer_covers_every_object_kind_at_every_split_point() {
         let samples = [
             b"[true false null 1 -2 +3 1. .5 7 0 R /A#20B (x \\) y) <abc> << /K /V >>]\nendobj".as_slice(),
+            b"[/Indexed 34471 0 R 255 34473 0 R]\rendobj".as_slice(),
             b"/Name#20with#23escapes\nendobj".as_slice(),
             b"(literal (nested) \\) text)\nendobj".as_slice(),
             b"<0a B>\nendobj".as_slice(),
