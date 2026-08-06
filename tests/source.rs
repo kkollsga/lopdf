@@ -210,21 +210,14 @@ mod file {
     }
 
     #[test]
-    fn truncation_after_open_reports_structured_unexpected_eof() {
+    fn truncation_after_open_reports_source_changed() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"abcdef").unwrap();
         file.flush().unwrap();
         let source = FileSource::from_file(file.try_clone().unwrap()).unwrap();
 
         file.set_len(2).unwrap();
-        assert!(matches!(
-            source.read_range(0, 6, 6),
-            Err(SourceError::UnexpectedEof {
-                offset: 0,
-                expected: 6,
-                actual: 2
-            })
-        ));
+        assert!(matches!(source.read_range(0, 6, 6), Err(SourceError::SourceChanged)));
     }
 
     #[test]

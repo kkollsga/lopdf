@@ -200,6 +200,7 @@ enum SharedSourceError {
         kind: std::io::ErrorKind,
         message: Arc<str>,
     },
+    SourceChanged,
 }
 
 impl From<&SourceError> for SharedSourceError {
@@ -244,6 +245,7 @@ impl From<&SourceError> for SharedSourceError {
                 kind: error.kind(),
                 message: Arc::from(error.to_string()),
             },
+            SourceError::SourceChanged => Self::SourceChanged,
         }
     }
 }
@@ -279,6 +281,7 @@ impl From<SharedSourceError> for SourceError {
                 Self::InvalidReadCount { returned, buffer_len }
             }
             SharedSourceError::Io { kind, message } => Self::Io(std::io::Error::new(kind, message.to_string())),
+            SharedSourceError::SourceChanged => Self::SourceChanged,
         }
     }
 }
@@ -394,7 +397,13 @@ impl CachedSource {
                     self.record_peaks(&cache);
                     drop(cache);
 
-                    let result = self.load_chunk(chunk_offset, chunk_len);
+                    let result = self.load_chunk(chunk_offset, chunk_len).and_then(|bytes| {
+                        // Keep metadata I/O outside the cache mutex: unrelated
+                        // hot hits and chunk publications must not serialize
+                        // behind a filesystem call.
+                        self.source.validate_unchanged()?;
+                        Ok(bytes)
+                    });
                     let shared_error = result.as_ref().err().map(SharedSourceError::from);
                     let mut cache = lock_unpoisoned(&self.cache);
                     cache.in_flight_bytes -= chunk_len;
@@ -583,6 +592,19 @@ impl RandomAccessSource for CachedSource {
     }
 
     fn read_at(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+        // Hot chunks are memory-only and deliberately issue no metadata
+        // syscall. Source stability is the public precondition; physical reads
+        // and cache publication provide best-effort mutation observability.
+        self.read_at_checked(offset, output)
+    }
+
+    fn validate_unchanged(&self) -> SourceResult<()> {
+        self.source.validate_unchanged()
+    }
+}
+
+impl CachedSource {
+    fn read_at_checked(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
         let requested = u64::try_from(output.len()).map_err(|_| SourceError::RangeOverflow {
             offset,
             length: u64::MAX,
@@ -729,6 +751,52 @@ mod tests {
             output[..read].copy_from_slice(&self.bytes[start..start + read]);
             Ok(read)
         }
+    }
+
+    struct ValidationCountingSource {
+        bytes: Arc<[u8]>,
+        reads: AtomicUsize,
+        validations: AtomicUsize,
+    }
+
+    impl RandomAccessSource for ValidationCountingSource {
+        fn len(&self) -> SourceResult<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let start = offset as usize;
+            let read = output.len().min(self.bytes.len().saturating_sub(start));
+            output[..read].copy_from_slice(&self.bytes[start..start + read]);
+            Ok(read)
+        }
+
+        fn validate_unchanged(&self) -> SourceResult<()> {
+            self.validations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cache_validates_once_before_cold_publication_and_never_on_hot_hits() {
+        let source = Arc::new(ValidationCountingSource {
+            bytes: bytes(1),
+            reads: AtomicUsize::new(0),
+            validations: AtomicUsize::new(0),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let cached = CachedSource::new(erased, IndexedReaderCacheOptions::new(4 * SOURCE_CHUNK_BYTES, 4)).unwrap();
+        let mut output = [0; 32];
+
+        cached.read_exact_at(0, &mut output).unwrap();
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(source.validations.load(Ordering::SeqCst), 1);
+        for _ in 0..100 {
+            cached.read_exact_at(0, &mut output).unwrap();
+        }
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(source.validations.load(Ordering::SeqCst), 1);
     }
 
     struct RequestRecordingSource {

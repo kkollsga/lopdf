@@ -30,7 +30,7 @@ pub struct ObjectStream {
 /// Invalid unrelated header pairs remain represented instead of rejecting the
 /// complete stream, preserving the selected-member parser's permissive policy.
 pub(crate) struct SelectedObjectStream {
-    decoded: Arc<[u8]>,
+    decoded: Arc<Vec<u8>>,
     first: usize,
     pairs: Vec<(Option<u32>, Option<u32>)>,
 }
@@ -487,14 +487,14 @@ impl SelectedObjectStream {
     fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<Self> {
         // Keep decompression call-local. A batch therefore retains at most the
         // decoded containers it is actively resolving, never a source-wide map.
-        let decoded: Arc<[u8]> = if stream.is_compressed() {
+        let decoded = if stream.is_compressed() {
             match max_decompressed_size {
-                Some(max) => Arc::from(stream.decompressed_content_with_limit(max)?),
+                Some(max) => stream.decompressed_content_with_limit(max)?,
                 // Preserve the eager unbounded constructor's fallback to the
                 // original bytes when a filter cannot be decoded.
                 None => match stream.decompressed_content() {
-                    Ok(decoded) => Arc::from(decoded),
-                    Err(_) => Arc::from(stream.content.as_slice()),
+                    Ok(decoded) => decoded,
+                    Err(_) => stream.content.clone(),
                 },
             }
         } else {
@@ -503,21 +503,51 @@ impl SelectedObjectStream {
             {
                 return Err(DecompressError::MemoryLimitExceeded { limit: max }.into());
             }
-            Arc::from(stream.content.as_slice())
+            stream.content.clone()
         };
 
+        Self::from_decoded(stream, decoded)
+    }
+
+    pub(crate) fn index_pair_count_with_first(first: usize, decoded: &[u8]) -> Result<usize> {
         if decoded.is_empty() {
             return Err(Error::InvalidObjectStream(
                 "selected object stream member is not present".to_string(),
             ));
         }
+        let index_block = decoded.get(..first).ok_or(Error::InvalidOffset(first))?;
+        let index_text =
+            std::str::from_utf8(index_block).map_err(|error| Error::InvalidObjectStream(error.to_string()))?;
+        let token_limit = MAX_SELECTED_OBJECT_STREAM_MEMBERS
+            .checked_add(1)
+            .and_then(|pairs| pairs.checked_mul(2))
+            .ok_or_else(|| Error::InvalidObjectStream("selected-parser member limit overflow".to_string()))?;
+        let number_count = index_text.split_whitespace().take(token_limit).count();
+        if number_count == token_limit {
+            return Err(Error::InvalidObjectStream(format!(
+                "parsed member count exceeds selected-parser limit {MAX_SELECTED_OBJECT_STREAM_MEMBERS}"
+            )));
+        }
+        Ok(number_count / 2)
+    }
 
+    pub(crate) fn from_decoded(stream: &Stream, decoded: Vec<u8>) -> Result<Self> {
         let first = stream
             .dict
             .get(b"First")
             .and_then(Object::as_i64)?
             .try_into()
             .map_err(|error: TryFromIntError| Error::NumericCast(error.to_string()))?;
+        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
+        Self::from_decoded_parts(first, n, decoded)
+    }
+
+    pub(crate) fn from_decoded_parts(first: usize, n: i64, decoded: Vec<u8>) -> Result<Self> {
+        if decoded.is_empty() {
+            return Err(Error::InvalidObjectStream(
+                "selected object stream member is not present".to_string(),
+            ));
+        }
         let index_block = decoded.get(..first).ok_or(Error::InvalidOffset(first))?;
         let index_text =
             std::str::from_utf8(index_block).map_err(|error| Error::InvalidObjectStream(error.to_string()))?;
@@ -532,7 +562,6 @@ impl SelectedObjectStream {
             )));
         }
 
-        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
         let member_limit = i64::try_from(MAX_SELECTED_OBJECT_STREAM_MEMBERS)
             .map_err(|error: TryFromIntError| Error::NumericCast(error.to_string()))?;
         if n > member_limit {
@@ -555,18 +584,22 @@ impl SelectedObjectStream {
                 tokens.next().and_then(|token| u32::from_str(token).ok()),
             ));
         }
-        Ok(Self { decoded, first, pairs })
+        Ok(Self {
+            decoded: Arc::new(decoded),
+            first,
+            pairs,
+        })
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.decoded.len().saturating_add(
+        self.decoded.capacity().saturating_add(
             self.pairs
-                .len()
+                .capacity()
                 .saturating_mul(std::mem::size_of::<(Option<u32>, Option<u32>)>()),
         )
     }
 
-    pub(crate) fn parse_member(&self, expected_id: ObjectId, member_index: u32) -> Result<Object> {
+    pub(crate) fn member_slice(&self, expected_id: ObjectId, member_index: u32) -> Result<&[u8]> {
         if expected_id.1 != 0 {
             return Err(Error::InvalidObjectStream(
                 "compressed objects must have generation zero".to_string(),
@@ -611,7 +644,12 @@ impl SelectedObjectStream {
 
         // Do not bound parsing at the next declared offset: the existing eager
         // prefix policy accepts the first complete direct object from this tail.
-        parser::direct_object(&self.decoded[start..]).ok_or_else(|| {
+        Ok(&self.decoded[start..])
+    }
+
+    pub(crate) fn parse_member(&self, expected_id: ObjectId, member_index: u32) -> Result<Object> {
+        let member = self.member_slice(expected_id, member_index)?;
+        parser::direct_object(member).ok_or_else(|| {
             Error::InvalidObjectStream("selected object stream member is truncated or invalid".to_string())
         })
     }
@@ -1022,5 +1060,22 @@ mod selected_member_tests {
             ObjectStream::parse_selected_member_with_limit(&stream, (1, 0), 0, Some(LIMIT)),
             Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit: LIMIT }))
         ));
+    }
+
+    #[test]
+    fn selected_retained_bytes_accounts_allocator_capacities() {
+        let mut decoded = Vec::with_capacity(256);
+        decoded.extend_from_slice(b"1 0 42");
+        let mut pairs = Vec::with_capacity(64);
+        pairs.push((Some(1), Some(0)));
+        let selected = SelectedObjectStream {
+            decoded: Arc::new(decoded),
+            first: 4,
+            pairs,
+        };
+        assert_eq!(
+            selected.retained_bytes(),
+            256 + 64 * std::mem::size_of::<(Option<u32>, Option<u32>)>()
+        );
     }
 }

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
@@ -40,6 +41,9 @@ const DEFAULT_PAGE_COUNT_LIMIT: usize = 1_000_000;
 const ENCODED_STREAM_CHUNK_LIMIT: usize = 64 * 1_024;
 const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
 const SHARED_OBJECT_PROTECTED_PERCENT: usize = 75;
+// Conservative envelope for the map node, queue key, Arc allocation/header,
+// mutex/condvar cell, and allocator slack of one retained ObjStm entry.
+const OBJECT_STREAM_CACHE_ENTRY_BYTES: usize = 512;
 
 /// Result returned by the indexed random-access reader.
 pub type IndexedReaderResult<T> = std::result::Result<T, IndexedReaderError>;
@@ -591,6 +595,8 @@ pub enum IndexedReaderError {
         #[source]
         source: crate::Error,
     },
+    #[error("decoded object-stream container {container:?} must use call-local bounded storage")]
+    ObjectStreamCacheBypass { container: crate::ObjectId },
     #[error("encrypted PDF requires a password")]
     PasswordRequired,
     #[error("invalid password for encrypted PDF")]
@@ -821,13 +827,34 @@ enum PreparedObjectStream {
     NotStream,
 }
 
+enum BoundedPreparedObjectStream {
+    Cached(Arc<PreparedObjectStream>),
+    CallLocal {
+        prepared: Arc<PreparedObjectStream>,
+        _charges: Vec<ScalarCharge>,
+    },
+}
+
+impl BoundedPreparedObjectStream {
+    fn prepared(&self) -> &PreparedObjectStream {
+        match self {
+            Self::Cached(prepared) => prepared,
+            Self::CallLocal { prepared, .. } => prepared,
+        }
+    }
+}
+
 impl PreparedObjectStream {
     fn retained_bytes(&self) -> usize {
         match self {
             Self::Selected(selected) => selected.retained_bytes(),
-            Self::Raw(stream) => stream.content.len().saturating_add(std::mem::size_of::<Stream>()),
+            Self::Raw(stream) => stream.content.capacity().saturating_add(std::mem::size_of::<Stream>()),
             Self::NotStream => std::mem::size_of::<Self>(),
         }
+    }
+
+    fn cache_weight(&self) -> usize {
+        self.retained_bytes().saturating_add(OBJECT_STREAM_CACHE_ENTRY_BYTES)
     }
 }
 
@@ -917,9 +944,21 @@ impl<T> SharedCache<T> {
             .err()
             .is_some_and(|error| is_transient_error(error.as_ref()));
         let retained_bytes = result.as_ref().ok().map_or(0, |value| weight(value.as_ref()));
-        let bypass = retained_bytes > self.max_entry_bytes || retained_bytes > self.max_bytes;
+        let mut bypass = retained_bytes > self.max_entry_bytes || retained_bytes > self.max_bytes;
         let mut inner = self.inner.lock().unwrap();
         inner.loading_entries = inner.loading_entries.saturating_sub(1);
+        while !transient
+            && !bypass
+            && inner
+                .probation_bytes
+                .saturating_add(inner.protected_bytes)
+                .saturating_add(retained_bytes)
+                > self.max_bytes
+        {
+            if !self.evict_one_ready(&mut inner) {
+                bypass = true;
+            }
+        }
         if transient || bypass {
             if transient {
                 atomic_saturating_increment(match self.kind {
@@ -1024,7 +1063,7 @@ impl<T> SharedCache<T> {
             let Some(entry) = inner.entries.get(&id) else {
                 continue;
             };
-            if matches!(*entry.cell.state.lock().unwrap(), SharedCellState::Loading) {
+            if !Self::entry_is_evictable(entry) {
                 match entry.segment {
                     CacheSegment::Probation => inner.probation.push_back(id),
                     CacheSegment::Protected => inner.protected.push_back(id),
@@ -1035,9 +1074,6 @@ impl<T> SharedCache<T> {
                 }
                 continue;
             }
-            // Completed cells are safe to unlink even while callers retain
-            // their cell or result Arcs. Only Loading cells must stay mapped
-            // so a second leader cannot start for the same id.
             self.remove_entry(inner, id, true);
             pinned = 0;
         }
@@ -1052,7 +1088,7 @@ impl<T> SharedCache<T> {
             let Some(entry) = inner.entries.get(&id) else {
                 continue;
             };
-            if matches!(*entry.cell.state.lock().unwrap(), SharedCellState::Loading) {
+            if !Self::entry_is_evictable(entry) {
                 match entry.segment {
                     CacheSegment::Probation => inner.probation.push_back(id),
                     CacheSegment::Protected => inner.protected.push_back(id),
@@ -1063,6 +1099,14 @@ impl<T> SharedCache<T> {
             return true;
         }
         false
+    }
+
+    fn entry_is_evictable(entry: &CacheEntry<T>) -> bool {
+        match &*entry.cell.state.lock().unwrap() {
+            SharedCellState::Loading => false,
+            SharedCellState::Ready(Ok(value)) => Arc::strong_count(value) == 1,
+            SharedCellState::Ready(Err(_)) => true,
+        }
     }
 
     fn remove_if_same(
@@ -1160,6 +1204,202 @@ impl<T> SharedCache<T> {
     }
 }
 
+impl SharedCache<PreparedObjectStream> {
+    fn resolve_bounded<F>(
+        &self, container_id: crate::ObjectId, member_id: crate::ObjectId, member_index: u32,
+        permit: &ScalarResolutionPermit, load: F,
+    ) -> IndexedReaderResult<BoundedPreparedObjectStream>
+    where
+        F: FnOnce() -> IndexedReaderResult<(PreparedObjectStream, Vec<ScalarCharge>)>,
+    {
+        let mut load = Some(load);
+        loop {
+            let (cell, leader) = {
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(entry) = inner.entries.get(&container_id) {
+                    let cell = Arc::clone(&entry.cell);
+                    self.record_hit();
+                    self.touch(&mut inner, container_id);
+                    (cell, false)
+                } else {
+                    self.record_miss();
+                    while inner.entries.len() >= self.max_entries
+                        && inner.loading_entries < inner.entries.len()
+                        && self.evict_one_ready(&mut inner)
+                    {}
+                    if inner.entries.len() >= self.max_entries {
+                        self.record_bypass();
+                        self.record_load();
+                        drop(inner);
+                        let loaded = load.take().expect("bounded loader runs once")()?;
+                        if permit.stats().cancelled {
+                            drop(loaded);
+                            return Err(IndexedReaderError::ScalarResolutionCancelled {
+                                id: container_id,
+                                phase: "object-stream-bypass-publish",
+                            });
+                        }
+                        return Ok(BoundedPreparedObjectStream::CallLocal {
+                            prepared: Arc::new(loaded.0),
+                            _charges: loaded.1,
+                        });
+                    }
+                    let cell = Arc::new(SharedCell::loading());
+                    inner.probation.push_back(container_id);
+                    inner.entries.insert(
+                        container_id,
+                        CacheEntry {
+                            cell: Arc::clone(&cell),
+                            segment: CacheSegment::Probation,
+                            bytes: 0,
+                        },
+                    );
+                    inner.loading_entries = inner.loading_entries.saturating_add(1);
+                    self.record_residency_peaks(&inner);
+                    (cell, true)
+                }
+            };
+
+            if !leader {
+                let mut state = cell.state.lock().unwrap();
+                if matches!(*state, SharedCellState::Loading) {
+                    self.record_wait();
+                }
+                while matches!(*state, SharedCellState::Loading) {
+                    if permit.stats().cancelled {
+                        return Err(IndexedReaderError::ScalarResolutionCancelled {
+                            id: container_id,
+                            phase: "object-stream-cache-wait",
+                        });
+                    }
+                    state = cell.ready.wait_timeout(state, Duration::from_millis(10)).unwrap().0;
+                }
+                let SharedCellState::Ready(result) = &*state else {
+                    unreachable!();
+                };
+                match result {
+                    Ok(prepared) => return Ok(BoundedPreparedObjectStream::Cached(Arc::clone(prepared))),
+                    Err(error) if !permit.stats().cancelled => {
+                        if let Some(error) = rewrap_cacheable_bounded_error(error, member_id, member_index) {
+                            atomic_saturating_increment(&self.counters.negative_hits);
+                            return Err(error);
+                        }
+                        drop(state);
+                        let mut inner = self.inner.lock().unwrap();
+                        self.remove_if_same(&mut inner, container_id, &cell, false);
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err(IndexedReaderError::ScalarResolutionCancelled {
+                            id: container_id,
+                            phase: "object-stream-cache-wait",
+                        });
+                    }
+                }
+            }
+
+            self.record_load();
+            let loaded = load.take().expect("bounded loader runs once")();
+            let cancelled = permit.stats().cancelled;
+            let mut inner = self.inner.lock().unwrap();
+            inner.loading_entries = inner.loading_entries.saturating_sub(1);
+
+            match loaded {
+                Err(error) => {
+                    if is_transient_error(&error) {
+                        atomic_saturating_increment(&self.counters.objstm_transient_failures);
+                    }
+                    if let Some(shared) = neutralize_cacheable_bounded_error(&error) {
+                        let mut state = cell.state.lock().unwrap();
+                        *state = SharedCellState::Ready(Err(Arc::new(shared)));
+                        cell.ready.notify_all();
+                    } else {
+                        self.remove_if_same(&mut inner, container_id, &cell, false);
+                        let mut state = cell.state.lock().unwrap();
+                        *state = SharedCellState::Ready(Err(Arc::new(IndexedReaderError::ObjectStreamCacheBypass {
+                            container: container_id,
+                        })));
+                        cell.ready.notify_all();
+                    }
+                    return Err(error);
+                }
+                Ok((prepared, charges)) if cancelled => {
+                    drop(charges);
+                    drop(prepared);
+                    let error = IndexedReaderError::ScalarResolutionCancelled {
+                        id: container_id,
+                        phase: "object-stream-cache-publish",
+                    };
+                    self.remove_if_same(&mut inner, container_id, &cell, false);
+                    let mut state = cell.state.lock().unwrap();
+                    *state = SharedCellState::Ready(Err(Arc::new(IndexedReaderError::ObjectStreamCacheBypass {
+                        container: container_id,
+                    })));
+                    cell.ready.notify_all();
+                    return Err(error);
+                }
+                Ok((prepared, charges)) => {
+                    let prepared = Arc::new(prepared);
+                    let retained_bytes = prepared.cache_weight();
+                    let mut cacheable = retained_bytes <= self.max_entry_bytes && retained_bytes <= self.max_bytes;
+                    while cacheable
+                        && inner
+                            .probation_bytes
+                            .saturating_add(inner.protected_bytes)
+                            .saturating_add(retained_bytes)
+                            > self.max_bytes
+                    {
+                        if !self.evict_one_ready(&mut inner) {
+                            cacheable = false;
+                        }
+                    }
+
+                    if cacheable {
+                        if let Some(entry) = inner.entries.get_mut(&container_id)
+                            && Arc::ptr_eq(&entry.cell, &cell)
+                        {
+                            entry.bytes = retained_bytes;
+                            match entry.segment {
+                                CacheSegment::Probation => {
+                                    inner.probation_bytes = inner.probation_bytes.saturating_add(retained_bytes);
+                                }
+                                CacheSegment::Protected => {
+                                    inner.protected_bytes = inner.protected_bytes.saturating_add(retained_bytes);
+                                }
+                            }
+                        }
+                        self.record_residency_peaks(&inner);
+                        let mut state = cell.state.lock().unwrap();
+                        *state = SharedCellState::Ready(Ok(Arc::clone(&prepared)));
+                        cell.ready.notify_all();
+                        drop(state);
+                        drop(inner);
+                        // The reader cache's pre-reserved B budget owns this
+                        // allocation after publication; release call-local O.
+                        drop(charges);
+                        return Ok(BoundedPreparedObjectStream::Cached(prepared));
+                    }
+
+                    self.record_bypass();
+                    self.remove_if_same(&mut inner, container_id, &cell, false);
+                    let bypass_signal = Arc::new(IndexedReaderError::ObjectStreamCacheBypass {
+                        container: container_id,
+                    });
+                    let mut state = cell.state.lock().unwrap();
+                    *state = SharedCellState::Ready(Err(bypass_signal));
+                    cell.ready.notify_all();
+                    drop(state);
+                    drop(inner);
+                    return Ok(BoundedPreparedObjectStream::CallLocal {
+                        prepared,
+                        _charges: charges,
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn atomic_saturating_increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
@@ -1182,10 +1422,101 @@ fn remove_key(queue: &mut VecDeque<crate::ObjectId>, id: crate::ObjectId) {
 
 fn is_transient_error(error: &IndexedReaderError) -> bool {
     match error {
+        IndexedReaderError::Source(SourceError::SourceChanged) => false,
         IndexedReaderError::Source(_) => true,
         IndexedReaderError::ObjectStreamMember { source, .. }
         | IndexedReaderError::ObjectStreamBatchSetup { source, .. } => matches!(source, crate::Error::IO(_)),
         _ => false,
+    }
+}
+
+fn clone_stable_object_stream_error(error: &crate::Error) -> Option<crate::Error> {
+    match error {
+        crate::Error::InvalidObjectStream(message) => Some(crate::Error::InvalidObjectStream(message.clone())),
+        crate::Error::InvalidStream(message) => Some(crate::Error::InvalidStream(message.clone())),
+        crate::Error::Decompress(crate::DecompressError::Ascii85(message)) => {
+            Some(crate::Error::Decompress(crate::DecompressError::Ascii85(message)))
+        }
+        crate::Error::Decompress(crate::DecompressError::AsciiHex(message)) => {
+            Some(crate::Error::Decompress(crate::DecompressError::AsciiHex(message)))
+        }
+        crate::Error::Decompress(crate::DecompressError::Predictor(message)) => {
+            Some(crate::Error::Decompress(crate::DecompressError::Predictor(message)))
+        }
+        // MemoryLimitExceeded is permit-dependent and must never poison a
+        // container-keyed negative cache.
+        _ => None,
+    }
+}
+
+/// Convert member-attributed failures to a container-neutral fingerprint before
+/// publishing them under the container cache key.  A racing leader must not
+/// decide which requested member future callers see in their error. This is an
+/// explicit safe whitelist: permit-dependent limits, cancellation, resource
+/// admission, I/O, and generic fallbacks are never retained.
+fn neutralize_cacheable_bounded_error(error: &IndexedReaderError) -> Option<IndexedReaderError> {
+    match error {
+        IndexedReaderError::ObjectStreamMember { container, source, .. } => {
+            Some(IndexedReaderError::ObjectStreamBatchSetup {
+                container: *container,
+                source: clone_stable_object_stream_error(source)?,
+            })
+        }
+        IndexedReaderError::ObjectStreamBatchSetup { container, source } => {
+            Some(IndexedReaderError::ObjectStreamBatchSetup {
+                container: *container,
+                source: clone_stable_object_stream_error(source)?,
+            })
+        }
+        IndexedReaderError::ObjectStreamContainerNotStream { container, .. } => {
+            Some(IndexedReaderError::ObjectStreamContainerNotStream {
+                id: *container,
+                container: *container,
+            })
+        }
+        IndexedReaderError::UnsupportedBoundedScalar { reason, .. }
+            if matches!(
+                *reason,
+                "object-stream filter chains or predictors outside plain/FlateDecode"
+                    | "object streams without a bounded nonnegative /Length"
+            ) =>
+        {
+            Some(IndexedReaderError::UnsupportedBoundedScalar { id: (0, 0), reason })
+        }
+        IndexedReaderError::Source(SourceError::SourceChanged) => {
+            Some(IndexedReaderError::Source(SourceError::SourceChanged))
+        }
+        _ => None,
+    }
+}
+
+/// Reapply the current request's member identity to a container-neutral
+/// negative-cache fingerprint.
+fn rewrap_cacheable_bounded_error(
+    error: &IndexedReaderError, member_id: crate::ObjectId, member_index: u32,
+) -> Option<IndexedReaderError> {
+    match error {
+        IndexedReaderError::ObjectStreamBatchSetup { container, source } => {
+            Some(IndexedReaderError::ObjectStreamMember {
+                id: member_id,
+                container: *container,
+                index: member_index,
+                source: clone_stable_object_stream_error(source)?,
+            })
+        }
+        IndexedReaderError::ObjectStreamContainerNotStream { container, .. } => {
+            Some(IndexedReaderError::ObjectStreamContainerNotStream {
+                id: member_id,
+                container: *container,
+            })
+        }
+        IndexedReaderError::UnsupportedBoundedScalar { reason, .. } => {
+            Some(IndexedReaderError::UnsupportedBoundedScalar { id: member_id, reason })
+        }
+        IndexedReaderError::Source(SourceError::SourceChanged) => {
+            Some(IndexedReaderError::Source(SourceError::SourceChanged))
+        }
+        _ => None,
     }
 }
 
@@ -1262,50 +1593,6 @@ fn scalar_dictionary_heap_bytes(dictionary: &Dictionary) -> usize {
             .saturating_add(128)
             .saturating_add(scalar_object_heap_bytes(value))
     })
-}
-
-fn selected_object_stream_member(
-    decoded: &[u8], first: usize, declared_members: usize, expected_id: crate::ObjectId, member_index: u32,
-) -> crate::Result<&[u8]> {
-    let dictionary_error = || crate::Error::InvalidObjectStream("invalid selected object stream header".into());
-    if expected_id.1 != 0 {
-        return Err(crate::Error::InvalidObjectStream(
-            "compressed objects must have generation zero".into(),
-        ));
-    }
-    let header = decoded.get(..first).ok_or_else(dictionary_error)?;
-    let text = std::str::from_utf8(header).map_err(|_| dictionary_error())?;
-    let selected_index = usize::try_from(member_index).map_err(|_| dictionary_error())?;
-    if selected_index >= declared_members {
-        return Err(dictionary_error());
-    }
-    let mut tokens = text.split_whitespace();
-    let object_number = tokens
-        .nth(selected_index.saturating_mul(2))
-        .and_then(|token| token.parse::<u32>().ok())
-        .ok_or_else(dictionary_error)?;
-    let relative_offset = tokens
-        .next()
-        .and_then(|token| token.parse::<usize>().ok())
-        .ok_or_else(dictionary_error)?;
-    if object_number != expected_id.0 {
-        return Err(crate::Error::InvalidObjectStream(format!(
-            "member index {member_index} declares object {object_number}, not {}",
-            expected_id.0
-        )));
-    }
-    let start = first.checked_add(relative_offset).ok_or_else(dictionary_error)?;
-    let next = text
-        .split_whitespace()
-        .skip(1)
-        .step_by(2)
-        .filter_map(|token| token.parse::<usize>().ok())
-        .filter(|offset| *offset > relative_offset)
-        .min()
-        .and_then(|offset| first.checked_add(offset))
-        .unwrap_or(decoded.len())
-        .min(decoded.len());
-    decoded.get(start..next).ok_or_else(dictionary_error)
 }
 
 /// Immutable indexed reader over a cursor-free random-access source.
@@ -2057,6 +2344,82 @@ impl IndexedReader {
             return Err(IndexedReaderError::GenerationMismatch { id, indexed: 0 });
         }
         let container_id = (container, 0);
+        let prepared = if let Some(cache) = self.object_stream_cache.as_ref() {
+            cache.resolve_bounded(container_id, id, index, permit, || {
+                self.prepare_compressed_object_stream_limited(id, container, index, permit)
+            })?
+        } else {
+            let (prepared, charges) = self.prepare_compressed_object_stream_limited(id, container, index, permit)?;
+            BoundedPreparedObjectStream::CallLocal {
+                prepared: Arc::new(prepared),
+                _charges: charges,
+            }
+        };
+
+        let selected = match prepared.prepared() {
+            PreparedObjectStream::Selected(selected) => selected,
+            PreparedObjectStream::Raw(_) => {
+                return Err(IndexedReaderError::UnsupportedBoundedScalar {
+                    id,
+                    reason: "an object-stream cache entry without a selected-member index",
+                });
+            }
+            PreparedObjectStream::NotStream => {
+                return Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                    id,
+                    container: container_id,
+                });
+            }
+        };
+        let member = selected
+            .member_slice(id, index)
+            .map_err(|source| IndexedReaderError::ObjectStreamMember {
+                id,
+                container: container_id,
+                index,
+                source,
+            })?;
+        let ast_bound = scalar_ast_preflight(member)
+            .ok_or_else(|| IndexedReaderError::ObjectStreamMember {
+                id,
+                container: container_id,
+                index,
+                source: crate::Error::InvalidObjectStream(
+                    "selected object stream member is truncated or invalid".to_string(),
+                ),
+            })?
+            .reserved_bytes(false);
+        let mut ast_charge = permit.reserve(id, ast_bound, "object-stream-member-ast")?;
+        let object = crate::parser::direct_object(member).ok_or_else(|| IndexedReaderError::ObjectStreamMember {
+            id,
+            container: container_id,
+            index,
+            source: crate::Error::InvalidObjectStream(
+                "selected object stream member is truncated or invalid".to_string(),
+            ),
+        })?;
+        drop(prepared);
+        let retained = u64::try_from(scalar_object_retained_bytes(&object)).unwrap_or(u64::MAX);
+        if retained > ast_charge.bytes() {
+            return Err(IndexedReaderError::ScalarResourceLimit {
+                id,
+                requested: retained,
+                limit: ast_charge.bytes(),
+                phase: "measured-object-stream-member",
+            });
+        }
+        ast_charge.shrink_to(retained);
+        let peak = permit.stats().peak_bytes;
+        Ok(BoundedScalar::new(object, retained, peak, ast_charge))
+    }
+
+    fn prepare_compressed_object_stream_limited(
+        &self, id: crate::ObjectId, container: u32, index: u32, permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<(PreparedObjectStream, Vec<ScalarCharge>)> {
+        if id.1 != 0 {
+            return Err(IndexedReaderError::GenerationMismatch { id, indexed: 0 });
+        }
+        let container_id = (container, 0);
         let (body_offset, source_len, parsed, mut dictionary_charge) =
             self.parse_normal_at_limited(container_id, permit)?;
         let ParsedObject {
@@ -2261,14 +2624,37 @@ impl IndexedReader {
                 }
                 let mut decoded_charge = permit.reserve(id, decode_envelope, "object-stream-decode-envelope")?;
                 let decoded_limit = usize::try_from((decode_envelope - DECODER_FIXED_BYTES) / 4).unwrap_or(usize::MAX);
-                let decoded = stream
-                    .decompressed_content_with_limit(decoded_limit)
-                    .map_err(|source| IndexedReaderError::ObjectStreamMember {
-                        id,
-                        container: container_id,
-                        index,
-                        source,
-                    })?;
+                let decoded = match stream.decompressed_content_with_limit(decoded_limit) {
+                    Ok(decoded) => decoded,
+                    Err(crate::Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. })) => {
+                        // The decoder deliberately stops at its charged output
+                        // cap, so it can prove only that a larger allowance is
+                        // required. Doubling is deterministic and monotonic,
+                        // bounds retry count logarithmically, and lets the
+                        // caller enforce its own oversize ceiling before the
+                        // next allocation or source read.
+                        let Some(requested) = permit.limit_bytes().checked_mul(2) else {
+                            return Err(IndexedReaderError::ObjectLimitExceeded {
+                                id,
+                                limit: permit.limit_bytes(),
+                            });
+                        };
+                        return Err(IndexedReaderError::ScalarResourceLimit {
+                            id,
+                            requested,
+                            limit: permit.limit_bytes(),
+                            phase: "object-stream-decompressed-growth",
+                        });
+                    }
+                    Err(source) => {
+                        return Err(IndexedReaderError::ObjectStreamMember {
+                            id,
+                            container: container_id,
+                            index,
+                            source,
+                        });
+                    }
+                };
                 let decoded_capacity = u64::try_from(decoded.capacity()).unwrap_or(u64::MAX);
                 if decoded_capacity > decode_envelope {
                     return Err(IndexedReaderError::ScalarResourceLimit {
@@ -2287,47 +2673,44 @@ impl IndexedReader {
             }
         };
 
-        let member = selected_object_stream_member(&decoded, first, declared_members, id, index).map_err(|source| {
-            IndexedReaderError::ObjectStreamMember {
+        let pair_count = crate::object_stream::SelectedObjectStream::index_pair_count_with_first(first, &decoded)
+            .map_err(|source| IndexedReaderError::ObjectStreamMember {
                 id,
                 container: container_id,
                 index,
                 source,
-            }
-        })?;
-        let ast_bound = scalar_ast_preflight(member)
-            .ok_or_else(|| IndexedReaderError::ObjectStreamMember {
-                id,
-                container: container_id,
-                index,
-                source: crate::Error::InvalidObjectStream(
-                    "selected object stream member is truncated or invalid".to_string(),
-                ),
-            })?
-            .reserved_bytes(false);
-        let mut ast_charge = permit.reserve(id, ast_bound, "object-stream-member-ast")?;
-        let object = crate::parser::direct_object(member).ok_or_else(|| IndexedReaderError::ObjectStreamMember {
+            })?;
+        let pair_bytes = pair_count.saturating_mul(std::mem::size_of::<(Option<u32>, Option<u32>)>());
+        let pair_charge = permit.reserve(
+            id,
+            u64::try_from(pair_bytes).unwrap_or(u64::MAX),
+            "object-stream-header-index",
+        )?;
+        let selected = crate::object_stream::SelectedObjectStream::from_decoded_parts(
+            first,
+            i64::try_from(declared_members).unwrap_or(i64::MAX),
+            decoded,
+        )
+        .map_err(|source| IndexedReaderError::ObjectStreamMember {
             id,
             container: container_id,
             index,
-            source: crate::Error::InvalidObjectStream(
-                "selected object stream member is truncated or invalid".to_string(),
-            ),
+            source,
         })?;
-        drop(decoded);
-        drop(decoded_charge);
-        let retained = u64::try_from(scalar_object_retained_bytes(&object)).unwrap_or(u64::MAX);
-        if retained > ast_charge.bytes() {
+        let retained = u64::try_from(selected.retained_bytes()).unwrap_or(u64::MAX);
+        let charged = decoded_charge.bytes().saturating_add(pair_charge.bytes());
+        if retained > charged {
             return Err(IndexedReaderError::ScalarResourceLimit {
                 id,
                 requested: retained,
-                limit: ast_charge.bytes(),
-                phase: "measured-object-stream-member",
+                limit: charged,
+                phase: "measured-object-stream-cache-entry",
             });
         }
-        ast_charge.shrink_to(retained);
-        let peak = permit.stats().peak_bytes;
-        Ok(BoundedScalar::new(object, retained, peak, ast_charge))
+        Ok((
+            PreparedObjectStream::Selected(selected),
+            vec![decoded_charge, pair_charge],
+        ))
     }
 
     /// Resolve bounded metadata for one ordinary stream without reading its
@@ -3009,7 +3392,7 @@ impl IndexedReader {
                 };
                 Ok(Arc::new(prepared))
             },
-            PreparedObjectStream::retained_bytes,
+            PreparedObjectStream::cache_weight,
         )?;
         state.depth -= 1;
         state.active.remove(&container);
@@ -5736,13 +6119,13 @@ fn validate_endstream(
 mod tests {
     use super::*;
     use crate::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
-    use crate::source::BytesSource;
+    use crate::source::{BytesSource, FileSource};
     use crate::writer::Writer;
     use crate::xref::XrefEntry;
     use crate::{Document, EncryptionState, EncryptionVersion, Permissions, StringFormat};
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -7571,6 +7954,427 @@ mod tests {
     }
 
     #[test]
+    fn bounded_scalar_reuses_one_decoded_object_stream_across_215_members() {
+        let bodies: Vec<_> = (10..225).map(|id| format!("({id})")).collect();
+        let members: Vec<_> = bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| (u32::try_from(index).unwrap() + 10, body.as_bytes()))
+            .collect();
+        let (first, decoded) = object_stream_content(&members);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&decoded).unwrap();
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 215 /First {first} /Filter /FlateDecode"),
+            &encoder.finish().unwrap(),
+            &(10..225).map(|id| (id, id - 10)).collect::<Vec<_>>(),
+        );
+        let source = Arc::new(TracingBytesSource {
+            bytes: fixture.pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+        configure_test_caches(&mut reader, 4 * 1024 * 1024, 256);
+        source.requests.lock().unwrap().clear();
+
+        let mut first_reads = 0;
+        for id in 10..225 {
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            let scalar = reader.resolve_scalar_with_permit((id, 0), &permit).unwrap();
+            assert_eq!(scalar.as_object().as_str().unwrap(), id.to_string().as_bytes());
+            drop(scalar);
+            permit.close().unwrap();
+            if id == 10 {
+                first_reads = source.requests.lock().unwrap().len();
+            }
+        }
+
+        assert_eq!(source.requests.lock().unwrap().len(), first_reads);
+        let stats = reader.object_stream_cache_stats();
+        assert_eq!(stats.loads, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 214);
+        assert_eq!(stats.entries, 1);
+        assert!(stats.bytes >= decoded.len());
+    }
+
+    #[test]
+    fn bounded_object_stream_cache_singleflights_and_cancelled_waiter_exits() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = Arc::new(SharedCache::new(
+            4096,
+            8,
+            4096,
+            0,
+            CacheKind::ObjectStream,
+            Arc::clone(&counters),
+        ));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let leader_cache = Arc::clone(&cache);
+        let leader_entered = Arc::clone(&entered);
+        let leader_release = Arc::clone(&release);
+        let leader = std::thread::spawn(move || {
+            let permit = crate::ScalarResolutionPermit::new(1024);
+            let result = leader_cache.resolve_bounded((5, 0), (10, 0), 0, &permit, || {
+                leader_entered.wait();
+                leader_release.wait();
+                let charge = permit.reserve((10, 0), 1, "test-object-stream")?;
+                Ok((PreparedObjectStream::NotStream, vec![charge]))
+            });
+            assert!(matches!(result, Ok(BoundedPreparedObjectStream::Cached(_))));
+            drop(result);
+            permit.close().unwrap();
+        });
+        entered.wait();
+
+        let waiter_cache = Arc::clone(&cache);
+        let waiter_permit = crate::ScalarResolutionPermit::new(1024);
+        let waiter_cancel = waiter_permit.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = waiter_cache.resolve_bounded((5, 0), (10, 0), 0, &waiter_permit, || {
+                panic!("waiter must not become a loader while the leader is live")
+            });
+            assert!(matches!(
+                result,
+                Err(IndexedReaderError::ScalarResolutionCancelled {
+                    phase: "object-stream-cache-wait",
+                    ..
+                })
+            ));
+            waiter_permit.close().unwrap();
+        });
+        while counters.objstm_waits.load(Ordering::Relaxed) == 0 {
+            std::thread::yield_now();
+        }
+        waiter_cancel.cancel();
+        waiter.join().unwrap();
+        release.wait();
+        leader.join().unwrap();
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.objstm_waits.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.residency().0 + cache.residency().2, 1);
+
+        let cancelled = crate::ScalarResolutionPermit::new(1024);
+        cancelled.cancel();
+        assert!(matches!(
+            cache.resolve_bounded((6, 0), (11, 0), 0, &cancelled, || {
+                let charge = cancelled.reserve((11, 0), 1, "test-cancelled-leader")?;
+                Ok((PreparedObjectStream::NotStream, vec![charge]))
+            }),
+            Err(IndexedReaderError::ScalarResolutionCancelled { .. })
+        ));
+        assert_eq!(cancelled.stats().current_bytes, 0);
+        cancelled.close().unwrap();
+        assert_eq!(cache.residency().0 + cache.residency().2, 1);
+    }
+
+    #[test]
+    fn bounded_object_stream_cache_evicts_reloads_and_keeps_oversize_call_local() {
+        let entry_weight = PreparedObjectStream::NotStream.cache_weight();
+        let counters = Arc::new(CacheCounters::default());
+        let cache = SharedCache::new(
+            entry_weight,
+            1,
+            entry_weight,
+            0,
+            CacheKind::ObjectStream,
+            Arc::clone(&counters),
+        );
+        for id in [(5, 0), (6, 0), (5, 0)] {
+            let permit = crate::ScalarResolutionPermit::new(1024);
+            let result = cache
+                .resolve_bounded(id, id, 0, &permit, || {
+                    let charge = permit.reserve(id, 1, "test-object-stream")?;
+                    Ok((PreparedObjectStream::NotStream, vec![charge]))
+                })
+                .unwrap();
+            assert!(matches!(result, BoundedPreparedObjectStream::Cached(_)));
+            drop(result);
+            permit.close().unwrap();
+        }
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.objstm_evictions.load(Ordering::Relaxed), 2);
+
+        let oversize_counters = Arc::new(CacheCounters::default());
+        let oversize_cache = SharedCache::new(1, 1, 1, 0, CacheKind::ObjectStream, Arc::clone(&oversize_counters));
+        let permit = crate::ScalarResolutionPermit::new(4096);
+        let result = oversize_cache
+            .resolve_bounded((7, 0), (7, 0), 0, &permit, || {
+                let stream = Stream::new(Dictionary::new(), vec![0; 64]);
+                let prepared = PreparedObjectStream::Raw(stream);
+                let charge = permit.reserve(
+                    (7, 0),
+                    u64::try_from(prepared.retained_bytes()).unwrap(),
+                    "test-object-stream-oversize",
+                )?;
+                Ok((prepared, vec![charge]))
+            })
+            .unwrap();
+        assert!(matches!(result, BoundedPreparedObjectStream::CallLocal { .. }));
+        assert!(permit.stats().current_bytes > 0);
+        assert_eq!(oversize_cache.residency().0 + oversize_cache.residency().2, 0);
+        drop(result);
+        assert_eq!(permit.stats().current_bytes, 0);
+        permit.close().unwrap();
+        assert_eq!(oversize_counters.objstm_bypasses.load(Ordering::Relaxed), 1);
+
+        let refusal = crate::ScalarResolutionPermit::new(8);
+        assert!(matches!(
+            oversize_cache.resolve_bounded((8, 0), (8, 0), 0, &refusal, || {
+                let charge = refusal.reserve((8, 0), 9, "test-object-stream-over-b-plus-o")?;
+                Ok((PreparedObjectStream::NotStream, vec![charge]))
+            }),
+            Err(IndexedReaderError::ScalarResourceLimit { .. })
+        ));
+        assert_eq!(refusal.stats().current_bytes, 0);
+        refusal.close().unwrap();
+        assert_eq!(oversize_cache.residency().0 + oversize_cache.residency().2, 0);
+    }
+
+    #[test]
+    fn bounded_object_stream_oversize_bypass_permits_close_independently() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = Arc::new(SharedCache::new(
+            1,
+            8,
+            1,
+            0,
+            CacheKind::ObjectStream,
+            Arc::clone(&counters),
+        ));
+        let first_permit = crate::ScalarResolutionPermit::new(4096);
+        let first = cache
+            .resolve_bounded((7, 0), (10, 0), 0, &first_permit, || {
+                let prepared = PreparedObjectStream::Raw(Stream::new(Dictionary::new(), vec![0; 64]));
+                let charge = first_permit.reserve(
+                    (10, 0),
+                    u64::try_from(prepared.retained_bytes()).unwrap(),
+                    "test-object-stream-oversize-first",
+                )?;
+                Ok((prepared, vec![charge]))
+            })
+            .unwrap();
+        let second_permit = crate::ScalarResolutionPermit::new(4096);
+        let second = cache
+            .resolve_bounded((7, 0), (11, 0), 1, &second_permit, || {
+                let prepared = PreparedObjectStream::Raw(Stream::new(Dictionary::new(), vec![0; 64]));
+                let charge = second_permit.reserve(
+                    (11, 0),
+                    u64::try_from(prepared.retained_bytes()).unwrap(),
+                    "test-object-stream-oversize-second",
+                )?;
+                Ok((prepared, vec![charge]))
+            })
+            .unwrap();
+        assert!(matches!(first, BoundedPreparedObjectStream::CallLocal { .. }));
+        assert!(matches!(second, BoundedPreparedObjectStream::CallLocal { .. }));
+
+        // Closing either permit must not wait for, or release, the other call's
+        // allocation. Independent O budgets intentionally trade singleflight
+        // for unambiguous ownership on non-resident results.
+        drop(first);
+        first_permit.close().unwrap();
+        assert!(second_permit.stats().current_bytes > 0);
+        drop(second);
+        second_permit.close().unwrap();
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.objstm_bypasses.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bounded_object_stream_negative_cache_rewraps_each_requested_member() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = SharedCache::new(4096, 8, 4096, 0, CacheKind::ObjectStream, Arc::clone(&counters));
+        let first = crate::ScalarResolutionPermit::new(1024);
+        let malformed = match cache.resolve_bounded((5, 0), (10, 0), 0, &first, || {
+            Err(IndexedReaderError::ObjectStreamMember {
+                id: (10, 0),
+                container: (5, 0),
+                index: 0,
+                source: crate::Error::InvalidObjectStream("stable malformed member".into()),
+            })
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed object stream unexpectedly resolved"),
+        };
+        first.close().unwrap();
+        let second = crate::ScalarResolutionPermit::new(1024);
+        let shared = match cache.resolve_bounded((5, 0), (11, 0), 1, &second, || {
+            panic!("stable malformed error must be shared")
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("cached malformed object stream unexpectedly resolved"),
+        };
+        second.close().unwrap();
+        assert!(matches!(
+            malformed,
+            IndexedReaderError::ObjectStreamMember {
+                id: (10, 0),
+                container: (5, 0),
+                index: 0,
+                source: crate::Error::InvalidObjectStream(_),
+            }
+        ));
+        assert!(matches!(
+            shared,
+            IndexedReaderError::ObjectStreamMember {
+                id: (11, 0),
+                container: (5, 0),
+                index: 1,
+                source: crate::Error::InvalidObjectStream(_),
+            }
+        ));
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 1);
+
+        let transient = crate::ScalarResolutionPermit::new(1024);
+        assert!(matches!(
+            cache.resolve_bounded((6, 0), (12, 0), 0, &transient, || {
+                Err(IndexedReaderError::Source(SourceError::Io(std::io::Error::other(
+                    "one-shot source failure",
+                ))))
+            }),
+            Err(IndexedReaderError::Source(SourceError::Io(_)))
+        ));
+        transient.close().unwrap();
+        let retry = crate::ScalarResolutionPermit::new(1024);
+        let recovered = cache
+            .resolve_bounded((6, 0), (12, 0), 0, &retry, || {
+                let charge = retry.reserve((6, 0), 1, "transient-retry")?;
+                Ok((PreparedObjectStream::NotStream, vec![charge]))
+            })
+            .unwrap();
+        assert!(matches!(recovered, BoundedPreparedObjectStream::Cached(_)));
+        drop(recovered);
+        retry.close().unwrap();
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn bounded_object_stream_negative_cache_rewraps_nonstream_and_unsupported_members() {
+        let counters = Arc::new(CacheCounters::default());
+        let cache = SharedCache::new(4096, 8, 4096, 0, CacheKind::ObjectStream, Arc::clone(&counters));
+
+        let first = crate::ScalarResolutionPermit::new(1024);
+        assert!(matches!(
+            cache.resolve_bounded((5, 0), (10, 0), 0, &first, || {
+                Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                    id: (10, 0),
+                    container: (5, 0),
+                })
+            }),
+            Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                id: (10, 0),
+                container: (5, 0),
+            })
+        ));
+        first.close().unwrap();
+        let second = crate::ScalarResolutionPermit::new(1024);
+        assert!(matches!(
+            cache.resolve_bounded((5, 0), (11, 0), 1, &second, || panic!("non-stream must be cached")),
+            Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                id: (11, 0),
+                container: (5, 0),
+            })
+        ));
+        second.close().unwrap();
+
+        const REASON: &str = "object-stream filter chains or predictors outside plain/FlateDecode";
+        let third = crate::ScalarResolutionPermit::new(1024);
+        assert!(matches!(
+            cache.resolve_bounded((6, 0), (10, 0), 0, &third, || {
+                Err(IndexedReaderError::UnsupportedBoundedScalar {
+                    id: (10, 0),
+                    reason: REASON,
+                })
+            }),
+            Err(IndexedReaderError::UnsupportedBoundedScalar {
+                id: (10, 0),
+                reason: REASON,
+            })
+        ));
+        third.close().unwrap();
+        let fourth = crate::ScalarResolutionPermit::new(1024);
+        assert!(matches!(
+            cache.resolve_bounded((6, 0), (11, 0), 1, &fourth, || panic!("unsupported must be cached")),
+            Err(IndexedReaderError::UnsupportedBoundedScalar {
+                id: (11, 0),
+                reason: REASON,
+            })
+        ));
+        fourth.close().unwrap();
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.negative_hits.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bounded_object_stream_all_pinned_pressure_bypasses_and_closes_every_charge() {
+        let entry_weight = PreparedObjectStream::NotStream.cache_weight();
+        let cache = SharedCache::new(
+            entry_weight,
+            1,
+            entry_weight,
+            0,
+            CacheKind::ObjectStream,
+            Arc::default(),
+        );
+        let pinned_permit = crate::ScalarResolutionPermit::new(1024);
+        let pinned = cache
+            .resolve_bounded((5, 0), (5, 0), 0, &pinned_permit, || {
+                let charge = pinned_permit.reserve((5, 0), 1, "pinned-entry")?;
+                Ok((PreparedObjectStream::NotStream, vec![charge]))
+            })
+            .unwrap();
+        assert!(matches!(pinned, BoundedPreparedObjectStream::Cached(_)));
+
+        let bypass_permit = crate::ScalarResolutionPermit::new(1024);
+        let bypass = cache
+            .resolve_bounded((6, 0), (6, 0), 0, &bypass_permit, || {
+                let charge = bypass_permit.reserve((6, 0), 1, "all-pinned-bypass")?;
+                Ok((PreparedObjectStream::NotStream, vec![charge]))
+            })
+            .unwrap();
+        assert!(matches!(bypass, BoundedPreparedObjectStream::CallLocal { .. }));
+        assert_eq!(cache.residency().0 + cache.residency().2, 1);
+        drop(bypass);
+        assert_eq!(bypass_permit.stats().current_bytes, 0);
+        bypass_permit.close().unwrap();
+        drop(pinned);
+        pinned_permit.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_encrypted_object_stream_caches_are_reader_and_epoch_isolated() {
+        let (pdf_r4, _, _) = encrypted_object_stream_pdf(4, true, 0);
+        let (pdf_r6, _, _) = encrypted_object_stream_pdf(6, true, 0);
+        let mut reader_r4 = open_encrypted(&pdf_r4, Some(b"user")).unwrap();
+        let mut reader_r6 = open_encrypted(&pdf_r6, Some(b"user")).unwrap();
+        for reader in [&mut reader_r4, &mut reader_r6] {
+            reader.configure_resolution_caches(0, 0, 4 * 1024 * 1024, 8);
+        }
+        for reader in [&reader_r4, &reader_r6] {
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            let member = reader.resolve_scalar_with_permit((10, 0), &permit).unwrap();
+            assert_eq!(
+                member
+                    .as_object()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Text")
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                b"member secret"
+            );
+            drop(member);
+            permit.close().unwrap();
+            let stats = reader.object_stream_cache_stats();
+            assert_eq!(stats.loads, 1);
+            assert_eq!(stats.entries, 1);
+        }
+    }
+
+    #[test]
     fn cached_constructor_wires_every_partition_into_unified_stats() {
         let members = [(10, b"(ten)".as_slice()), (11, b"(eleven)".as_slice())];
         let (first, decoded) = object_stream_content(&members);
@@ -9076,6 +9880,49 @@ mod tests {
                     protection: EncodedStreamProtection::DocumentEncrypted,
                     ..
                 })
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_descriptor_physical_reads_fail_closed_after_detectable_mutation() {
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Length 5 >>\nstream\nhello\nendstream",
+        }]);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&pdf).unwrap();
+        file.as_file_mut().sync_all().unwrap();
+        let reader = IndexedReader::open(FileSource::open(file.path()).unwrap()).unwrap();
+        let descriptor = Arc::new(reader.resolve_stream_descriptor((1, 0)).unwrap());
+
+        file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let mut changed = pdf.clone();
+        changed[0] = b'!';
+        file.write_all(&changed).unwrap();
+        file.as_file_mut().sync_all().unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let descriptor = Arc::clone(&descriptor);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    match descriptor.open_plain_encoded() {
+                        Ok(mut stream) => stream.read_chunk(&mut [0; 5]),
+                        Err(error) => Err(error),
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(IndexedStreamReadError::Source(SourceError::SourceChanged))
             ));
         }
     }
@@ -10803,6 +11650,19 @@ mod tests {
     }
 
     #[test]
+    fn retained_accounting_uses_spare_vector_capacities() {
+        let mut literal = Vec::with_capacity(4096);
+        literal.push(b'x');
+        let object = Object::String(literal, crate::StringFormat::Literal);
+        assert!(scalar_object_retained_bytes(&object) >= std::mem::size_of::<Object>() + 4096);
+
+        let mut content = Vec::with_capacity(2048);
+        content.push(0);
+        let raw = PreparedObjectStream::Raw(Stream::new(Dictionary::new(), content));
+        assert!(raw.retained_bytes() >= std::mem::size_of::<Stream>() + 2048);
+    }
+
+    #[test]
     fn scalar_ast_preflight_keeps_multimegabyte_literal_near_raw_plus_decoded() {
         let payload_bytes = 2 * 1024 * 1024;
         let mut input = Vec::with_capacity(payload_bytes + 2);
@@ -10910,6 +11770,88 @@ mod tests {
     }
 
     #[test]
+    fn bounded_compressed_scalar_reports_retryable_decompressed_growth() {
+        let body = vec![b'x'; 300 * 1024];
+        let mut literal = Vec::with_capacity(body.len() + 2);
+        literal.push(b'(');
+        literal.extend_from_slice(&body);
+        literal.push(b')');
+        let (first, plain) = object_stream_content(&[(10, literal.as_slice())]);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&plain).unwrap();
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 1 /First {first} /Filter /FlateDecode"),
+            &encoder.finish().unwrap(),
+            &[(10, 0)],
+        );
+        let reader = IndexedReader::open(BytesSource::from(fixture.pdf)).unwrap();
+
+        let first_permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+        let error = reader.resolve_scalar_with_permit((10, 0), &first_permit).unwrap_err();
+        let IndexedReaderError::ScalarResourceLimit {
+            requested,
+            limit,
+            phase,
+            ..
+        } = error
+        else {
+            panic!("expected retryable scalar resource limit, got {error:?}");
+        };
+        assert_eq!(limit, 1024 * 1024);
+        assert_eq!(requested, 2 * 1024 * 1024);
+        assert_eq!(phase, "object-stream-decompressed-growth");
+        assert_eq!(first_permit.stats().current_bytes, 0);
+        first_permit.close().unwrap();
+
+        let retry_permit = crate::ScalarResolutionPermit::new(requested);
+        let scalar = reader.resolve_scalar_with_permit((10, 0), &retry_permit).unwrap();
+        assert_eq!(scalar.as_object().as_str().unwrap(), body.as_slice());
+        assert!(scalar.peak_bytes() <= requested);
+        drop(scalar);
+        assert_eq!(retry_permit.close().unwrap().current_bytes, 0);
+    }
+
+    #[test]
+    fn bounded_object_stream_encoded_length_failure_is_not_negative_cached() {
+        const ENCODED_LEN: u64 = 8192;
+        let counters = Arc::new(CacheCounters::default());
+        let cache = SharedCache::new(4096, 8, 4096, 0, CacheKind::ObjectStream, Arc::clone(&counters));
+        let small = crate::ScalarResolutionPermit::new(4096);
+        assert!(matches!(
+            cache.resolve_bounded((5, 0), (10, 0), 0, &small, || {
+                Err(IndexedReaderError::StreamLimitExceeded {
+                    id: (5, 0),
+                    length: ENCODED_LEN,
+                    limit: small.limit_bytes(),
+                })
+            }),
+            Err(IndexedReaderError::StreamLimitExceeded {
+                length: ENCODED_LEN,
+                limit: 4096,
+                ..
+            })
+        ));
+        assert_eq!(small.stats().current_bytes, 0);
+        small.close().unwrap();
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.residency().0 + cache.residency().2, 0);
+
+        let large = crate::ScalarResolutionPermit::new(16 * 1024);
+        let prepared = cache
+            .resolve_bounded((5, 0), (10, 0), 0, &large, || {
+                assert!(ENCODED_LEN <= large.limit_bytes());
+                let charge = large.reserve((10, 0), 1, "encoded-length-retry")?;
+                Ok((PreparedObjectStream::NotStream, vec![charge]))
+            })
+            .unwrap();
+        assert!(matches!(prepared, BoundedPreparedObjectStream::Cached(_)));
+        drop(prepared);
+        large.close().unwrap();
+        assert_eq!(counters.objstm_loads.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.residency().0 + cache.residency().2, 1);
+    }
+
+    #[test]
     fn bounded_compressed_scalar_rejects_large_inflation_and_releases_to_zero() {
         let mut body = Vec::with_capacity(2 * 1024 * 1024 + 2);
         body.push(b'(');
@@ -10924,11 +11866,34 @@ mod tests {
             &[(10, 0)],
         );
         let reader = IndexedReader::open(BytesSource::from(fixture.pdf)).unwrap();
-        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
-        assert!(reader.resolve_scalar_with_permit((10, 0), &permit).is_err());
-        assert!(permit.stats().peak_bytes <= permit.limit_bytes());
-        assert_eq!(permit.stats().current_bytes, 0);
-        permit.close().unwrap();
+        let ceiling = 4 * 1024 * 1024;
+        let mut allowance = 1024 * 1024;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let permit = crate::ScalarResolutionPermit::new(allowance);
+            let error = reader.resolve_scalar_with_permit((10, 0), &permit).unwrap_err();
+            assert!(permit.stats().peak_bytes <= permit.limit_bytes());
+            assert_eq!(permit.stats().current_bytes, 0);
+            permit.close().unwrap();
+            let IndexedReaderError::ScalarResourceLimit {
+                requested,
+                limit,
+                phase,
+                ..
+            } = error
+            else {
+                panic!("expected stable bounded-growth refusal, got {error:?}");
+            };
+            assert_eq!(limit, allowance);
+            assert!(requested > allowance);
+            assert_eq!(phase, "object-stream-decompressed-growth");
+            if requested > ceiling {
+                break;
+            }
+            allowance = requested;
+        }
+        assert_eq!(attempts, 3, "growth must terminate logarithmically at O");
     }
 
     #[test]

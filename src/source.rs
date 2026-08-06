@@ -4,7 +4,10 @@
 //! prescribe caching or scheduling policy and never fall back to reading an
 //! entire file into memory.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use thiserror::Error;
 
@@ -67,6 +70,12 @@ pub enum SourceError {
     /// The platform's positional read failed.
     #[error("source I/O error")]
     Io(#[from] std::io::Error),
+
+    /// A file-backed source has a detectable metadata change relative to the
+    /// descriptor state captured when it was opened. Callers must discard any
+    /// partial result assembled from the source.
+    #[error("file source detectably changed after open")]
+    SourceChanged,
 }
 
 /// A cursor-free byte source that supports concurrent independent reads.
@@ -90,6 +99,13 @@ pub trait RandomAccessSource: Send + Sync + 'static {
     /// Read up to `out.len()` bytes starting at `offset` without changing a
     /// shared cursor.
     fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize>;
+
+    /// Detect a backing-store revision change when the implementation exposes
+    /// a reliable revision signal. Source stability remains a precondition;
+    /// immutable/custom sources may use the default.
+    fn validate_unchanged(&self) -> SourceResult<()> {
+        Ok(())
+    }
 
     /// Return whether the source is empty.
     fn is_empty(&self) -> SourceResult<bool> {
@@ -243,14 +259,44 @@ impl RandomAccessSource for BytesSource {
 
 /// A file-backed source using operating-system positional reads.
 ///
-/// The file length is captured when the source is created. Later truncation
-/// therefore fails closed as an unexpected EOF; path replacement cannot
-/// retarget the owned descriptor.
+/// The descriptor identity, length and modification time are captured when the
+/// source is created. Detectable changes fail closed, while path replacement
+/// cannot retarget the owned descriptor. This is observability, not a snapshot:
+/// callers must still keep the opened file's bytes stable.
 #[cfg(any(unix, windows))]
 #[derive(Debug)]
 pub struct FileSource {
     file: std::fs::File,
+    identity: FileIdentity,
+    changed: AtomicBool,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
     len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[cfg(any(unix, windows))]
+impl FileIdentity {
+    fn capture(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -262,37 +308,147 @@ impl FileSource {
 
     /// Adopt an already-open read-only file and capture its current length.
     pub fn from_file(file: std::fs::File) -> SourceResult<Self> {
-        let len = file.metadata()?.len();
-        Ok(Self { file, len })
+        let identity = FileIdentity::capture(&file.metadata()?);
+        Ok(Self {
+            file,
+            identity,
+            changed: AtomicBool::new(false),
+        })
+    }
+
+    fn check_identity(&self) -> SourceResult<()> {
+        if self.changed.load(Ordering::Acquire) {
+            return Err(SourceError::SourceChanged);
+        }
+        let current = FileIdentity::capture(&self.file.metadata()?);
+        if current != self.identity {
+            self.changed.store(true, Ordering::Release);
+            return Err(SourceError::SourceChanged);
+        }
+        Ok(())
     }
 }
 
 #[cfg(any(unix, windows))]
 impl RandomAccessSource for FileSource {
     fn len(&self) -> SourceResult<u64> {
-        Ok(self.len)
+        Ok(self.identity.len)
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
-        if offset > self.len {
+        if offset > self.identity.len {
             return Err(SourceError::OutOfBounds {
                 offset,
                 length: 0,
-                source_len: self.len,
+                source_len: self.identity.len,
             });
         }
-        if out.is_empty() || offset == self.len {
+        if out.is_empty() || offset == self.identity.len {
             return Ok(0);
         }
         #[cfg(unix)]
-        {
+        let result = {
             use std::os::unix::fs::FileExt;
-            self.file.read_at(out, offset).map_err(SourceError::from)
-        }
+            self.file.read_at(out, offset)
+        };
         #[cfg(windows)]
-        {
+        let result = {
             use std::os::windows::fs::FileExt;
-            self.file.seek_read(out, offset).map_err(SourceError::from)
+            self.file.seek_read(out, offset)
+        };
+        // One descriptor-metadata check after every physical read detects the
+        // ordinary mutation cases without doubling metadata syscalls.
+        self.check_identity()?;
+        result.map_err(SourceError::from)
+    }
+
+    fn validate_unchanged(&self) -> SourceResult<()> {
+        self.check_identity()
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use std::fs::FileTimes;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::time::UNIX_EPOCH;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    fn source_with(bytes: &[u8]) -> (NamedTempFile, FileSource) {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        let source = FileSource::open(file.path()).unwrap();
+        (file, source)
+    }
+
+    #[test]
+    fn file_source_fails_sticky_on_append_truncate_and_same_length_rewrite() {
+        for mutation in 0..3 {
+            let (mut file, source) = source_with(b"0123456789abcdef");
+            match mutation {
+                0 => {
+                    file.as_file_mut().seek(SeekFrom::End(0)).unwrap();
+                    file.write_all(b"append").unwrap();
+                }
+                1 => file.as_file_mut().set_len(7).unwrap(),
+                2 => {
+                    file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+                    file.write_all(b"fedcba9876543210").unwrap();
+                    file.as_file()
+                        .set_times(FileTimes::new().set_modified(UNIX_EPOCH))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            file.as_file_mut().sync_all().unwrap();
+            assert_eq!(source.len().unwrap(), 16);
+            assert!(matches!(source.validate_unchanged(), Err(SourceError::SourceChanged)));
+            assert!(matches!(
+                source.read_at(0, &mut [0; 4]),
+                Err(SourceError::SourceChanged)
+            ));
         }
+    }
+
+    #[test]
+    fn restored_mtime_documents_best_effort_detection_limit() {
+        let (mut file, source) = source_with(b"0123456789abcdef");
+        let original_modified = file.as_file().metadata().unwrap().modified().unwrap();
+        file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"fedcba9876543210").unwrap();
+        file.as_file_mut().sync_all().unwrap();
+        file.as_file()
+            .set_times(FileTimes::new().set_modified(original_modified))
+            .unwrap();
+
+        // Mutation is outside RandomAccessSource's stability contract. A
+        // writer that restores every compared metadata field can conceal it;
+        // strong semantics require an owned byte snapshot.
+        source.validate_unchanged().unwrap();
+        let mut bytes = [0; 4];
+        assert_eq!(source.read_at(0, &mut bytes).unwrap(), 4);
+        assert_eq!(&bytes, b"fedc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_replacement_does_not_retarget_the_open_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.pdf");
+        let old_path = directory.path().join("source-old.pdf");
+        std::fs::write(&path, b"old-source").unwrap();
+        let source = FileSource::open(&path).unwrap();
+
+        std::fs::rename(&path, &old_path).unwrap();
+        std::fs::write(&path, b"new-source").unwrap();
+
+        let mut bytes = [0; 10];
+        source.read_exact_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"old-source");
+        source.validate_unchanged().unwrap();
     }
 }
