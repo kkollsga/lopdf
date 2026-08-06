@@ -1,7 +1,7 @@
 use lopdf::{
-    BytesSource, Dictionary, Document, EncodedStreamProtection, IndexedReader, IndexedReaderCacheOptions,
-    IndexedReaderError, IndexedReaderOptions, IndexedStreamDescriptor, IndexedStreamReadError, Object,
-    RandomAccessSource, SourceError, Stream, dictionary,
+    BytesSource, Dictionary, Document, EncodedStreamLength, EncodedStreamProtection, IndexedReader,
+    IndexedReaderCacheOptions, IndexedReaderError, IndexedReaderOptions, IndexedStreamDescriptor,
+    IndexedStreamReadError, Object, RandomAccessSource, SourceError, Stream, dictionary,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -121,7 +121,14 @@ fn encoded_stream_descriptor_reads_exact_bounded_chunks_without_materializing_pa
 
     assert_eq!(descriptor.id(), (1, 0));
     assert_eq!(descriptor.dictionary(), &scalar.dict);
-    assert_eq!(descriptor.encoded_len(), u64::try_from(scalar.content.len()).unwrap());
+    assert_eq!(
+        descriptor.encoded_len(),
+        Some(u64::try_from(scalar.content.len()).unwrap())
+    );
+    assert_eq!(
+        descriptor.encoded_length(),
+        EncodedStreamLength::Known(u64::try_from(scalar.content.len()).unwrap())
+    );
     assert_eq!(descriptor.protection(), EncodedStreamProtection::Plain);
     let debug = format!("{descriptor:?}");
     assert!(!debug.contains("encoded_start"));
