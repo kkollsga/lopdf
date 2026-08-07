@@ -125,6 +125,15 @@ pub enum IndexedStreamReadError {
         id: crate::ObjectId,
         reason: EncodedStreamLengthUnavailableReason,
     },
+    /// The declared encoded span exceeds the caller-selected streaming
+    /// workload cap. This cap is distinct from the retained/materialized
+    /// stream limit used by ordinary object resolution.
+    #[error("encoded stream in object {id:?} declares {length} bytes, exceeding the {limit}-byte streaming limit")]
+    EncodedStreamLimitExceeded {
+        id: crate::ObjectId,
+        length: u64,
+        limit: u64,
+    },
     /// The source's reported length changed after the reader captured it.
     #[error("indexed source length changed: expected {expected}, found {actual}")]
     SourceLengthChanged { expected: u64, actual: u64 },
@@ -655,6 +664,12 @@ pub struct IndexedReaderOptions {
     pub object_bytes: u64,
     /// Maximum declared or decoded bytes retained for one stream.
     pub stream_bytes: u64,
+    /// Optional maximum declared encoded span exposed by stream descriptors.
+    ///
+    /// `None` admits any checked span bounded by the captured source length.
+    /// This streaming workload policy does not weaken [`Self::stream_bytes`],
+    /// which continues to cap retained, decrypted, or decoded stream data.
+    pub encoded_stream_bytes: Option<u64>,
     /// Maximum bytes inspected after a declared stream payload.
     pub endstream_tail_bytes: u64,
     /// Maximum recursive object/reference resolution depth.
@@ -673,6 +688,7 @@ impl std::fmt::Debug for IndexedReaderOptions {
             .debug_struct("IndexedReaderOptions")
             .field("object_bytes", &self.object_bytes)
             .field("stream_bytes", &self.stream_bytes)
+            .field("encoded_stream_bytes", &self.encoded_stream_bytes)
             .field("endstream_tail_bytes", &self.endstream_tail_bytes)
             .field("reference_depth", &self.reference_depth)
             .field("page_tree_depth", &self.page_tree_depth)
@@ -687,6 +703,7 @@ impl Default for IndexedReaderOptions {
         Self {
             object_bytes: DEFAULT_OBJECT_LIMIT,
             stream_bytes: DEFAULT_STREAM_LIMIT,
+            encoded_stream_bytes: None,
             endstream_tail_bytes: DEFAULT_ENDSTREAM_TAIL_LIMIT,
             reference_depth: DEFAULT_LENGTH_DEPTH_LIMIT,
             page_tree_depth: DEFAULT_PAGE_TREE_DEPTH_LIMIT,
@@ -700,6 +717,7 @@ impl Default for IndexedReaderOptions {
 struct ResolverLimits {
     pub(crate) max_object_bytes: u64,
     pub(crate) max_stream_bytes: u64,
+    pub(crate) max_encoded_stream_bytes: Option<u64>,
     pub(crate) max_endstream_tail_bytes: u64,
     pub(crate) max_length_depth: usize,
 }
@@ -709,6 +727,7 @@ impl Default for ResolverLimits {
         Self {
             max_object_bytes: DEFAULT_OBJECT_LIMIT,
             max_stream_bytes: DEFAULT_STREAM_LIMIT,
+            max_encoded_stream_bytes: None,
             max_endstream_tail_bytes: DEFAULT_ENDSTREAM_TAIL_LIMIT,
             max_length_depth: DEFAULT_LENGTH_DEPTH_LIMIT,
         }
@@ -720,6 +739,7 @@ impl From<&IndexedReaderOptions> for ResolverLimits {
         Self {
             max_object_bytes: options.object_bytes,
             max_stream_bytes: options.stream_bytes,
+            max_encoded_stream_bytes: options.encoded_stream_bytes,
             max_endstream_tail_bytes: options.endstream_tail_bytes,
             max_length_depth: options.reference_depth,
         }
@@ -1981,6 +2001,7 @@ impl IndexedReader {
         let options = IndexedReaderOptions {
             object_bytes: limits.max_object_bytes,
             stream_bytes: limits.max_stream_bytes,
+            encoded_stream_bytes: limits.max_encoded_stream_bytes,
             endstream_tail_bytes: limits.max_endstream_tail_bytes,
             reference_depth: limits.max_length_depth,
             ..IndexedReaderOptions::default()
@@ -1994,6 +2015,7 @@ impl IndexedReader {
         let options = IndexedReaderOptions {
             object_bytes: limits.max_object_bytes,
             stream_bytes: limits.max_stream_bytes,
+            encoded_stream_bytes: limits.max_encoded_stream_bytes,
             endstream_tail_bytes: limits.max_endstream_tail_bytes,
             reference_depth: limits.max_length_depth,
             password: password.map(<[u8]>::to_vec),
@@ -2790,12 +2812,21 @@ impl IndexedReader {
             return Err(IndexedStreamReadError::NotNormalObject { id });
         }
         let mut state = ResolutionState::default();
-        let metadata: IndexedReaderResult<(FramedStreamMetadata, u64)> = (|| {
+        let metadata: IndexedStreamReadResult<(FramedStreamMetadata, u64)> = (|| {
             let (body_offset, source_len, parsed) = self.resolve_normal_framed(id)?;
             let metadata_frame_bytes = u64::try_from(parsed.consumed)
                 .unwrap_or(u64::MAX)
                 .saturating_add(parsed.stream_prefix.unwrap_or(0));
-            let metadata = self.finish_stream_metadata(id, body_offset, source_len, parsed, &mut state)?;
+            let metadata = self
+                .finish_stream_metadata(
+                    id,
+                    body_offset,
+                    source_len,
+                    parsed,
+                    &mut state,
+                    StreamSpanPolicy::Encoded(self.limits.max_encoded_stream_bytes),
+                )
+                .map_err(StreamMetadataError::into_stream_error)?;
             Ok((metadata, metadata_frame_bytes))
         })();
         self.ensure_stream_source_len()?;
@@ -2900,17 +2931,14 @@ impl IndexedReader {
             Some(length) => {
                 let length =
                     u64::try_from(length).map_err(|_| IndexedReaderError::NegativeStreamLength { id, length })?;
-                if length > self.limits.max_stream_bytes {
-                    return Err(IndexedReaderError::StreamLimitExceeded {
-                        id,
-                        length,
-                        limit: self.limits.max_stream_bytes,
-                    }
-                    .into());
-                }
                 let Some(encoded_end) = encoded_start.checked_add(length).filter(|end| *end <= source_len) else {
                     return Err(IndexedStreamReadError::NotStream { id });
                 };
+                if let Some(limit) = self.limits.max_encoded_stream_bytes
+                    && length > limit
+                {
+                    return Err(IndexedStreamReadError::EncodedStreamLimitExceeded { id, length, limit });
+                }
                 let tail_bytes = self
                     .limits
                     .max_endstream_tail_bytes
@@ -3784,7 +3812,17 @@ impl IndexedReader {
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64, parsed: ParsedObject,
         state: &mut ResolutionState,
     ) -> IndexedReaderResult<Object> {
-        match self.finish_stream_metadata(id, body_offset, source_len, parsed, state)? {
+        match self
+            .finish_stream_metadata(
+                id,
+                body_offset,
+                source_len,
+                parsed,
+                state,
+                StreamSpanPolicy::Materialized(self.limits.max_stream_bytes),
+            )
+            .map_err(StreamMetadataError::into_reader_error)?
+        {
             FramedStreamMetadata::Scalar(object) => Ok(object),
             FramedStreamMetadata::MissingLength {
                 dictionary,
@@ -3818,8 +3856,8 @@ impl IndexedReader {
 
     fn finish_stream_metadata(
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64, parsed: ParsedObject,
-        state: &mut ResolutionState,
-    ) -> IndexedReaderResult<FramedStreamMetadata> {
+        state: &mut ResolutionState, span_policy: StreamSpanPolicy,
+    ) -> Result<FramedStreamMetadata, StreamMetadataError> {
         let ParsedObject {
             object,
             consumed,
@@ -3832,7 +3870,8 @@ impl IndexedReader {
             return Err(IndexedReaderError::InvalidIndirectObject {
                 id,
                 offset: body_offset,
-            });
+            }
+            .into());
         };
 
         let stream_start = body_offset
@@ -3857,15 +3896,13 @@ impl IndexedReader {
             });
         };
         if length < 0 {
-            return Err(IndexedReaderError::NegativeStreamLength { id, length });
+            return Err(IndexedReaderError::NegativeStreamLength { id, length }.into());
         }
         let length = u64::try_from(length).map_err(|_| IndexedReaderError::NegativeStreamLength { id, length })?;
-        if length > self.limits.max_stream_bytes {
-            return Err(IndexedReaderError::StreamLimitExceeded {
-                id,
-                length,
-                limit: self.limits.max_stream_bytes,
-            });
+        if let StreamSpanPolicy::Materialized(limit) = span_policy
+            && length > limit
+        {
+            return Err(IndexedReaderError::StreamLimitExceeded { id, length, limit }.into());
         }
 
         let stream_end = stream_start
@@ -3877,6 +3914,11 @@ impl IndexedReader {
         if stream_end > source_len {
             return Ok(FramedStreamMetadata::Scalar(Object::Dictionary(dictionary)));
         }
+        if let StreamSpanPolicy::Encoded(Some(limit)) = span_policy
+            && length > limit
+        {
+            return Err(StreamMetadataError::EncodedLimit { id, length, limit });
+        }
         match validate_endstream(
             self.source.as_ref(),
             source_len,
@@ -3887,7 +3929,7 @@ impl IndexedReader {
             EndstreamStatus::Missing => {
                 return Ok(FramedStreamMetadata::Scalar(Object::Dictionary(dictionary)));
             }
-            EndstreamStatus::LimitExceeded => return Err(IndexedReaderError::MissingEndstream { id }),
+            EndstreamStatus::LimitExceeded => return Err(IndexedReaderError::MissingEndstream { id }.into()),
         }
         Ok(FramedStreamMetadata::Span {
             dictionary,
@@ -4045,6 +4087,45 @@ enum FramedStreamMetadata {
         encoded_start: u64,
         encoded_len: u64,
     },
+}
+
+#[derive(Clone, Copy)]
+enum StreamSpanPolicy {
+    Materialized(u64),
+    Encoded(Option<u64>),
+}
+
+enum StreamMetadataError {
+    Reader(IndexedReaderError),
+    EncodedLimit {
+        id: crate::ObjectId,
+        length: u64,
+        limit: u64,
+    },
+}
+
+impl StreamMetadataError {
+    fn into_reader_error(self) -> IndexedReaderError {
+        match self {
+            Self::Reader(error) => error,
+            Self::EncodedLimit { id, length, limit } => IndexedReaderError::StreamLimitExceeded { id, length, limit },
+        }
+    }
+
+    fn into_stream_error(self) -> IndexedStreamReadError {
+        match self {
+            Self::Reader(error) => error.into(),
+            Self::EncodedLimit { id, length, limit } => {
+                IndexedStreamReadError::EncodedStreamLimitExceeded { id, length, limit }
+            }
+        }
+    }
+}
+
+impl From<IndexedReaderError> for StreamMetadataError {
+    fn from(error: IndexedReaderError) -> Self {
+        Self::Reader(error)
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -7354,6 +7435,7 @@ mod tests {
         let options = IndexedReaderOptions {
             object_bytes: 101,
             stream_bytes: 102,
+            encoded_stream_bytes: Some(104),
             endstream_tail_bytes: 103,
             reference_depth: 7,
             page_tree_depth: 0,
@@ -7363,6 +7445,7 @@ mod tests {
         let limits = ResolverLimits::from(&options);
         assert_eq!(limits.max_object_bytes, 101);
         assert_eq!(limits.max_stream_bytes, 102);
+        assert_eq!(limits.max_encoded_stream_bytes, Some(104));
         assert_eq!(limits.max_endstream_tail_bytes, 103);
         assert_eq!(limits.max_length_depth, 7);
 
@@ -10013,7 +10096,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_descriptors_preserve_scalar_resource_and_endstream_errors() {
+    fn stream_descriptors_separate_encoded_span_policy_from_materialized_stream_limit() {
         let pdf = object_pdf(&[
             ObjectDef {
                 id: 1,
@@ -10042,7 +10125,7 @@ mod tests {
                 ..ResolverLimits::default()
             },
         );
-        for id in [1, 2, 3] {
+        for id in [1, 3] {
             let scalar = reader.resolve_object((id, 0)).unwrap_err().to_string();
             let descriptor = reader.resolve_stream_descriptor((id, 0)).unwrap_err().to_string();
             assert!(
@@ -10050,6 +10133,129 @@ mod tests {
                 "scalar={scalar:?}, descriptor={descriptor:?}"
             );
         }
+        let stream_reader = open_reader(
+            &pdf,
+            ResolverLimits {
+                max_stream_bytes: 10,
+                ..ResolverLimits::default()
+            },
+        );
+        assert!(matches!(
+            stream_reader.resolve_object((2, 0)),
+            Err(IndexedReaderError::StreamLimitExceeded {
+                id: (2, 0),
+                length: 20,
+                limit: 10,
+            })
+        ));
+        let descriptor = stream_reader.resolve_stream_descriptor((2, 0)).unwrap();
+        assert_eq!(read_all_encoded(&descriptor, 64 * 1_024), b"01234567890123456789");
+    }
+
+    #[test]
+    fn encoded_stream_cap_is_inclusive_and_wired_to_both_descriptor_paths() {
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Length 5 >>\nstream\nhello\nendstream",
+        }]);
+
+        let below = IndexedReader::open_with_options(
+            BytesSource::from(pdf.clone()),
+            IndexedReaderOptions {
+                stream_bytes: 4,
+                encoded_stream_bytes: Some(4),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            below.resolve_stream_descriptor((1, 0)),
+            Err(IndexedStreamReadError::EncodedStreamLimitExceeded {
+                id: (1, 0),
+                length: 5,
+                limit: 4,
+            })
+        ));
+        let permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+        assert!(matches!(
+            below.resolve_stream_descriptor_with_permit((1, 0), &permit),
+            Err(IndexedStreamReadError::EncodedStreamLimitExceeded {
+                id: (1, 0),
+                length: 5,
+                limit: 4,
+            })
+        ));
+        assert_eq!(permit.stats().current_bytes, 0);
+        permit.close().unwrap();
+        assert!(matches!(
+            below.resolve_object((1, 0)),
+            Err(IndexedReaderError::StreamLimitExceeded {
+                id: (1, 0),
+                length: 5,
+                limit: 4,
+            })
+        ));
+
+        for limit in [Some(5), Some(6), None] {
+            let reader = IndexedReader::open_with_options(
+                BytesSource::from(pdf.clone()),
+                IndexedReaderOptions {
+                    stream_bytes: 4,
+                    encoded_stream_bytes: limit,
+                    ..IndexedReaderOptions::default()
+                },
+            )
+            .unwrap();
+            let descriptor = reader.resolve_stream_descriptor((1, 0)).unwrap();
+            assert_eq!(read_all_encoded(&descriptor, 2), b"hello");
+
+            let permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+            let descriptor = reader.resolve_stream_descriptor_with_permit((1, 0), &permit).unwrap();
+            assert_eq!(descriptor.encoded_len(), Some(5));
+            drop(descriptor);
+            assert_eq!(permit.close().unwrap().current_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn flate_descriptor_streams_raw_encoded_bytes_without_weakening_materialized_cap() {
+        let plain = std::iter::repeat_n(b'x', 128 * 1_024).collect::<Vec<_>>();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&plain).unwrap();
+        let encoded = encoder.finish().unwrap();
+        assert!(encoded.len() > 4);
+
+        let mut body = format!("<< /Length {} /Filter /FlateDecode >>\nstream\n", encoded.len()).into_bytes();
+        body.extend_from_slice(&encoded);
+        body.extend_from_slice(b"\nendstream");
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: &body,
+        }]);
+        let reader = IndexedReader::open_with_options(
+            BytesSource::from(pdf),
+            IndexedReaderOptions {
+                stream_bytes: 4,
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            reader.resolve_object((1, 0)),
+            Err(IndexedReaderError::StreamLimitExceeded {
+                id: (1, 0),
+                limit: 4,
+                ..
+            })
+        ));
+        let descriptor = reader.resolve_stream_descriptor((1, 0)).unwrap();
+        assert_eq!(descriptor.protection(), EncodedStreamProtection::Plain);
+        assert_eq!(read_all_encoded(&descriptor, 256 * 1_024), encoded);
     }
 
     #[test]
@@ -11092,11 +11298,30 @@ mod tests {
         let reader = IndexedReader::open_with_limits(
             source.clone(),
             ResolverLimits {
-                max_stream_bytes: 128 * 1_024 * 1_024,
+                max_stream_bytes: 4 * 1_024 * 1_024,
                 ..ResolverLimits::default()
             },
         )
         .unwrap();
+        source.requests.lock().unwrap().clear();
+
+        assert!(matches!(
+            reader.resolve_object((1, 0)),
+            Err(IndexedReaderError::StreamLimitExceeded {
+                id: (1, 0),
+                length,
+                limit,
+            }) if length == stream_length && limit == 4 * 1_024 * 1_024
+        ));
+        assert!(
+            !source
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(offset, _)| *offset >= stream_start && *offset < stream_end),
+            "materialized limit refusal issued a payload read"
+        );
         source.requests.lock().unwrap().clear();
 
         let descriptor = reader.resolve_stream_descriptor((1, 0)).unwrap();
@@ -12679,6 +12904,67 @@ mod tests {
             drop(content);
             assert_eq!(permit.close().unwrap().current_bytes, 0);
         }
+    }
+
+    #[test]
+    fn oversized_encrypted_materialization_refuses_before_payload_and_releases_permit() {
+        let pdf = encrypted_pdf_with_stream(4, "owner", "user", &vec![b'x'; 128 * 1_024]);
+        let object_start = pdf
+            .windows(b"2 0 obj\n".len())
+            .position(|window| window == b"2 0 obj\n")
+            .unwrap();
+        let stream_prefix = pdf[object_start..]
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .unwrap();
+        let encoded_start = u64::try_from(object_start + stream_prefix + b"stream\n".len()).unwrap();
+        let source = Arc::new(TracingBytesSource {
+            bytes: pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(
+            erased,
+            IndexedReaderOptions {
+                stream_bytes: 4,
+                password: Some(b"user".to_vec()),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+
+        let descriptor = reader.resolve_stream_descriptor((2, 0)).unwrap();
+        assert_eq!(descriptor.protection(), EncodedStreamProtection::DocumentEncrypted);
+        let encoded_end = encoded_start.checked_add(descriptor.encoded_len().unwrap()).unwrap();
+        assert!(matches!(
+            descriptor.open_plain_encoded(),
+            Err(IndexedStreamReadError::Protected {
+                protection: EncodedStreamProtection::DocumentEncrypted,
+                ..
+            })
+        ));
+
+        source.requests.lock().unwrap().clear();
+        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        assert!(matches!(
+            reader.resolve_stream_with_permit((2, 0), &permit),
+            Err(IndexedReaderError::StreamLimitExceeded {
+                id: (2, 0),
+                limit: 4,
+                ..
+            })
+        ));
+        assert!(
+            !source
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(offset, _)| *offset >= encoded_start && *offset < encoded_end),
+            "encrypted materialization refusal issued a payload read"
+        );
+        assert_eq!(permit.stats().current_bytes, 0);
+        permit.close().unwrap();
     }
 
     #[test]
