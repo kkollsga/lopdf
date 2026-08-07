@@ -57,7 +57,8 @@ pub use indexed_reader::{
     IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
     IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats, IndexedReaderOptions, IndexedReaderResult,
     IndexedReaderSourceCacheStats, IndexedStreamDescriptor, IndexedStreamReadError, IndexedStreamReadResult,
-    InheritedPageAttributeOwners, MissingNormalObjectReason, PageMap, PageMapEntry, SharedIndexedReaderResult,
+    InheritedPageAttributeOwners, MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry,
+    SharedIndexedReaderResult,
 };
 pub use load_options::{FilterFunc, LoadOptions};
 pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};

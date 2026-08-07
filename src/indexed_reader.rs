@@ -596,7 +596,11 @@ pub enum IndexedReaderError {
     #[error("incomplete indirect object {id:?} at offset {offset}")]
     IncompleteObject { id: crate::ObjectId, offset: u64 },
     #[error("object {id:?} exceeds the {limit}-byte parser limit")]
-    ObjectLimitExceeded { id: crate::ObjectId, limit: u64 },
+    ObjectLimitExceeded {
+        id: crate::ObjectId,
+        limit: u64,
+        provenance: ObjectLimitProvenance,
+    },
     #[error(
         "scalar resolution for object {id:?} needs {requested} simultaneous bytes during {phase}, exceeding limit {limit}"
     )]
@@ -667,6 +671,56 @@ pub enum IndexedReaderError {
     },
     #[error("page tree exceeds the {limit}-page limit")]
     PageCountLimitExceeded { limit: usize },
+}
+
+/// Typed proof for an [`IndexedReaderError::ObjectLimitExceeded`] result.
+///
+/// Downstream bounded caches use this field to distinguish immutable demand
+/// observed by the object framer from defensive arithmetic failures without
+/// parsing the stable public display string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ObjectLimitProvenance {
+    /// The direct-object framer still required input at its configured maximum.
+    FrameNeedMoreAtMaximum,
+    /// The bounded scalar framer exhausted the available source while preserving
+    /// its historical object-limit classification.
+    SourceExhaustedAtMaximum,
+    /// A platform conversion or checked arithmetic operation could not
+    /// represent the otherwise bounded window.
+    ArithmeticInvariant,
+}
+
+fn object_limit_arithmetic(id: crate::ObjectId, limit: u64) -> IndexedReaderError {
+    IndexedReaderError::ObjectLimitExceeded {
+        id,
+        limit,
+        provenance: ObjectLimitProvenance::ArithmeticInvariant,
+    }
+}
+
+fn object_frame_at_maximum(id: crate::ObjectId, maximum: u64, remaining: u64) -> IndexedReaderError {
+    IndexedReaderError::ObjectLimitExceeded {
+        id,
+        limit: maximum,
+        provenance: if remaining > maximum {
+            ObjectLimitProvenance::FrameNeedMoreAtMaximum
+        } else {
+            ObjectLimitProvenance::SourceExhaustedAtMaximum
+        },
+    }
+}
+
+fn object_frame_need_more(id: crate::ObjectId, offset: u64, maximum: u64, remaining: u64) -> IndexedReaderError {
+    if remaining > maximum {
+        IndexedReaderError::ObjectLimitExceeded {
+            id,
+            limit: maximum,
+            provenance: ObjectLimitProvenance::FrameNeedMoreAtMaximum,
+        }
+    } else {
+        IndexedReaderError::IncompleteObject { id, offset }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2670,10 +2724,9 @@ impl IndexedReader {
                 FrameStatus::Ready => break,
                 FrameStatus::NeedMore => {}
             }
-            let current = u64::try_from(window.bytes.len())
-                .map_err(|_| IndexedReaderError::ObjectLimitExceeded { id, limit: maximum })?;
+            let current = u64::try_from(window.bytes.len()).map_err(|_| object_limit_arithmetic(id, maximum))?;
             if current >= maximum {
-                return Err(IndexedReaderError::ObjectLimitExceeded { id, limit: maximum });
+                return Err(object_frame_at_maximum(id, maximum, remaining));
             }
             let target = current
                 .saturating_mul(2)
@@ -2999,10 +3052,7 @@ impl IndexedReader {
                         // caller enforce its own oversize ceiling before the
                         // next allocation or source read.
                         let Some(requested) = permit.limit_bytes().checked_mul(2) else {
-                            return Err(IndexedReaderError::ObjectLimitExceeded {
-                                id,
-                                limit: permit.limit_bytes(),
-                            });
+                            return Err(object_limit_arithmetic(id, permit.limit_bytes()));
                         };
                         return Err(IndexedReaderError::ScalarResourceLimit {
                             id,
@@ -4142,22 +4192,10 @@ impl IndexedReader {
                 return parse_object_body(&window, id, body_offset);
             }
 
-            let current = u64::try_from(window.len()).map_err(|_| IndexedReaderError::ObjectLimitExceeded {
-                id,
-                limit: self.limits.max_object_bytes,
-            })?;
+            let current =
+                u64::try_from(window.len()).map_err(|_| object_limit_arithmetic(id, self.limits.max_object_bytes))?;
             if current >= maximum {
-                return if remaining > self.limits.max_object_bytes {
-                    Err(IndexedReaderError::ObjectLimitExceeded {
-                        id,
-                        limit: self.limits.max_object_bytes,
-                    })
-                } else {
-                    Err(IndexedReaderError::IncompleteObject {
-                        id,
-                        offset: body_offset,
-                    })
-                };
+                return Err(object_frame_need_more(id, body_offset, maximum, remaining));
             }
             // Extend the retained prefix instead of rereading it. A fixed
             // upper growth step caps speculative stream-payload reads while
@@ -11261,8 +11299,76 @@ mod tests {
         );
         assert!(matches!(
             reader.resolve_object((1, 0)),
-            Err(IndexedReaderError::ObjectLimitExceeded { id: (1, 0), limit: 32 })
+            Err(IndexedReaderError::ObjectLimitExceeded {
+                id: (1, 0),
+                limit: 32,
+                provenance: ObjectLimitProvenance::FrameNeedMoreAtMaximum,
+            })
         ));
+    }
+
+    #[test]
+    fn object_limit_provenance_does_not_change_the_stable_display() {
+        for provenance in [
+            ObjectLimitProvenance::FrameNeedMoreAtMaximum,
+            ObjectLimitProvenance::SourceExhaustedAtMaximum,
+            ObjectLimitProvenance::ArithmeticInvariant,
+        ] {
+            assert_eq!(
+                IndexedReaderError::ObjectLimitExceeded {
+                    id: (7, 0),
+                    limit: 64,
+                    provenance,
+                }
+                .to_string(),
+                "object (7, 0) exceeds the 64-byte parser limit"
+            );
+        }
+
+        for limit in [4 * 1024 * 1024, 64 * 1024 * 1024] {
+            assert!(matches!(
+                object_frame_need_more((7, 0), 91, limit, limit + 1),
+                IndexedReaderError::ObjectLimitExceeded {
+                    id: (7, 0),
+                    limit: actual,
+                    provenance: ObjectLimitProvenance::FrameNeedMoreAtMaximum,
+                } if actual == limit
+            ));
+            assert!(matches!(
+                object_frame_need_more((7, 0), 91, limit, limit),
+                IndexedReaderError::IncompleteObject { id: (7, 0), offset: 91 }
+            ));
+        }
+        assert!(matches!(
+            object_limit_arithmetic((8, 0), 64 * 1024 * 1024),
+            IndexedReaderError::ObjectLimitExceeded {
+                id: (8, 0),
+                limit: 67_108_864,
+                provenance: ObjectLimitProvenance::ArithmeticInvariant,
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_scalar_source_exhaustion_preserves_object_limit_with_typed_provenance() {
+        let pdf = object_pdf(&[ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"(",
+        }]);
+        let reader = IndexedReader::open(BytesSource::from(pdf.clone())).unwrap();
+        let permit = crate::ScalarResolutionPermit::new(u64::try_from(pdf.len()).unwrap() + 4096);
+        let error = reader.resolve_scalar_with_permit((1, 0), &permit).unwrap_err();
+        assert!(matches!(
+            error,
+            IndexedReaderError::ObjectLimitExceeded {
+                id: (1, 0),
+                limit,
+                provenance: ObjectLimitProvenance::SourceExhaustedAtMaximum,
+            } if limit < u64::try_from(pdf.len()).unwrap()
+        ));
+        assert_eq!(permit.close().unwrap().current_bytes, 0);
     }
 
     struct OverlaySource {
@@ -13085,11 +13191,21 @@ mod tests {
             xref_generation: 0,
             body: &body,
         }]);
-        let reader = IndexedReader::open(BytesSource::from(pdf)).unwrap();
-        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+        let reader = open_reader(
+            &pdf,
+            ResolverLimits {
+                max_object_bytes: 4 * 1024 * 1024,
+                ..ResolverLimits::default()
+            },
+        );
+        let permit = crate::ScalarResolutionPermit::new(64 * 1024 * 1024);
         assert!(matches!(
             reader.resolve_scalar_with_permit((1, 0), &permit),
-            Err(IndexedReaderError::ScalarResourceLimit { .. }) | Err(IndexedReaderError::ObjectLimitExceeded { .. })
+            Err(IndexedReaderError::ObjectLimitExceeded {
+                id: (1, 0),
+                limit: 4_194_304,
+                provenance: ObjectLimitProvenance::FrameNeedMoreAtMaximum,
+            })
         ));
         assert_eq!(permit.stats().current_bytes, 0);
         permit.close().unwrap();
