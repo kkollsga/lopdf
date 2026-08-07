@@ -87,6 +87,8 @@ impl std::fmt::Debug for OwnedEncoding {
 }
 
 impl OwnedEncoding {
+    const MAP_SLOT_ENVELOPE: usize = 128;
+
     /// Construct the standard one-byte encoding.
     pub fn standard() -> Self {
         Self {
@@ -199,6 +201,26 @@ impl OwnedEncoding {
                 Ok(())
             }
         }
+    }
+
+    /// Conservative retained allocation weight for this owned encoding.
+    ///
+    /// Static predefined tables add no dynamic weight. Owned names, CMap range
+    /// and reverse-map storage, Differences slots, and nested base encodings
+    /// are measured by allocator capacity rather than logical length.
+    pub fn retained_bytes(&self) -> u64 {
+        let heap = match &self.kind {
+            OwnedEncodingKind::OneByte(_) => 0,
+            OwnedEncodingKind::Simple(name) => name.capacity(),
+            OwnedEncodingKind::UnicodeMap(unicode_map) => unicode_map.retained_heap_bytes(),
+            OwnedEncodingKind::Differences { base, map } => usize::try_from(base.retained_bytes())
+                .unwrap_or(usize::MAX)
+                .saturating_add(
+                    map.capacity()
+                        .saturating_mul(std::mem::size_of::<(u8, Glyph)>().saturating_add(Self::MAP_SLOT_ENVELOPE)),
+                ),
+        };
+        u64::try_from(std::mem::size_of::<Self>().saturating_add(heap)).unwrap_or(u64::MAX)
     }
 }
 
@@ -582,6 +604,27 @@ mod tests {
                 found: "Boolean"
             })
         ));
+    }
+
+    #[test]
+    fn owned_encoding_retained_weight_tracks_dynamic_map_capacity() {
+        let standard = OwnedEncoding::standard();
+        assert_eq!(
+            standard.retained_bytes(),
+            u64::try_from(std::mem::size_of::<OwnedEncoding>()).unwrap()
+        );
+        let standard_weight = standard.retained_bytes();
+
+        let mut differences = Vec::new();
+        for code in 0..64 {
+            differences.push(Object::Integer(code));
+            differences.push(Object::Name(b"A".to_vec()));
+        }
+        let mapped = standard.with_differences(&differences).unwrap();
+        assert!(mapped.retained_bytes() > standard_weight);
+
+        let unicode = OwnedEncoding::from_to_unicode_for_extraction(exact_cmap()).unwrap();
+        assert!(unicode.retained_bytes() > u64::try_from(std::mem::size_of::<OwnedEncoding>()).unwrap());
     }
 
     #[test]

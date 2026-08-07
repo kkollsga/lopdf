@@ -41,6 +41,16 @@ impl From<CMapParseError> for UnicodeCMapError {
 
 impl ToUnicodeCMap {
     const REPLACEMENT_CHAR: u16 = 0xfffd;
+    // `RangeInclusiveMap` stores ranges in a private `BTreeMap`. A sparse map
+    // still owns a full node allocation: on supported Rust targets the node can
+    // hold 11 `(u32, (u32, BfRangeTarget))` key/value slots, and an internal
+    // node additionally holds 12 pointer-width edges plus its header. Two KiB
+    // covers that complete allocation, including alignment and allocator
+    // overhead, on both 32- and 64-bit targets. Charge the whole envelope for
+    // every live range so this remains conservative at any node occupancy.
+    // The stored tuple is already included and must not be added separately.
+    const RANGE_NODE_ALLOCATION_ENVELOPE: usize = 2 * 1024;
+    const REVERSE_SLOT_ENVELOPE: usize = 128;
 
     pub fn new() -> ToUnicodeCMap {
         ToUnicodeCMap {
@@ -218,6 +228,32 @@ impl ToUnicodeCMap {
             None
         }
     }
+
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        let forward = self.bf_ranges.iter().fold(0usize, |bytes, ranges| {
+            ranges.iter().fold(bytes, |bytes, (_, target)| {
+                bytes
+                    .saturating_add(Self::RANGE_NODE_ALLOCATION_ENVELOPE)
+                    .saturating_add(target.retained_heap_bytes())
+            })
+        });
+        self.reverse_map.as_ref().map_or(forward, |reverse| {
+            let slots = reverse.capacity().saturating_mul(
+                std::mem::size_of::<(Vec<u16>, Vec<ReverseCMapEntry>)>().saturating_add(Self::REVERSE_SLOT_ENVELOPE),
+            );
+            reverse
+                .iter()
+                .fold(forward.saturating_add(slots), |bytes, (unicode, entries)| {
+                    bytes
+                        .saturating_add(unicode.capacity().saturating_mul(std::mem::size_of::<u16>()))
+                        .saturating_add(
+                            entries
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ReverseCMapEntry>()),
+                        )
+                })
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -228,6 +264,24 @@ pub enum BfRangeTarget {
     // so that consecutive ranges can be mapped to the same value in the range map
     UTF16CodePoint { offset: u32 },
     ArrayOfHexStrings(Vec<Vec<u16>>),
+}
+
+impl BfRangeTarget {
+    fn retained_heap_bytes(&self) -> usize {
+        match self {
+            Self::UTF16CodePoint { .. } => 0,
+            Self::HexString(values) => values.capacity().saturating_mul(std::mem::size_of::<u16>()),
+            Self::ArrayOfHexStrings(values) => values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<u16>>())
+                .saturating_add(
+                    values
+                        .iter()
+                        .map(|value| value.capacity().saturating_mul(std::mem::size_of::<u16>()))
+                        .fold(0, usize::saturating_add),
+                ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -317,5 +371,26 @@ mod tests {
         assert_eq!(cmap.get(0, 4), Some(vec![0x0041]));
         assert_eq!(cmap.get(1, 4), Some(vec![0x0042]));
         assert_eq!(cmap.get(u32::MAX, 4), Some(vec![0x0040]));
+    }
+
+    #[test]
+    fn sparse_single_range_has_absolute_full_node_lower_bound() {
+        let mut cmap = ToUnicodeCMap::new();
+        cmap.put(0x10, 0x10, 1, BfRangeTarget::UTF16CodePoint { offset: 0 });
+
+        assert_eq!(cmap.bf_ranges[0].iter().count(), 1);
+        assert!(cmap.retained_heap_bytes() >= 2 * 1024);
+    }
+
+    #[test]
+    fn retained_weight_tracks_multiple_ranges_and_target_capacity() {
+        let mut target = Vec::with_capacity(64);
+        target.push(0x0041);
+        let mut cmap = ToUnicodeCMap::new();
+        cmap.put(0x10, 0x10, 1, BfRangeTarget::HexString(target));
+        cmap.put(0x20, 0x2f, 1, BfRangeTarget::UTF16CodePoint { offset: 0 });
+
+        assert_eq!(cmap.bf_ranges[0].iter().count(), 2);
+        assert!(cmap.retained_heap_bytes() >= 2 * (2 * 1024) + 64 * std::mem::size_of::<u16>());
     }
 }

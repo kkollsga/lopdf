@@ -951,6 +951,18 @@ impl BoundedObjectStream {
     /// Parse one declared member while keeping both the prepared container and
     /// returned scalar charged to the original caller permit.
     pub fn resolve_member(&self, id: crate::ObjectId, index: u32) -> IndexedReaderResult<BoundedScalar> {
+        self.resolve_member_with_permit(id, index, &self.permit)
+    }
+
+    /// Parse one declared member under an independent caller-owned permit.
+    ///
+    /// The prepared container remains charged to the permit which admitted
+    /// [`IndexedReader::prepare_object_stream_with_permit`], while the returned
+    /// scalar remains charged to `permit`. This lets downstream caches retain a
+    /// decoded container independently from any member objects derived from it.
+    pub fn resolve_member_with_permit(
+        &self, id: crate::ObjectId, index: u32, permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<BoundedScalar> {
         let member =
             self.selected
                 .member_slice(id, index)
@@ -970,7 +982,7 @@ impl BoundedObjectStream {
                 ),
             })?
             .reserved_bytes(false);
-        let mut ast_charge = self.permit.reserve(id, ast_bound, "object-stream-member-ast")?;
+        let mut ast_charge = permit.reserve(id, ast_bound, "object-stream-member-ast")?;
         let object = crate::parser::direct_object(member).ok_or_else(|| IndexedReaderError::ObjectStreamMember {
             id,
             container: self.container_id,
@@ -989,7 +1001,7 @@ impl BoundedObjectStream {
             });
         }
         ast_charge.shrink_to(retained);
-        let peak = self.permit.stats().peak_bytes;
+        let peak = permit.stats().peak_bytes;
         Ok(BoundedScalar::new(object, retained, peak, ast_charge))
     }
 }
@@ -13573,6 +13585,57 @@ mod tests {
         assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
         drop(prepared);
         assert_eq!(permit.stats().current_bytes, 0);
+    }
+
+    #[test]
+    fn bounded_object_stream_member_can_use_an_independent_permit() {
+        let (first, content) = object_stream_content(&[(10, b"<< /Answer 42 >>")]);
+        let fixture = object_stream_fixture(&format!("/Type /ObjStm /N 1 /First {first}"), &content, &[(10, 0)]);
+        let reader = IndexedReader::open(BytesSource::from(fixture.pdf)).unwrap();
+        let IndexedObjectLocation::Compressed { container, index } = reader.object_location((10, 0)).unwrap() else {
+            panic!("member 10 was not declared compressed")
+        };
+        let container_permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+        let member_permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+        let prepared = reader
+            .prepare_object_stream_with_permit(container, &container_permit)
+            .unwrap();
+        assert_eq!(container_permit.stats().current_bytes, prepared.retained_bytes());
+        assert_eq!(member_permit.stats().current_bytes, 0);
+
+        let refusing_member_permit = crate::ScalarResolutionPermit::new(1);
+        assert!(matches!(
+            prepared.resolve_member_with_permit((10, 0), index, &refusing_member_permit),
+            Err(IndexedReaderError::ScalarResourceLimit { .. })
+        ));
+        assert_eq!(refusing_member_permit.stats().current_bytes, 0);
+        refusing_member_permit.close().unwrap();
+        assert_eq!(container_permit.stats().current_bytes, prepared.retained_bytes());
+
+        let member = prepared
+            .resolve_member_with_permit((10, 0), index, &member_permit)
+            .unwrap();
+        assert_eq!(
+            member
+                .as_object()
+                .as_dict()
+                .unwrap()
+                .get(b"Answer")
+                .unwrap()
+                .as_i64()
+                .unwrap(),
+            42
+        );
+        assert_eq!(container_permit.stats().current_bytes, prepared.retained_bytes());
+        assert_eq!(member_permit.stats().current_bytes, member.retained_bytes());
+
+        drop(member);
+        assert_eq!(member_permit.stats().current_bytes, 0);
+        member_permit.close().unwrap();
+        assert_eq!(container_permit.stats().current_bytes, prepared.retained_bytes());
+        drop(prepared);
+        assert_eq!(container_permit.stats().current_bytes, 0);
+        container_permit.close().unwrap();
     }
 
     #[test]

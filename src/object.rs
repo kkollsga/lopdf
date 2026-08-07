@@ -134,6 +134,36 @@ impl From<ObjectId> for Object {
 }
 
 impl Object {
+    /// Conservative retained allocation weight for this owned object graph.
+    ///
+    /// The weight is capacity-sensitive for byte strings, arrays, dictionaries,
+    /// and streams. Dictionary storage includes a conservative per-slot envelope
+    /// because `IndexMap` does not expose its raw hash/index allocations.
+    pub fn retained_bytes(&self) -> u64 {
+        u64::try_from(std::mem::size_of::<Self>().saturating_add(self.retained_heap_bytes())).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        match self {
+            Object::Name(value) | Object::String(value, _) => value.capacity(),
+            Object::Array(values) => values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Object>())
+                .saturating_add(
+                    values
+                        .iter()
+                        .map(Object::retained_heap_bytes)
+                        .fold(0, usize::saturating_add),
+                ),
+            Object::Dictionary(dictionary) => dictionary.retained_heap_bytes(),
+            Object::Stream(stream) => stream
+                .content
+                .capacity()
+                .saturating_add(stream.dict.retained_heap_bytes()),
+            Object::Null | Object::Boolean(_) | Object::Integer(_) | Object::Real(_) | Object::Reference(_) => 0,
+        }
+    }
+
     pub fn string_literal<S: Into<Vec<u8>>>(s: S) -> Self {
         Object::String(s.into(), StringFormat::Literal)
     }
@@ -341,6 +371,20 @@ impl fmt::Debug for Object {
 }
 
 impl Dictionary {
+    const RETAINED_SLOT_ENVELOPE: usize = 128;
+
+    fn retained_heap_bytes(&self) -> usize {
+        let slots = self
+            .0
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Vec<u8>, Object)>().saturating_add(Self::RETAINED_SLOT_ENVELOPE));
+        self.0.iter().fold(slots, |bytes, (key, value)| {
+            bytes
+                .saturating_add(key.capacity())
+                .saturating_add(value.retained_heap_bytes())
+        })
+    }
+
     pub fn new() -> Dictionary {
         Dictionary(IndexMap::new())
     }
@@ -1328,9 +1372,43 @@ impl Stream {
 
 #[cfg(test)]
 mod test {
-    use crate::{Error, error::DecompressError};
+    use std::mem::size_of;
+
+    use crate::{Dictionary, Error, Object, StringFormat, error::DecompressError};
 
     use super::Stream;
+
+    #[test]
+    fn retained_weight_tracks_string_array_and_map_capacity() {
+        let mut bytes = Vec::with_capacity(512);
+        bytes.extend_from_slice(b"value");
+        let string = Object::String(bytes, StringFormat::Literal);
+        assert!(string.retained_bytes() >= u64::try_from(size_of::<Object>() + 512).unwrap());
+
+        let mut values = Vec::with_capacity(32);
+        values.push(string);
+        let array = Object::Array(values);
+        assert!(array.retained_bytes() >= u64::try_from(size_of::<Object>() + 32 * size_of::<Object>() + 512).unwrap());
+
+        let mut dictionary = Dictionary::new();
+        for index in 0..64 {
+            dictionary.set(format!("Key{index}").into_bytes(), Object::Integer(index));
+        }
+        for index in 1..64 {
+            dictionary.remove(format!("Key{index}").as_bytes());
+        }
+        let capacity = dictionary.0.capacity();
+        assert!(capacity >= 64);
+        let dictionary = Object::Dictionary(dictionary);
+        assert!(
+            dictionary.retained_bytes()
+                >= u64::try_from(
+                    size_of::<Object>()
+                        + capacity * (size_of::<(Vec<u8>, Object)>() + Dictionary::RETAINED_SLOT_ENVELOPE),
+                )
+                .unwrap()
+        );
+    }
 
     #[test]
     fn test_decode_ascii85() {
