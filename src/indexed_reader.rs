@@ -2694,6 +2694,163 @@ impl IndexedReader {
         Ok((body_offset, source_len, parsed, charge))
     }
 
+    /// Frame an encrypted ObjStm dictionary through its `stream` EOL without
+    /// allowing a speculative source request to cross into the ciphertext.
+    /// Reservation sizes and error phases mirror the general bounded parser;
+    /// only encrypted object-stream preparation uses this byte-exact path.
+    fn parse_encrypted_object_stream_prefix_limited(
+        &self, id: crate::ObjectId, permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<(u64, u64, ParsedObject, ScalarCharge, bool)> {
+        let location = self
+            .index
+            .locations
+            .get(&id.0)
+            .ok_or(IndexedReaderError::MissingNormalObject { id })?;
+        let (offset, indexed_generation) = match location {
+            ObjectLocation64::Normal { offset, generation } => (*offset, *generation),
+            _ => return Err(IndexedReaderError::MissingNormalObject { id }),
+        };
+        let physical = self
+            .index
+            .source_origin
+            .checked_add(offset)
+            .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
+        let source_len = self.source.len()?;
+        let header_len = (source_len.saturating_sub(physical)).min(INDIRECT_HEADER_LIMIT);
+        let header_charge = permit.reserve(id, header_len, "indirect-header")?;
+        let header_capacity =
+            usize::try_from(header_len).map_err(|_| IndexedReaderError::InvalidIndirectObject { id, offset })?;
+        let mut header = Vec::new();
+        header
+            .try_reserve_exact(header_capacity)
+            .map_err(|_| SourceError::AllocationFailed { requested: header_len })?;
+        let mut parsed_header = None;
+        while header.len() < header_capacity {
+            let relative =
+                u64::try_from(header.len()).map_err(|_| IndexedReaderError::InvalidIndirectObject { id, offset })?;
+            let read_offset = physical
+                .checked_add(relative)
+                .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
+            let mut byte = [0_u8; 1];
+            self.source.read_exact_at(read_offset, &mut byte)?;
+            header.push(byte[0]);
+            if let Some((actual, header_bytes)) = parse_indirect_header(&header)
+                && (header_bytes < header.len() || header.len() == header_capacity)
+            {
+                parsed_header = Some((actual, header_bytes));
+                break;
+            }
+        }
+        let (actual, header_bytes) = parsed_header.ok_or(IndexedReaderError::MissingNormalObjectAtXref {
+            id,
+            reason: MissingNormalObjectReason::HeaderProbeLimit {
+                offset,
+                limit: INDIRECT_HEADER_LIMIT,
+            },
+        })?;
+        if actual.0 != id.0 {
+            return Err(IndexedReaderError::MissingNormalObjectAtXref {
+                id,
+                reason: MissingNormalObjectReason::HeaderMismatch { expected: id, actual },
+            });
+        }
+        if actual.1 != id.1 {
+            return Err(IndexedReaderError::MissingNormalObjectAtXref {
+                id,
+                reason: MissingNormalObjectReason::GenerationMismatch {
+                    requested: id,
+                    indexed: indexed_generation,
+                    actual,
+                },
+            });
+        }
+        let body_offset = physical
+            .checked_add(
+                u64::try_from(header_bytes).map_err(|_| IndexedReaderError::InvalidIndirectObject { id, offset })?,
+            )
+            .ok_or(IndexedReaderError::InvalidIndirectObject { id, offset })?;
+        drop(header);
+        drop(header_charge);
+        let (parsed, charge, after_stream_cr) =
+            self.parse_encrypted_object_stream_prefix_body_limited(id, body_offset, source_len, permit)?;
+        Ok((body_offset, source_len, parsed, charge, after_stream_cr))
+    }
+
+    fn parse_encrypted_object_stream_prefix_body_limited(
+        &self, id: crate::ObjectId, body_offset: u64, source_len: u64, permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<(ParsedObject, ScalarCharge, bool)> {
+        let remaining = source_len.checked_sub(body_offset).ok_or(SourceError::OutOfBounds {
+            offset: body_offset,
+            length: 0,
+            source_len,
+        })?;
+        let maximum = remaining.min(self.limits.max_object_bytes).min(permit.limit_bytes());
+        let mut target = maximum.min(INITIAL_OBJECT_WINDOW);
+        let mut frame_charge = permit.reserve(id, target, "scalar-frame")?;
+        let mut window = Vec::new();
+        let target_usize = usize::try_from(target).map_err(|_| object_limit_arithmetic(id, maximum))?;
+        window
+            .try_reserve_exact(target_usize)
+            .map_err(|_| SourceError::AllocationFailed { requested: target })?;
+        let mut object_framer = DirectObjectFramer::new();
+        loop {
+            while u64::try_from(window.len()).unwrap_or(u64::MAX) < target {
+                let relative = u64::try_from(window.len()).map_err(|_| object_limit_arithmetic(id, maximum))?;
+                let read_offset =
+                    body_offset
+                        .checked_add(relative)
+                        .ok_or(IndexedReaderError::InvalidIndirectObject {
+                            id,
+                            offset: body_offset,
+                        })?;
+                let mut byte = [0_u8; 1];
+                self.source.read_exact_at(read_offset, &mut byte)?;
+                window.push(byte[0]);
+                let status = object_framer.advance(&window);
+                let after_stream_cr =
+                    status == FrameStatus::NeedMore && matches!(object_framer.lex, FrameLex::StreamEolCr);
+                if status == FrameStatus::Invalid {
+                    return Err(IndexedReaderError::InvalidIndirectObject {
+                        id,
+                        offset: body_offset,
+                    });
+                }
+                if status == FrameStatus::Ready || after_stream_cr {
+                    let ast_bound = scalar_ast_preflight(&window)
+                        .ok_or(IndexedReaderError::InvalidIndirectObject {
+                            id,
+                            offset: body_offset,
+                        })?
+                        .reserved_bytes(self.index.encryption_state.is_some());
+                    let ast_charge = permit.reserve(id, ast_bound, "scalar-ast-envelope")?;
+                    let parsed = parse_object_body(&window, id, body_offset)?;
+                    drop(window);
+                    drop(frame_charge);
+                    return Ok((parsed, ast_charge, after_stream_cr));
+                }
+            }
+            if target >= maximum {
+                return Err(object_frame_at_maximum(id, maximum, remaining));
+            }
+            let next_target = target
+                .saturating_mul(2)
+                .min(target.saturating_add(OBJECT_GROWTH_CHUNK))
+                .min(maximum);
+            let next_charge = permit.reserve(id, next_target, "scalar-frame-growth")?;
+            let next_usize = usize::try_from(next_target).map_err(|_| object_limit_arithmetic(id, maximum))?;
+            let mut next_window = Vec::new();
+            next_window
+                .try_reserve_exact(next_usize)
+                .map_err(|_| SourceError::AllocationFailed { requested: next_target })?;
+            next_window.extend_from_slice(&window);
+            drop(window);
+            drop(frame_charge);
+            window = next_window;
+            frame_charge = next_charge;
+            target = next_target;
+        }
+    }
+
     fn parse_normal_body_limited(
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64, permit: &ScalarResolutionPermit,
     ) -> IndexedReaderResult<(ParsedObject, ScalarCharge)> {
@@ -2838,8 +2995,14 @@ impl IndexedReader {
             return Err(IndexedReaderError::GenerationMismatch { id, indexed: 0 });
         }
         let container_id = (container, 0);
-        let (body_offset, source_len, parsed, mut dictionary_charge) =
-            self.parse_normal_at_limited(container_id, permit)?;
+        let decrypts = self.index.encrypt_object_id != Some(container_id) && self.index.encryption_state.is_some();
+        let (body_offset, source_len, parsed, mut dictionary_charge, after_stream_cr) = if decrypts {
+            self.parse_encrypted_object_stream_prefix_limited(container_id, permit)?
+        } else {
+            let (body_offset, source_len, parsed, dictionary_charge) =
+                self.parse_normal_at_limited(container_id, permit)?;
+            (body_offset, source_len, parsed, dictionary_charge, false)
+        };
         let ParsedObject {
             object,
             consumed,
@@ -2878,21 +3041,72 @@ impl IndexedReader {
                 limit: encoded_limit,
             });
         }
-        let encoded_start = body_offset
+        let mut encoded_start = body_offset
             .checked_add(u64::try_from(consumed).unwrap_or(u64::MAX))
             .and_then(|offset| offset.checked_add(stream_prefix))
             .ok_or(IndexedReaderError::InvalidIndirectObject {
                 id: container_id,
                 offset: body_offset,
             })?;
-        let encoded_end = encoded_start
-            .checked_add(encoded_len)
-            .filter(|end| *end <= source_len)
-            .ok_or(IndexedReaderError::StreamLimitExceeded {
-                id: container_id,
-                length: encoded_len,
-                limit: permit.limit_bytes(),
-            })?;
+        let mut encoded_end = if after_stream_cr {
+            None
+        } else {
+            Some(
+                encoded_start
+                    .checked_add(encoded_len)
+                    .filter(|end| *end <= source_len)
+                    .ok_or(IndexedReaderError::StreamLimitExceeded {
+                        id: container_id,
+                        length: encoded_len,
+                        limit: permit.limit_bytes(),
+                    })?,
+            )
+        };
+        let decrypt_overlap = if decrypts {
+            encoded_len.saturating_mul(2).saturating_add(64)
+        } else {
+            0
+        };
+        let mut prefetched_payload_byte = None;
+        if after_stream_cr && encoded_len != 0 {
+            // A CR stream EOL is ambiguous until the next byte distinguishes
+            // lone CR from CRLF. Admit the complete payload/decryption overlap
+            // before that one-byte read, then release it so tail validation
+            // retains the established admission order and peak semantics.
+            let admission = permit.admit_without_peak(
+                id,
+                &[
+                    (encoded_len, "object-stream-encoded"),
+                    (decrypt_overlap, "object-stream-decryption-overlap"),
+                ],
+            )?;
+            let mut lookahead = [0_u8; 1];
+            self.source.read_exact_at(encoded_start, &mut lookahead)?;
+            if lookahead[0] == b'\n' {
+                encoded_start = encoded_start
+                    .checked_add(1)
+                    .ok_or(IndexedReaderError::InvalidIndirectObject {
+                        id: container_id,
+                        offset: body_offset,
+                    })?;
+            } else {
+                prefetched_payload_byte = Some(lookahead[0]);
+            }
+            drop(admission);
+        }
+        if encoded_end.is_none() {
+            encoded_end = Some(
+                encoded_start
+                    .checked_add(encoded_len)
+                    .filter(|end| *end <= source_len)
+                    .ok_or(IndexedReaderError::StreamLimitExceeded {
+                        id: container_id,
+                        length: encoded_len,
+                        limit: permit.limit_bytes(),
+                    })?,
+            );
+        }
+        let encoded_end = encoded_end.unwrap();
         let dictionary_bytes = u64::try_from(dictionary_retained_bytes(&dictionary)).unwrap_or(u64::MAX);
         if dictionary_bytes > dictionary_charge.bytes() {
             return Err(IndexedReaderError::ScalarResourceLimit {
@@ -2944,14 +3158,8 @@ impl IndexedReader {
         }
         drop(tail_charge);
         let mut content_charge = permit.reserve(id, encoded_len, "object-stream-encoded")?;
-        let decrypts = self.index.encrypt_object_id != Some(container_id) && self.index.encryption_state.is_some();
-        let decrypt_overlap = if decrypts {
-            encoded_len.saturating_mul(2).saturating_add(64)
-        } else {
-            0
-        };
-        // Admit the complete ciphertext/plaintext/cipher-work overlap before
-        // allocating or reading the first payload byte.
+        // Re-admit the complete ciphertext/plaintext/cipher-work overlap before
+        // allocating the payload buffer or reading any remaining payload bytes.
         let mut decrypt_charge = permit.reserve(id, decrypt_overlap, "object-stream-decryption-overlap")?;
         let encoded_usize = usize::try_from(encoded_len).map_err(|_| IndexedReaderError::ScalarResourceLimit {
             id,
@@ -2965,6 +3173,10 @@ impl IndexedReader {
             .map_err(|_| SourceError::AllocationFailed { requested: encoded_len })?;
         encoded.resize(encoded_usize, 0);
         let mut completed = 0_usize;
+        if let Some(first) = prefetched_payload_byte {
+            encoded[0] = first;
+            completed = 1;
+        }
         while completed < encoded.len() {
             let request = (encoded.len() - completed).min(ENCODED_STREAM_CHUNK_LIMIT);
             let offset = encoded_start
@@ -7055,11 +7267,31 @@ mod tests {
     }
 
     fn encrypted_object_stream_pdf(revision: u8, flate: bool, member_padding: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        encrypted_object_stream_pdf_with_eol(revision, flate, member_padding, b"\n")
+    }
+
+    fn encrypted_object_stream_pdf_with_eol(
+        revision: u8, flate: bool, member_padding: usize, stream_eol: &[u8],
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        encrypted_object_stream_pdf_with_eol_and_prefix(revision, flate, member_padding, stream_eol, 0)
+    }
+
+    fn encrypted_object_stream_pdf_with_eol_and_prefix(
+        revision: u8, flate: bool, member_padding: usize, stream_eol: &[u8], prefix_padding: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        encrypted_object_stream_pdf_with_options(revision, flate, member_padding, stream_eol, prefix_padding, None)
+    }
+
+    fn encrypted_object_stream_pdf_with_options(
+        revision: u8, flate: bool, member_padding: usize, stream_eol: &[u8], prefix_padding: usize,
+        metadata_override: Option<(i64, i64, i64)>,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         const CONTAINER_ID: u32 = 5;
         const IMAGE_ID: u32 = 20;
         const STRING_ID: u32 = 21;
         const ENCRYPT_ID: u32 = 30;
         const XREF_ID: u32 = 31;
+        assert!(matches!(stream_eol, b"\n" | b"\r" | b"\r\n"));
 
         let mut document = Document::with_version("1.7");
         let file_id = vec![0x24; 16];
@@ -7126,18 +7358,25 @@ mod tests {
         member.extend(std::iter::repeat_n(b'x', member_padding));
         member.extend_from_slice(b") >>");
         let (first, content) = object_stream_content(&[(10, member.as_slice())]);
-        let mut container = Object::Stream(Stream::new(
-            Dictionary::from_iter([
-                (b"Type".to_vec(), Object::Name(b"ObjStm".to_vec())),
-                (b"N".to_vec(), Object::Integer(1)),
-                (b"First".to_vec(), Object::Integer(i64::try_from(first).unwrap())),
-            ]),
-            content,
-        ));
+        let (declared_n, declared_first, declared_length) = metadata_override
+            .map(|(n, first, length)| (n, first, Some(length)))
+            .unwrap_or((1, i64::try_from(first).unwrap(), None));
+        let mut container_dictionary = Dictionary::from_iter([
+            (b"Type".to_vec(), Object::Name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), Object::Integer(declared_n)),
+            (b"First".to_vec(), Object::Integer(declared_first)),
+        ]);
+        if prefix_padding != 0 {
+            container_dictionary.set("PrefixPad", Object::Name(vec![b'x'; prefix_padding]));
+        }
+        let mut container = Object::Stream(Stream::new(container_dictionary, content));
         if flate {
             container.as_stream_mut().unwrap().compress().unwrap();
         }
         encryption::encrypt_object(&state, (CONTAINER_ID, 0), &mut container).unwrap();
+        if let Some(declared_length) = declared_length {
+            container.as_stream_mut().unwrap().dict.set("Length", declared_length);
+        }
 
         let image_plaintext = b"shared encrypted image".to_vec();
         let mut image = Object::Stream(Stream::new(
@@ -7162,7 +7401,21 @@ mod tests {
         ] {
             let offset = u64::try_from(pdf.len()).unwrap();
             pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
-            Writer::write_object(&mut pdf, &object).unwrap();
+            if id == CONTAINER_ID {
+                let mut rendered = Vec::new();
+                Writer::write_object(&mut rendered, &object).unwrap();
+                let marker = rendered
+                    .windows(b"stream\n".len())
+                    .position(|window| window == b"stream\n")
+                    .unwrap();
+                rendered.splice(
+                    marker + b"stream".len()..marker + b"stream\n".len(),
+                    stream_eol.iter().copied(),
+                );
+                pdf.extend_from_slice(&rendered);
+            } else {
+                Writer::write_object(&mut pdf, &object).unwrap();
+            }
             pdf.extend_from_slice(b"\nendobj\n");
             offsets.insert(id, offset);
         }
@@ -7543,15 +7796,23 @@ mod tests {
     fn object_stream_fixture(
         dictionary: &str, content: &[u8], compressed_entries: &[(u32, u32)],
     ) -> ObjectStreamFixture {
+        object_stream_fixture_with_declared_length(
+            dictionary,
+            content,
+            compressed_entries,
+            i64::try_from(content.len()).unwrap(),
+        )
+    }
+
+    fn object_stream_fixture_with_declared_length(
+        dictionary: &str, content: &[u8], compressed_entries: &[(u32, u32)], declared_length: i64,
+    ) -> ObjectStreamFixture {
         const CONTAINER_ID: u32 = 5;
         const XREF_ID: u32 = 6;
 
         let mut pdf = b"%PDF-1.7\n".to_vec();
         let container_offset = u64::try_from(pdf.len()).unwrap();
-        let prefix = format!(
-            "{CONTAINER_ID} 0 obj\n<< {dictionary} /Length {} >>\nstream\n",
-            content.len()
-        );
+        let prefix = format!("{CONTAINER_ID} 0 obj\n<< {dictionary} /Length {declared_length} >>\nstream\n");
         pdf.extend_from_slice(prefix.as_bytes());
         let container_stream_start = u64::try_from(pdf.len()).unwrap();
         pdf.extend_from_slice(content);
@@ -13659,6 +13920,292 @@ mod tests {
     }
 
     #[test]
+    fn public_preparation_matches_eager_for_encrypted_object_streams_without_private_cache_use() {
+        for revision in 2..=6 {
+            for flate in [false, true] {
+                for stream_eol in [b"\n".as_slice(), b"\r".as_slice(), b"\r\n".as_slice()] {
+                    let (pdf, _, _) = encrypted_object_stream_pdf_with_eol(revision, flate, 0, stream_eol);
+                    let eager =
+                        Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
+                    let expected = eager.get_object((10, 0)).unwrap();
+                    let source = Arc::new(TracingBytesSource {
+                        bytes: pdf,
+                        requests: Mutex::new(Vec::new()),
+                    });
+                    let erased: Arc<dyn RandomAccessSource> = source.clone();
+                    let reader = IndexedReader::open_shared(
+                        erased,
+                        IndexedReaderOptions {
+                            password: Some(b"user".to_vec()),
+                            ..IndexedReaderOptions::default()
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(reader.cache_stats(), IndexedReaderCacheStats::default());
+                    assert_eq!(reader.object_cache_stats(), IndexedObjectCacheStats::default());
+                    assert_eq!(
+                        reader.object_stream_cache_stats(),
+                        IndexedObjectStreamCacheStats::default()
+                    );
+
+                    let IndexedObjectLocation::Compressed { container, index } =
+                        reader.object_location((10, 0)).unwrap()
+                    else {
+                        panic!("encrypted fixture member was not declared compressed")
+                    };
+                    assert_eq!(container, (5, 0));
+                    assert_eq!(index, 0);
+
+                    let permit = crate::ScalarResolutionPermit::new(8 * 1024 * 1024);
+                    let prepared = reader.prepare_object_stream_with_permit(container, &permit).unwrap();
+                    assert_eq!(prepared.container_id(), container);
+                    assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
+                    let reads_after_prepare = source.requests.lock().unwrap().len();
+
+                    let member = prepared.resolve_member((10, 0), index).unwrap();
+                    assert_eq!(member.as_object(), expected);
+                    assert_eq!(
+                        member
+                            .as_object()
+                            .as_dict()
+                            .unwrap()
+                            .get(b"Text")
+                            .unwrap()
+                            .as_str()
+                            .unwrap(),
+                        b"member secret"
+                    );
+                    assert_eq!(source.requests.lock().unwrap().len(), reads_after_prepare);
+                    assert_eq!(
+                        permit.stats().current_bytes,
+                        prepared.retained_bytes() + member.retained_bytes()
+                    );
+                    assert!(permit.stats().peak_bytes <= permit.limit_bytes());
+                    assert_eq!(reader.cache_stats(), IndexedReaderCacheStats::default());
+                    assert_eq!(reader.object_cache_stats(), IndexedObjectCacheStats::default());
+                    assert_eq!(
+                        reader.object_stream_cache_stats(),
+                        IndexedObjectStreamCacheStats::default()
+                    );
+
+                    drop(member);
+                    assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
+                    drop(prepared);
+                    assert_eq!(permit.close().unwrap().current_bytes, 0);
+                    assert_eq!(reader.cache_stats(), IndexedReaderCacheStats::default());
+                }
+            }
+        }
+    }
+
+    fn assert_public_preparation_encrypted_overlap_refusal(stream_eol: &[u8], expected_span: (u64, u64)) {
+        let (pdf, _, _) = encrypted_object_stream_pdf_with_eol(4, false, 512 * 1024, stream_eol);
+        let container_offset = pdf
+            .windows(b"5 0 obj\n".len())
+            .position(|window| window == b"5 0 obj\n")
+            .unwrap();
+        let mut stream_marker = b"stream".to_vec();
+        stream_marker.extend_from_slice(stream_eol);
+        let stream = pdf[container_offset..]
+            .windows(stream_marker.len())
+            .position(|window| window == stream_marker)
+            .unwrap();
+        let encoded_start_usize = container_offset + stream + stream_marker.len();
+        let encoded_length = pdf[encoded_start_usize..]
+            .windows(b"\nendstream".len())
+            .position(|window| window == b"\nendstream")
+            .unwrap();
+        let encoded_start = u64::try_from(encoded_start_usize).unwrap();
+        let encoded_end = encoded_start + u64::try_from(encoded_length).unwrap();
+        assert_eq!((encoded_start, encoded_end), expected_span);
+        let source = Arc::new(TracingBytesSource {
+            bytes: pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(
+            erased,
+            IndexedReaderOptions {
+                password: Some(b"user".to_vec()),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reader.cache_stats(), IndexedReaderCacheStats::default());
+        let IndexedObjectLocation::Compressed { container, index } = reader.object_location((10, 0)).unwrap() else {
+            panic!("encrypted fixture member was not declared compressed")
+        };
+        assert_eq!(container, (5, 0));
+        assert_eq!(index, 0);
+
+        let mut limit = 1_u64;
+        let refusal_limit = loop {
+            let permit = crate::ScalarResolutionPermit::new(limit);
+            let error = reader
+                .prepare_object_stream_with_permit(container, &permit)
+                .unwrap_err();
+            if let IndexedReaderError::StreamLimitExceeded { length, .. } = &error {
+                assert!(*length > limit, "non-progressing stream admission");
+                assert_eq!(permit.stats().current_bytes, 0);
+                permit.close().unwrap();
+                limit = *length;
+                continue;
+            }
+            let IndexedReaderError::ScalarResourceLimit { requested, phase, .. } = error else {
+                panic!("unexpected bounded refusal: {error:?}")
+            };
+            assert_eq!(permit.stats().current_bytes, 0);
+            permit.close().unwrap();
+            if phase == "object-stream-decryption-overlap" {
+                break limit;
+            }
+            assert!(requested > limit, "non-progressing admission at {phase}");
+            limit = requested;
+        };
+
+        let mut observed = None;
+        for _ in 0..2 {
+            assert_eq!(reader.cache_stats(), IndexedReaderCacheStats::default());
+            source.requests.lock().unwrap().clear();
+            let permit = crate::ScalarResolutionPermit::new(refusal_limit);
+            let error = reader
+                .prepare_object_stream_with_permit(container, &permit)
+                .unwrap_err();
+            let IndexedReaderError::ScalarResourceLimit {
+                requested,
+                limit,
+                phase,
+                ..
+            } = error
+            else {
+                panic!("unexpected bounded refusal: {error:?}")
+            };
+            assert_eq!(phase, "object-stream-decryption-overlap");
+            assert_eq!(
+                observed.get_or_insert((requested, limit, phase)),
+                &(requested, limit, phase)
+            );
+            let requests = source.requests.lock().unwrap();
+            assert!(
+                requests.iter().all(|(offset, length)| {
+                    let request_end = offset.saturating_add(u64::try_from(*length).unwrap_or(u64::MAX));
+                    request_end <= encoded_start || *offset >= encoded_end
+                }),
+                "payload read was issued before decryption-overlap admission for {encoded_start}..{encoded_end}: \
+                 {requests:?}"
+            );
+            assert_eq!(permit.stats().current_bytes, 0);
+            permit.close().unwrap();
+            assert_eq!(reader.cache_stats(), IndexedReaderCacheStats::default());
+        }
+    }
+
+    #[test]
+    fn public_preparation_encrypted_overlap_refusal_precedes_payload_read_and_retries_identically() {
+        for (stream_eol, expected_span) in [
+            (b"\n".as_slice(), (66, 524_450)),
+            (b"\r".as_slice(), (66, 524_450)),
+            (b"\r\n".as_slice(), (67, 524_451)),
+        ] {
+            assert_public_preparation_encrypted_overlap_refusal(stream_eol, expected_span);
+        }
+    }
+
+    #[test]
+    fn encrypted_cr_admission_preserves_tail_stats_and_security_precedence() {
+        for stream_eol in [b"\n".as_slice(), b"\r".as_slice(), b"\r\n".as_slice()] {
+            let (mut pdf, _, _) = encrypted_object_stream_pdf_with_eol(4, false, 0, stream_eol);
+            let container = pdf
+                .windows(b"5 0 obj\n".len())
+                .position(|window| window == b"5 0 obj\n")
+                .unwrap();
+            let endstream = container
+                + pdf[container..]
+                    .windows(b"\nendstream".len())
+                    .position(|window| window == b"\nendstream")
+                    .unwrap();
+            pdf[endstream + b"\nendstrea".len()] = b'X';
+            let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+            let permit = crate::ScalarResolutionPermit::new(8 * 1024 * 1024);
+            assert!(matches!(
+                reader.prepare_object_stream_with_permit((5, 0), &permit),
+                Err(IndexedReaderError::MissingEndstream { id: (5, 0) })
+            ));
+            let stats = permit.stats();
+            assert_eq!(stats.current_bytes, 0);
+            assert!(stats.peak_bytes <= 4 * 1024);
+            assert_eq!(stats.reservations, 4);
+            permit.close().unwrap();
+        }
+
+        let (mut pdf, _, _) = encrypted_object_stream_pdf_with_eol(4, false, 512 * 1024, b"\r");
+        let container = pdf
+            .windows(b"5 0 obj\n".len())
+            .position(|window| window == b"5 0 obj\n")
+            .unwrap();
+        let stream = container
+            + pdf[container..]
+                .windows(b"stream\r".len())
+                .position(|window| window == b"stream\r")
+                .unwrap();
+        let encoded_start = u64::try_from(stream + b"stream\r".len()).unwrap();
+        let encoded_end = encoded_start + 524_384;
+        let endstream = usize::try_from(encoded_end).unwrap();
+        assert_eq!(&pdf[endstream..endstream + b"\nendstream".len()], b"\nendstream");
+        pdf[endstream + b"\nendstrea".len()] = b'X';
+        let source = Arc::new(TracingBytesSource {
+            bytes: pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(
+            erased,
+            IndexedReaderOptions {
+                password: Some(b"user".to_vec()),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+        let mut limit = 1_u64;
+        let refusal_limit = loop {
+            let permit = crate::ScalarResolutionPermit::new(limit);
+            let error = reader.prepare_object_stream_with_permit((5, 0), &permit).unwrap_err();
+            let next = match error {
+                IndexedReaderError::StreamLimitExceeded { length, .. } => length,
+                IndexedReaderError::ScalarResourceLimit {
+                    phase: "object-stream-decryption-overlap",
+                    ..
+                } => {
+                    assert_eq!(permit.stats().current_bytes, 0);
+                    permit.close().unwrap();
+                    break limit;
+                }
+                IndexedReaderError::ScalarResourceLimit { requested, .. } => requested,
+                error => panic!("unexpected bounded refusal: {error:?}"),
+            };
+            assert!(next > limit);
+            assert_eq!(permit.stats().current_bytes, 0);
+            permit.close().unwrap();
+            limit = next;
+        };
+        source.requests.lock().unwrap().clear();
+        let permit = crate::ScalarResolutionPermit::new(refusal_limit);
+        assert!(matches!(
+            reader.prepare_object_stream_with_permit((5, 0), &permit),
+            Err(IndexedReaderError::ScalarResourceLimit {
+                phase: "object-stream-decryption-overlap",
+                ..
+            })
+        ));
+        assert!(source.requests.lock().unwrap().iter().all(|(offset, length)| {
+            let request_end = offset.saturating_add(u64::try_from(*length).unwrap_or(u64::MAX));
+            request_end <= encoded_start || *offset >= encoded_end
+        }));
+        assert_eq!(permit.stats().current_bytes, 0);
+        permit.close().unwrap();
+    }
+
+    #[test]
     fn bounded_encrypted_stream_over_o_refuses_before_content_allocation() {
         let payload = vec![0x5a; 2 * 1024 * 1024];
         let pdf = encrypted_pdf_with_stream(6, "owner", "user", &payload);
@@ -13680,6 +14227,83 @@ mod tests {
         assert!(permit.stats().peak_bytes <= permit.limit_bytes());
         assert_eq!(permit.stats().current_bytes, 0);
         permit.close().unwrap();
+    }
+
+    #[test]
+    fn public_preparation_checks_encoded_end_before_first_and_n_after_required_cr_admission() {
+        for dictionary in [
+            "/Type /ObjStm /N 1 /First -1",
+            "/Type /ObjStm /N -1 /First 5",
+            "/Type /ObjStm /N -1 /First -1",
+        ] {
+            let fixture = object_stream_fixture_with_declared_length(dictionary, b"10 0 (ten)", &[(10, 0)], 1_000_000);
+            let reader = IndexedReader::open(BytesSource::from(fixture.pdf)).unwrap();
+            let permit = crate::ScalarResolutionPermit::new(8 * 1024 * 1024);
+            assert!(matches!(
+                reader.prepare_object_stream_with_permit((5, 0), &permit),
+                Err(IndexedReaderError::StreamLimitExceeded {
+                    id: (5, 0),
+                    length: 1_000_000,
+                    ..
+                })
+            ));
+            assert_eq!(permit.stats().current_bytes, 0);
+            permit.close().unwrap();
+        }
+
+        for (declared_n, declared_first) in [(1, -1), (-1, 5), (-1, -1)] {
+            let (pdf, _, _) = encrypted_object_stream_pdf_with_options(
+                4,
+                false,
+                0,
+                b"\r",
+                0,
+                Some((declared_n, declared_first, 1_000_000)),
+            );
+            let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+            let permit = crate::ScalarResolutionPermit::new(8 * 1024 * 1024);
+            assert!(matches!(
+                reader.prepare_object_stream_with_permit((5, 0), &permit),
+                Err(IndexedReaderError::StreamLimitExceeded {
+                    id: (5, 0),
+                    length: 1_000_000,
+                    ..
+                })
+            ));
+            assert_eq!(permit.stats().current_bytes, 0);
+            permit.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn encrypted_public_preparation_bounds_large_prefix_source_requests() {
+        const PREFIX_PADDING: usize = 4 * 1024;
+        const REQUEST_LIMIT: usize = PREFIX_PADDING + 512;
+
+        let (pdf, _, _) = encrypted_object_stream_pdf_with_eol_and_prefix(4, false, 0, b"\n", PREFIX_PADDING);
+        let source = Arc::new(TracingBytesSource {
+            bytes: pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(
+            erased,
+            IndexedReaderOptions {
+                password: Some(b"user".to_vec()),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+        source.requests.lock().unwrap().clear();
+        let permit = crate::ScalarResolutionPermit::new(8 * 1024 * 1024);
+        let prepared = reader.prepare_object_stream_with_permit((5, 0), &permit).unwrap();
+        let requests = source.requests.lock().unwrap().len();
+        assert!(
+            (PREFIX_PADDING..=REQUEST_LIMIT).contains(&requests),
+            "large encrypted ObjStm prefix used {requests} source requests; limit is {REQUEST_LIMIT}"
+        );
+        drop(prepared);
+        assert_eq!(permit.close().unwrap().current_bytes, 0);
     }
 
     #[test]

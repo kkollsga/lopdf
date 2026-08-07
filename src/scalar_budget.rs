@@ -33,6 +33,7 @@ struct PermitInner {
 struct PermitState {
     limit_bytes: u64,
     current_bytes: u64,
+    admitted_bytes: u64,
     peak_bytes: u64,
     reservations: u64,
     cancelled: bool,
@@ -43,6 +44,12 @@ pub(crate) const PERMIT_INNER_STRUCTURAL_BYTES: usize = std::mem::size_of::<Perm
 pub(crate) const SCALAR_CHARGE_STRUCTURAL_BYTES: usize = std::mem::size_of::<ScalarCharge>();
 
 pub(crate) struct ScalarCharge {
+    inner: Arc<PermitInner>,
+    bytes: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScalarAdmissionGuard {
     inner: Arc<PermitInner>,
     bytes: u64,
 }
@@ -275,6 +282,7 @@ impl ScalarResolutionPermit {
                 state: Mutex::new(PermitState {
                     limit_bytes,
                     current_bytes: 0,
+                    admitted_bytes: 0,
                     peak_bytes: 0,
                     reservations: 0,
                     cancelled: false,
@@ -298,10 +306,11 @@ impl ScalarResolutionPermit {
 
     pub fn close(&self) -> Result<ScalarResolutionStats, String> {
         let mut state = lock_unpoisoned(&self.inner.state);
-        if state.current_bytes != 0 {
+        let occupied = state.current_bytes.saturating_add(state.admitted_bytes);
+        if occupied != 0 {
             return Err(format!(
                 "cannot close scalar-resolution permit with {} charged bytes",
-                state.current_bytes
+                occupied
             ));
         }
         state.closed = true;
@@ -316,6 +325,16 @@ impl ScalarResolutionPermit {
         if state.closed {
             return Err(IndexedReaderError::ScalarResolutionClosed { id, phase });
         }
+        let occupied = state
+            .current_bytes
+            .checked_add(state.admitted_bytes)
+            .and_then(|occupied| occupied.checked_add(bytes))
+            .ok_or(IndexedReaderError::ScalarResourceLimit {
+                id,
+                requested: u64::MAX,
+                limit: state.limit_bytes,
+                phase,
+            })?;
         let proposed = state
             .current_bytes
             .checked_add(bytes)
@@ -325,10 +344,10 @@ impl ScalarResolutionPermit {
                 limit: state.limit_bytes,
                 phase,
             })?;
-        if proposed > state.limit_bytes {
+        if occupied > state.limit_bytes {
             return Err(IndexedReaderError::ScalarResourceLimit {
                 id,
-                requested: proposed,
+                requested: occupied,
                 limit: state.limit_bytes,
                 phase,
             });
@@ -337,6 +356,58 @@ impl ScalarResolutionPermit {
         state.peak_bytes = state.peak_bytes.max(proposed);
         state.reservations = state.reservations.saturating_add(1);
         Ok(ScalarCharge {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        })
+    }
+
+    /// Hold admission headroom without recording an allocation high-water mark.
+    ///
+    /// This is reserved for a fixed-size stack probe which must prove that a
+    /// later allocation sequence fits before performing source I/O. The guard
+    /// blocks competing charges until it is dropped, while leaving allocation
+    /// peaks and reservation counts unchanged.
+    pub(crate) fn admit_without_peak(
+        &self, id: ObjectId, reservations: &[(u64, &'static str)],
+    ) -> IndexedReaderResult<ScalarAdmissionGuard> {
+        let mut state = lock_unpoisoned(&self.inner.state);
+        let initial = state.admitted_bytes;
+        let mut proposed = state
+            .current_bytes
+            .checked_add(initial)
+            .ok_or(IndexedReaderError::ScalarResourceLimit {
+                id,
+                requested: u64::MAX,
+                limit: state.limit_bytes,
+                phase: reservations.first().map_or("admission", |(_, phase)| *phase),
+            })?;
+        for (bytes, phase) in reservations {
+            if state.cancelled {
+                return Err(IndexedReaderError::ScalarResolutionCancelled { id, phase });
+            }
+            if state.closed {
+                return Err(IndexedReaderError::ScalarResolutionClosed { id, phase });
+            }
+            proposed = proposed
+                .checked_add(*bytes)
+                .ok_or(IndexedReaderError::ScalarResourceLimit {
+                    id,
+                    requested: u64::MAX,
+                    limit: state.limit_bytes,
+                    phase,
+                })?;
+            if proposed > state.limit_bytes {
+                return Err(IndexedReaderError::ScalarResourceLimit {
+                    id,
+                    requested: proposed,
+                    limit: state.limit_bytes,
+                    phase,
+                });
+            }
+        }
+        let bytes = proposed - state.current_bytes - initial;
+        state.admitted_bytes = initial + bytes;
+        Ok(ScalarAdmissionGuard {
             inner: Arc::clone(&self.inner),
             bytes,
         })
@@ -361,6 +432,13 @@ impl Drop for ScalarCharge {
     fn drop(&mut self) {
         let mut state = lock_unpoisoned(&self.inner.state);
         state.current_bytes = state.current_bytes.saturating_sub(self.bytes);
+    }
+}
+
+impl Drop for ScalarAdmissionGuard {
+    fn drop(&mut self) {
+        let mut state = lock_unpoisoned(&self.inner.state);
+        state.admitted_bytes = state.admitted_bytes.saturating_sub(self.bytes);
     }
 }
 
@@ -406,5 +484,80 @@ mod tests {
         let closed = ScalarResolutionPermit::new(10);
         closed.close().unwrap();
         assert!(closed.reserve((1, 0), 1, "closed").is_err());
+    }
+
+    #[test]
+    fn admission_guard_blocks_competing_charges_without_changing_allocation_stats() {
+        let permit = ScalarResolutionPermit::new(10);
+        let retained = permit.reserve((1, 0), 2, "retained").unwrap();
+        let before = permit.stats();
+        let guard = permit
+            .admit_without_peak((1, 0), &[(3, "content"), (5, "decrypt")])
+            .unwrap();
+        let admitted = permit.stats();
+        assert_eq!(admitted, before);
+        let competing = permit.clone();
+        let error = std::thread::spawn(move || match competing.reserve((1, 0), 1, "competing") {
+            Err(error) => error,
+            Ok(_) => panic!("competing allocation bypassed admission guard"),
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(
+            error,
+            IndexedReaderError::ScalarResourceLimit {
+                requested: 11,
+                phase: "competing",
+                ..
+            }
+        ));
+        assert!(permit.close().is_err());
+        drop(guard);
+        assert_eq!(permit.stats(), before);
+
+        let error = permit
+            .admit_without_peak((1, 0), &[(3, "content"), (6, "decrypt")])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IndexedReaderError::ScalarResourceLimit {
+                requested: 11,
+                phase: "decrypt",
+                ..
+            }
+        ));
+        assert_eq!(permit.stats(), before);
+        drop(retained);
+        assert_eq!(permit.close().unwrap().current_bytes, 0);
+
+        let cancelled = ScalarResolutionPermit::new(10);
+        let guard = cancelled.admit_without_peak((1, 0), &[(10, "content")]).unwrap();
+        cancelled.cancel();
+        assert!(matches!(
+            cancelled.admit_without_peak((1, 0), &[(1, "cancelled")]),
+            Err(IndexedReaderError::ScalarResolutionCancelled { phase: "cancelled", .. })
+        ));
+        drop(guard);
+        cancelled.close().unwrap();
+
+        let closed = ScalarResolutionPermit::new(10);
+        closed.close().unwrap();
+        assert!(matches!(
+            closed.admit_without_peak((1, 0), &[(1, "closed")]),
+            Err(IndexedReaderError::ScalarResolutionClosed { phase: "closed", .. })
+        ));
+
+        let overflow = ScalarResolutionPermit::new(u64::MAX);
+        let retained = overflow.reserve((1, 0), 1, "retained").unwrap();
+        assert!(matches!(
+            overflow.admit_without_peak((1, 0), &[(u64::MAX, "overflow")]),
+            Err(IndexedReaderError::ScalarResourceLimit {
+                requested: u64::MAX,
+                phase: "overflow",
+                ..
+            })
+        ));
+        drop(retained);
+        overflow.close().unwrap();
     }
 }
