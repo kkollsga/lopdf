@@ -477,6 +477,48 @@ pub struct IndexedObjectStreamCacheStats {
     pub peak_bytes: usize,
 }
 
+/// Conservative structural residency and cardinality for an opened index.
+///
+/// The byte estimate includes the reader/index bookkeeping, live xref map,
+/// trailer, encryption metadata, and one owned page map. Source and resolver
+/// caches are reported separately by [`IndexedReader::cache_stats`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexedReaderIndexStats {
+    object_count: usize,
+    page_count: usize,
+    index_retained_bytes: u64,
+    page_map_retained_bytes: u64,
+    estimated_retained_bytes: u64,
+}
+
+impl IndexedReaderIndexStats {
+    /// Number of live normal or compressed xref entries.
+    pub const fn object_count(&self) -> usize {
+        self.object_count
+    }
+
+    /// Number of actual leaf pages found by the bounded page-tree walk.
+    pub const fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    /// Conservative bytes retained by reader and index structures, excluding caches.
+    pub const fn index_retained_bytes(&self) -> u64 {
+        self.index_retained_bytes
+    }
+
+    /// Conservative bytes needed to retain the derived owned page map.
+    pub const fn page_map_retained_bytes(&self) -> u64 {
+        self.page_map_retained_bytes
+    }
+
+    /// Sum of index and page-map retained-byte estimates.
+    pub const fn estimated_retained_bytes(&self) -> u64 {
+        self.estimated_retained_bytes
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static OBJECT_BODY_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
@@ -855,6 +897,100 @@ enum BoundedPreparedObjectStream {
         prepared: Arc<PreparedObjectStream>,
         _charges: Vec<ScalarCharge>,
     },
+}
+
+/// Structural location of one live indexed indirect object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IndexedObjectLocation {
+    /// Ordinary indirect object at the requested full generation.
+    Normal,
+    /// Generation-zero member declared by an xref stream.
+    Compressed { container: crate::ObjectId, index: u32 },
+}
+
+/// One decoded and indexed object-stream container retained under a caller's
+/// scalar-resolution permit.
+///
+/// The owner is intentionally cache-agnostic. A downstream caller may place it
+/// in a container-keyed cell, and may parse any declared member in that
+/// container without decoding it again. Container and member allocations stay
+/// charged until their respective bounded owners are dropped.
+pub struct BoundedObjectStream {
+    container_id: crate::ObjectId,
+    selected: crate::object_stream::SelectedObjectStream,
+    permit: ScalarResolutionPermit,
+    charges: Vec<ScalarCharge>,
+}
+
+impl std::fmt::Debug for BoundedObjectStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundedObjectStream")
+            .field("container_id", &self.container_id)
+            .field("retained_bytes", &self.retained_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundedObjectStream {
+    /// Normal object id of this prepared object-stream container.
+    pub const fn container_id(&self) -> crate::ObjectId {
+        self.container_id
+    }
+
+    /// Bytes currently charged for the retained decoded container and index.
+    pub fn retained_bytes(&self) -> u64 {
+        self.charges
+            .iter()
+            .map(ScalarCharge::bytes)
+            .fold(0, u64::saturating_add)
+    }
+
+    /// Parse one declared member while keeping both the prepared container and
+    /// returned scalar charged to the original caller permit.
+    pub fn resolve_member(&self, id: crate::ObjectId, index: u32) -> IndexedReaderResult<BoundedScalar> {
+        let member =
+            self.selected
+                .member_slice(id, index)
+                .map_err(|source| IndexedReaderError::ObjectStreamMember {
+                    id,
+                    container: self.container_id,
+                    index,
+                    source,
+                })?;
+        let ast_bound = scalar_ast_preflight(member)
+            .ok_or_else(|| IndexedReaderError::ObjectStreamMember {
+                id,
+                container: self.container_id,
+                index,
+                source: crate::Error::InvalidObjectStream(
+                    "selected object stream member is truncated or invalid".to_string(),
+                ),
+            })?
+            .reserved_bytes(false);
+        let mut ast_charge = self.permit.reserve(id, ast_bound, "object-stream-member-ast")?;
+        let object = crate::parser::direct_object(member).ok_or_else(|| IndexedReaderError::ObjectStreamMember {
+            id,
+            container: self.container_id,
+            index,
+            source: crate::Error::InvalidObjectStream(
+                "selected object stream member is truncated or invalid".to_string(),
+            ),
+        })?;
+        let retained = u64::try_from(scalar_object_retained_bytes(&object)).unwrap_or(u64::MAX);
+        if retained > ast_charge.bytes() {
+            return Err(IndexedReaderError::ScalarResourceLimit {
+                id,
+                requested: retained,
+                limit: ast_charge.bytes(),
+                phase: "measured-object-stream-member",
+            });
+        }
+        ast_charge.shrink_to(retained);
+        let peak = self.permit.stats().peak_bytes;
+        Ok(BoundedScalar::new(object, retained, peak, ast_charge))
+    }
 }
 
 impl BoundedPreparedObjectStream {
@@ -1579,6 +1715,50 @@ fn dictionary_retained_bytes(dictionary: &Dictionary) -> usize {
     std::mem::size_of::<Dictionary>().saturating_add(scalar_dictionary_heap_bytes(dictionary))
 }
 
+fn encryption_state_retained_bytes(state: &EncryptionState) -> usize {
+    let vectors = state
+        .file_encryption_key
+        .capacity()
+        .saturating_add(state.stream_filter.capacity())
+        .saturating_add(state.string_filter.capacity())
+        .saturating_add(state.owner_value.capacity())
+        .saturating_add(state.owner_encrypted.capacity())
+        .saturating_add(state.user_value.capacity())
+        .saturating_add(state.user_encrypted.capacity())
+        .saturating_add(state.permission_encrypted.capacity());
+    let filters = state.crypt_filters.iter().fold(0usize, |bytes, (name, _)| {
+        bytes
+            .saturating_add(name.capacity())
+            // Conservative BTree node/Arc/filter allocation envelope.
+            .saturating_add(256)
+    });
+    std::mem::size_of::<EncryptionState>()
+        .saturating_add(vectors)
+        .saturating_add(filters)
+}
+
+fn index_retained_bytes(reader: &IndexedReader) -> usize {
+    let location_bytes = reader.index.locations.len().saturating_mul(
+        std::mem::size_of::<u32>()
+            .saturating_add(std::mem::size_of::<ObjectLocation64>())
+            // Conservative BTree node/key/value allocator envelope.
+            .saturating_add(256),
+    );
+    std::mem::size_of::<IndexedReader>()
+        .saturating_add(std::mem::size_of::<PdfIndex>())
+        .saturating_add(2 * std::mem::size_of::<usize>()) // Arc allocations/headers.
+        .saturating_add(reader.index.version.capacity())
+        .saturating_add(location_bytes)
+        .saturating_add(dictionary_retained_bytes(&reader.index.trailer))
+        .saturating_add(
+            reader
+                .index
+                .encryption_state
+                .as_ref()
+                .map_or(0, encryption_state_retained_bytes),
+        )
+}
+
 fn scalar_object_retained_bytes(object: &Object) -> usize {
     std::mem::size_of::<Object>().saturating_add(scalar_object_heap_bytes(object))
 }
@@ -2051,6 +2231,59 @@ impl IndexedReader {
             }
             Some(ObjectLocation64::Free { .. }) | None => Err(IndexedReaderError::MissingNormalObject { id }),
         }
+    }
+
+    /// Resolve one scalar or stream into a common bounded owned value.
+    ///
+    /// The returned owner keeps every retained allocation charged to `permit`
+    /// and exposes a shared [`Object`] view without cloning stream payloads.
+    pub fn resolve_object_with_permit(
+        &self, id: crate::ObjectId, permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<crate::BoundedObject> {
+        match self.resolve_scalar_with_permit(id, permit) {
+            Ok(scalar) => Ok(crate::BoundedObject::Scalar(scalar)),
+            Err(IndexedReaderError::NotScalarObject { .. }) => self
+                .resolve_stream_with_permit(id, permit)
+                .map(crate::BoundedObject::Stream),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Decode and index one object-stream container under a caller-owned
+    /// permit, without consulting or populating the reader's private caches.
+    ///
+    /// The returned cache-agnostic owner may be retained in a downstream cell
+    /// keyed by `container`; member parsing reuses this one decoded image.
+    pub fn prepare_object_stream_with_permit(
+        &self, container: crate::ObjectId, permit: &ScalarResolutionPermit,
+    ) -> IndexedReaderResult<BoundedObjectStream> {
+        if permit.stats().current_bytes != 0 {
+            return Err(IndexedReaderError::ScalarResourceLimit {
+                id: container,
+                requested: permit.stats().current_bytes,
+                limit: permit.limit_bytes(),
+                phase: "permit-not-empty",
+            });
+        }
+        if container.1 != 0 {
+            return Err(IndexedReaderError::GenerationMismatch {
+                id: container,
+                indexed: 0,
+            });
+        }
+        let (prepared, charges) = self.prepare_compressed_object_stream_limited(container, container.0, 0, permit)?;
+        let PreparedObjectStream::Selected(selected) = prepared else {
+            return Err(IndexedReaderError::ObjectStreamContainerNotStream {
+                id: container,
+                container,
+            });
+        };
+        Ok(BoundedObjectStream {
+            container_id: container,
+            selected,
+            permit: permit.clone(),
+            charges,
+        })
     }
 
     /// Resolve one normal stream under one call-local simultaneous allocation
@@ -3209,6 +3442,75 @@ impl IndexedReader {
     /// Derive the actual ordered leaf-page map by walking `/Kids`.
     pub fn page_map(&self) -> IndexedReaderResult<PageMap> {
         PageMap::from_reader(self)
+    }
+
+    /// Return an owned trailer value, resolving an indirect entry through the
+    /// same object resolver used by [`Self::resolve_object`]. Direct values are
+    /// cloned from the immutable index. Missing keys return `Ok(None)`.
+    pub fn trailer_entry_owned(&self, key: &[u8]) -> IndexedReaderResult<Option<Object>> {
+        let Some(value) = self.index.trailer.get(key).ok() else {
+            return Ok(None);
+        };
+        match value {
+            Object::Reference(id) => self.resolve_object(*id).map(Some),
+            direct => Ok(Some(direct.clone())),
+        }
+    }
+
+    /// Enumerate every live indexed indirect object id in deterministic order.
+    ///
+    /// Free entries are excluded. Normal entries preserve their xref
+    /// generation; compressed entries use generation zero as required by PDF.
+    pub fn object_ids(&self) -> Vec<crate::ObjectId> {
+        self.index
+            .locations
+            .iter()
+            .filter_map(|(number, location)| match location {
+                ObjectLocation64::Free { .. } => None,
+                ObjectLocation64::Normal { generation, .. } => Some((*number, *generation)),
+                ObjectLocation64::Compressed { .. } => Some((*number, 0)),
+            })
+            .collect()
+    }
+
+    /// Locate one live object without exposing physical source offsets.
+    pub fn object_location(&self, id: crate::ObjectId) -> Option<IndexedObjectLocation> {
+        match self.index.locations.get(&id.0)? {
+            ObjectLocation64::Normal { generation, .. } if *generation == id.1 => Some(IndexedObjectLocation::Normal),
+            ObjectLocation64::Compressed { container, index } if id.1 == 0 => Some(IndexedObjectLocation::Compressed {
+                container: (*container, 0),
+                index: *index,
+            }),
+            ObjectLocation64::Free { .. } | ObjectLocation64::Normal { .. } | ObjectLocation64::Compressed { .. } => {
+                None
+            }
+        }
+    }
+
+    /// Compute conservative index/page-map residency and live cardinalities.
+    pub fn index_stats(&self) -> IndexedReaderResult<IndexedReaderIndexStats> {
+        let page_map = self.page_map()?;
+        let index_retained_bytes = u64_from_usize_saturating(index_retained_bytes(self));
+        let page_map_retained_bytes = u64_from_usize_saturating(
+            std::mem::size_of::<PageMap>().saturating_add(
+                page_map
+                    .pages
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PageMapEntry>()),
+            ),
+        );
+        Ok(IndexedReaderIndexStats {
+            object_count: self
+                .index
+                .locations
+                .values()
+                .filter(|location| !matches!(location, ObjectLocation64::Free { .. }))
+                .count(),
+            page_count: page_map.len(),
+            index_retained_bytes,
+            page_map_retained_bytes,
+            estimated_retained_bytes: index_retained_bytes.saturating_add(page_map_retained_bytes),
+        })
     }
 
     /// PDF header version, for example `"1.7"`.
@@ -13109,5 +13411,93 @@ mod tests {
         assert!(permit.stats().peak_bytes <= permit.limit_bytes());
         assert_eq!(permit.stats().current_bytes, 0);
         permit.close().unwrap();
+    }
+
+    #[test]
+    fn public_object_ids_and_bounded_owner_cover_declared_objstm_members() {
+        let (first, content) = object_stream_content(&[(10, b"<< /Answer 42 >>"), (11, b"(second member)")]);
+        let fixture = object_stream_fixture(
+            &format!("/Type /ObjStm /N 2 /First {first}"),
+            &content,
+            &[(10, 0), (11, 1)],
+        );
+        let source = Arc::new(TracingBytesSource {
+            bytes: fixture.pdf,
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+
+        assert_eq!(reader.object_ids(), vec![(5, 0), (6, 0), (10, 0), (11, 0)]);
+        let IndexedObjectLocation::Compressed { container, index } = reader.object_location((10, 0)).unwrap() else {
+            panic!("member 10 was not declared compressed")
+        };
+        assert_eq!(container, (5, 0));
+        assert_eq!(index, 0);
+        let permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+        let prepared = reader.prepare_object_stream_with_permit(container, &permit).unwrap();
+        let reads_after_prepare = source.requests.lock().unwrap().len();
+        let bounded = prepared.resolve_member((10, 0), index).unwrap();
+        assert_eq!(
+            bounded
+                .as_object()
+                .as_dict()
+                .unwrap()
+                .get(b"Answer")
+                .unwrap()
+                .as_i64()
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            permit.stats().current_bytes,
+            prepared.retained_bytes() + bounded.retained_bytes()
+        );
+        drop(bounded);
+        let IndexedObjectLocation::Compressed { container, index } = reader.object_location((11, 0)).unwrap() else {
+            panic!("member 11 was not declared compressed")
+        };
+        assert_eq!(container, prepared.container_id());
+        let second = prepared.resolve_member((11, 0), index).unwrap();
+        assert_eq!(second.as_object().as_str().unwrap(), b"second member");
+        assert_eq!(source.requests.lock().unwrap().len(), reads_after_prepare);
+        drop(second);
+        assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
+        drop(prepared);
+        assert_eq!(permit.stats().current_bytes, 0);
+    }
+
+    #[test]
+    fn encrypted_public_metadata_and_unified_bounded_apis_preserve_decryption() {
+        let pdf = encrypted_pdf_with_stream(6, "owner", "user", b"encrypted payload");
+        let reader = IndexedReader::open_with_options(
+            BytesSource::from(pdf),
+            IndexedReaderOptions {
+                password: Some(b"user".to_vec()),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+
+        let root = reader.trailer_entry_owned(b"Root").unwrap().unwrap();
+        assert!(root.as_dict().unwrap().has_type(b"Catalog"));
+        let stats = reader.index_stats().unwrap();
+        assert!(stats.object_count() >= 3);
+        assert_eq!(stats.page_count(), 0);
+
+        let scalar_permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+        let scalar = reader.resolve_object_with_permit((1, 0), &scalar_permit).unwrap();
+        assert_eq!(scalar.as_object().as_str().unwrap(), b"encrypted string");
+        drop(scalar);
+        assert_eq!(scalar_permit.stats().current_bytes, 0);
+
+        let stream_permit = crate::ScalarResolutionPermit::new(1024 * 1024);
+        let stream = reader.resolve_object_with_permit((2, 0), &stream_permit).unwrap();
+        let Object::Stream(stream_object) = stream.as_object() else {
+            panic!("encrypted stream did not resolve as a stream")
+        };
+        assert_eq!(stream_object.content, b"encrypted payload");
+        drop(stream);
+        assert_eq!(stream_permit.stats().current_bytes, 0);
     }
 }

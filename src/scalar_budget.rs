@@ -55,11 +55,18 @@ pub struct BoundedScalar {
 /// One fully materialized stream whose dictionary and content allocations
 /// remain charged to the permit which admitted the resolution.
 pub struct BoundedStream {
-    stream: Stream,
+    object: Object,
     retained_bytes: u64,
     peak_bytes: u64,
     _dictionary_charge: ScalarCharge,
     content_charge: ScalarCharge,
+}
+
+/// One bounded owned object, scalar or stream, whose retained allocations
+/// remain charged to the permit which admitted its resolution.
+pub enum BoundedObject {
+    Scalar(BoundedScalar),
+    Stream(BoundedStream),
 }
 
 /// A materialized stream payload moved out without copying. Its allocation
@@ -127,8 +134,8 @@ impl std::fmt::Debug for BoundedStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BoundedStream")
-            .field("id", &self.stream.start_position)
-            .field("content_bytes", &self.stream.content.len())
+            .field("id", &self.as_stream().start_position)
+            .field("content_bytes", &self.as_stream().content.len())
             .field("retained_bytes", &self.retained_bytes)
             .field("peak_bytes", &self.peak_bytes)
             .finish_non_exhaustive()
@@ -137,7 +144,16 @@ impl std::fmt::Debug for BoundedStream {
 
 impl BoundedStream {
     pub const fn as_stream(&self) -> &Stream {
-        &self.stream
+        match &self.object {
+            Object::Stream(stream) => stream,
+            _ => panic!("bounded stream invariant violated"),
+        }
+    }
+
+    /// Inspect this stream through the common PDF object representation
+    /// without cloning its payload.
+    pub const fn as_object(&self) -> &Object {
+        &self.object
     }
 
     pub const fn retained_bytes(&self) -> u64 {
@@ -150,12 +166,15 @@ impl BoundedStream {
 
     pub fn into_content(self) -> BoundedStreamContent {
         let Self {
-            stream,
+            object,
             peak_bytes,
             _dictionary_charge,
             content_charge,
             ..
         } = self;
+        let Object::Stream(stream) = object else {
+            unreachable!("bounded stream always owns an Object::Stream")
+        };
         let Stream { content, .. } = stream;
         drop(_dictionary_charge);
         BoundedStreamContent {
@@ -170,11 +189,56 @@ impl BoundedStream {
         content_charge: ScalarCharge,
     ) -> Self {
         Self {
-            stream,
+            object: Object::Stream(stream),
             retained_bytes,
             peak_bytes,
             _dictionary_charge: dictionary_charge,
             content_charge,
+        }
+    }
+}
+
+impl std::fmt::Debug for BoundedObject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scalar(object) => formatter.debug_tuple("Scalar").field(object).finish(),
+            Self::Stream(object) => formatter.debug_tuple("Stream").field(object).finish(),
+        }
+    }
+}
+
+impl Deref for BoundedObject {
+    type Target = Object;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_object()
+    }
+}
+
+impl BoundedObject {
+    /// Inspect the owned scalar or stream without cloning stream content.
+    pub fn as_object(&self) -> &Object {
+        match self {
+            Self::Scalar(object) => object.as_object(),
+            Self::Stream(object) => object.as_object(),
+        }
+    }
+
+    pub const fn is_stream(&self) -> bool {
+        matches!(self, Self::Stream(_))
+    }
+
+    pub const fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Scalar(object) => object.retained_bytes(),
+            Self::Stream(object) => object.retained_bytes(),
+        }
+    }
+
+    pub const fn peak_bytes(&self) -> u64 {
+        match self {
+            Self::Scalar(object) => object.peak_bytes(),
+            Self::Stream(object) => object.peak_bytes(),
         }
     }
 }

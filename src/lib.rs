@@ -52,11 +52,12 @@ pub use encryption::{EncryptionState, EncryptionVersion, Permissions};
 pub use error::{DecompressError, Error, ParseError, Result};
 pub use incremental_document::IncrementalDocument;
 pub use indexed_reader::{
-    EncodedStreamLength, EncodedStreamLengthUnavailableReason, EncodedStreamProtection, EncodedStreamReader,
-    IndexedObjectCacheStats, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
-    IndexedReaderCacheStats, IndexedReaderError, IndexedReaderOptions, IndexedReaderResult,
-    IndexedReaderSourceCacheStats, IndexedStreamDescriptor, IndexedStreamReadError, IndexedStreamReadResult,
-    InheritedPageAttributeOwners, MissingNormalObjectReason, PageMap, PageMapEntry, SharedIndexedReaderResult,
+    BoundedObjectStream, EncodedStreamLength, EncodedStreamLengthUnavailableReason, EncodedStreamProtection,
+    EncodedStreamReader, IndexedObjectCacheStats, IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader,
+    IndexedReaderCacheOptions, IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats,
+    IndexedReaderOptions, IndexedReaderResult, IndexedReaderSourceCacheStats, IndexedStreamDescriptor,
+    IndexedStreamReadError, IndexedStreamReadResult, InheritedPageAttributeOwners, MissingNormalObjectReason, PageMap,
+    PageMapEntry, SharedIndexedReaderResult,
 };
 pub use load_options::{FilterFunc, LoadOptions};
 pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
@@ -64,7 +65,7 @@ pub use outlines::Outline;
 pub use reader::{PdfMetadata, Reader};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
 pub use scalar_budget::{
-    BoundedScalar, BoundedStream, BoundedStreamContent, ScalarResolutionPermit, ScalarResolutionStats,
+    BoundedObject, BoundedScalar, BoundedStream, BoundedStreamContent, ScalarResolutionPermit, ScalarResolutionStats,
 };
 #[cfg(any(unix, windows))]
 pub use source::FileSource;
