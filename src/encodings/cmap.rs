@@ -51,10 +51,19 @@ impl ToUnicodeCMap {
 
     pub(crate) fn parse(stream_content: Vec<u8>) -> Result<ToUnicodeCMap, UnicodeCMapError> {
         let cmap_sections = parse(&stream_content[..])?;
-        Self::from_sections(cmap_sections)
+        Self::from_sections(cmap_sections, true)
     }
 
-    fn from_sections(cmap_sections: Vec<CMapSection>) -> Result<ToUnicodeCMap, UnicodeCMapError> {
+    /// Parse the exact forward byte-to-Unicode map without constructing the reverse map used
+    /// only by Unicode-to-byte encoding.
+    pub(crate) fn parse_forward_only(stream_content: Vec<u8>) -> Result<ToUnicodeCMap, UnicodeCMapError> {
+        let cmap_sections = parse(&stream_content[..])?;
+        Self::from_sections(cmap_sections, false)
+    }
+
+    fn from_sections(
+        cmap_sections: Vec<CMapSection>, build_reverse_map: bool,
+    ) -> Result<ToUnicodeCMap, UnicodeCMapError> {
         let mut cmap = Self::new();
         for section in cmap_sections {
             match section {
@@ -87,8 +96,11 @@ impl ToUnicodeCMap {
             }
         }
 
-        let mut rev_map = HashMap::new();
+        if !build_reverse_map {
+            return Ok(cmap);
+        }
 
+        let mut rev_map = HashMap::new();
         for code_len_idx in 0..cmap.bf_ranges.len() {
             let code_len = (code_len_idx + 1) as u8;
             for (range, target) in cmap.bf_ranges[code_len_idx].iter() {
@@ -277,5 +289,33 @@ mod tests {
         assert_eq!(cmap.get(0x12, 2), Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR]));
         assert_eq!(cmap.get(0x13, 2), Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR]));
         assert_eq!(cmap.get(0x14, 2), Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR]));
+    }
+
+    #[test]
+    fn forward_only_full_four_byte_range_stays_compact() {
+        let content = b"/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapName /Full-Four-Byte-Range def\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <00000000> <FFFFFFFF>\n\
+            endcodespacerange\n\
+            1 beginbfrange\n\
+            <00000000> <FFFFFFFF> <0041>\n\
+            endbfrange\n\
+            endcmap\n\
+            CMapName currentdict /CMap defineresource pop\n\
+            end\n\
+            end\n"
+            .to_vec();
+
+        let cmap = ToUnicodeCMap::parse_forward_only(content).unwrap();
+
+        assert!(cmap.reverse_map.is_none());
+        assert_eq!(cmap.bf_ranges[3].iter().count(), 1);
+        assert_eq!(cmap.get(0, 4), Some(vec![0x0041]));
+        assert_eq!(cmap.get(1, 4), Some(vec![0x0042]));
+        assert_eq!(cmap.get(u32::MAX, 4), Some(vec![0x0040]));
     }
 }

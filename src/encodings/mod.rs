@@ -127,6 +127,18 @@ impl OwnedEncoding {
         })
     }
 
+    /// Parse already-decoded `/ToUnicode` bytes for forward text extraction.
+    ///
+    /// This preserves [`Self::from_to_unicode`]'s exact byte-to-text behavior while omitting the
+    /// reverse Unicode-to-source map. The reverse map is unnecessary for
+    /// [`Self::write_to_string`] and can otherwise enumerate every source code covered by a
+    /// compact `bfrange`.
+    pub fn from_to_unicode_for_extraction(content: Vec<u8>) -> Result<Self> {
+        Ok(Self {
+            kind: OwnedEncodingKind::UnicodeMap(ToUnicodeCMap::parse_forward_only(content)?),
+        })
+    }
+
     /// Apply a resolved encoding dictionary's required `/Differences` array.
     ///
     /// The caller owns the encoding dictionary's required-entry policy; this
@@ -430,6 +442,7 @@ mod tests {
         let content = exact_cmap();
         let borrowed = Encoding::UnicodeMapEncoding(ToUnicodeCMap::parse(content.clone()).unwrap());
         let owned = OwnedEncoding::from_to_unicode(content.clone()).unwrap();
+        let forward = OwnedEncoding::from_to_unicode_for_extraction(content.clone()).unwrap();
         let bytes = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, // A B 😀 D
             0xaa, 0xbb, 0xcc, 0xdd, // unmatched four-byte code
@@ -437,6 +450,7 @@ mod tests {
         ];
         let expected = borrowed.bytes_to_string(&bytes).unwrap();
         assert_eq!(owned_text(&owned, &bytes).unwrap(), expected);
+        assert_eq!(owned_text(&forward, &bytes).unwrap(), expected);
         assert_eq!(expected, "AB😀D��");
 
         let identity = OwnedEncoding::from_named(b"Identity-H", Some(content)).unwrap();
@@ -449,9 +463,68 @@ mod tests {
 
     #[test]
     fn owned_unicode_rejects_the_same_malformed_cmap_as_borrowed_parser() {
-        let malformed = b"1 beginbfchar\n<01> <0041>\n".to_vec();
-        assert!(ToUnicodeCMap::parse(malformed.clone()).is_err());
-        assert!(OwnedEncoding::from_to_unicode(malformed).is_err());
+        for malformed in [
+            b"1 beginbfchar\n<01> <0041>\n".to_vec(),
+            b"begincmap\n1 beginbfrange\n<02> <01> <0041>\nendbfrange\nendcmap\n".to_vec(),
+        ] {
+            let borrowed = ToUnicodeCMap::parse(malformed.clone()).unwrap_err();
+            let owned = OwnedEncoding::from_to_unicode(malformed.clone()).unwrap_err();
+            let forward = OwnedEncoding::from_to_unicode_for_extraction(malformed).unwrap_err();
+            assert_eq!(owned.to_string(), forward.to_string());
+            assert_eq!(owned.to_string(), Error::ToUnicodeCMap(borrowed).to_string());
+        }
+    }
+
+    #[test]
+    fn forward_only_unicode_matches_existing_owned_bfrange_targets() {
+        let content = b"/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapName /Owned-Ranges def\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <00> <FF>\n\
+            endcodespacerange\n\
+            3 beginbfrange\n\
+            <10> <12> <0041>\n\
+            <20> <21> <00610062>\n\
+            <30> <32> [<0044> <0045> <D83DDE00>]\n\
+            endbfrange\n\
+            endcmap\n\
+            CMapName currentdict /CMap defineresource pop\n\
+            end\n\
+            end\n"
+            .to_vec();
+        let existing = OwnedEncoding::from_to_unicode(content.clone()).unwrap();
+        let forward = OwnedEncoding::from_to_unicode_for_extraction(content).unwrap();
+        let bytes = [0x10, 0x11, 0x12, 0x20, 0x21, 0x30, 0x31, 0x32, 0xff];
+
+        let expected = owned_text(&existing, &bytes).unwrap();
+        assert_eq!(owned_text(&forward, &bytes).unwrap(), expected);
+        assert_eq!(expected, "ABCabacDE😀�");
+    }
+
+    #[test]
+    fn forward_only_owned_encoding_decodes_full_four_byte_range() {
+        let content = b"/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapName /Full-Four-Byte-Range def\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <00000000> <FFFFFFFF>\n\
+            endcodespacerange\n\
+            1 beginbfrange\n\
+            <00000000> <FFFFFFFF> <0041>\n\
+            endbfrange\n\
+            endcmap\n\
+            CMapName currentdict /CMap defineresource pop\n\
+            end\n\
+            end\n"
+            .to_vec();
+        let encoding = OwnedEncoding::from_to_unicode_for_extraction(content).unwrap();
+
+        assert_eq!(owned_text(&encoding, &[0, 0, 0, 0, 0, 0, 0, 1]).unwrap(), "AB");
     }
 
     #[test]
