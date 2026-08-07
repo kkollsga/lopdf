@@ -522,6 +522,7 @@ impl IndexedReaderIndexStats {
 #[cfg(test)]
 thread_local! {
     static OBJECT_BODY_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PAGE_TREE_WALK_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Why a normal xref entry has eager-compatible object-not-found semantics.
@@ -2007,6 +2008,8 @@ impl PageMap {
 
 impl PageMapBuilder<'_> {
     fn walk_page_tree(&mut self, page_map: &mut PageMap, root_id: crate::ObjectId) -> IndexedReaderResult<()> {
+        #[cfg(test)]
+        PAGE_TREE_WALK_CALLS.with(|calls| calls.set(calls.get() + 1));
         let Some(mut root) = self.reader.resolve_dictionary_deref(root_id)? else {
             return Ok(());
         };
@@ -3444,6 +3447,16 @@ impl IndexedReader {
         PageMap::from_reader(self)
     }
 
+    /// Derive one owned page map and its conservative index residency snapshot.
+    ///
+    /// The stats are estimated from the returned map's exact allocation, so
+    /// callers that need both values perform only one bounded page-tree walk.
+    pub fn page_map_with_stats(&self) -> IndexedReaderResult<(PageMap, IndexedReaderIndexStats)> {
+        let page_map = self.page_map()?;
+        let stats = self.index_stats_for_page_map(&page_map);
+        Ok((page_map, stats))
+    }
+
     /// Return an owned trailer value, resolving an indirect entry through the
     /// same object resolver used by [`Self::resolve_object`]. Direct values are
     /// cloned from the immutable index. Missing keys return `Ok(None)`.
@@ -3499,6 +3512,10 @@ impl IndexedReader {
     /// Compute conservative index/page-map residency and live cardinalities.
     pub fn index_stats(&self) -> IndexedReaderResult<IndexedReaderIndexStats> {
         let page_map = self.page_map()?;
+        Ok(self.index_stats_for_page_map(&page_map))
+    }
+
+    fn index_stats_for_page_map(&self, page_map: &PageMap) -> IndexedReaderIndexStats {
         let index_retained_bytes = u64_from_usize_saturating(index_retained_bytes(self));
         let page_map_retained_bytes = u64_from_usize_saturating(
             std::mem::size_of::<PageMap>().saturating_add(
@@ -3508,7 +3525,7 @@ impl IndexedReader {
                     .saturating_mul(std::mem::size_of::<PageMapEntry>()),
             ),
         );
-        Ok(IndexedReaderIndexStats {
+        IndexedReaderIndexStats {
             object_count: self
                 .index
                 .locations
@@ -3519,7 +3536,7 @@ impl IndexedReader {
             index_retained_bytes,
             page_map_retained_bytes,
             estimated_retained_bytes: index_retained_bytes.saturating_add(page_map_retained_bytes),
-        })
+        }
     }
 
     /// PDF header version, for example `"1.7"`.
@@ -7230,6 +7247,64 @@ mod tests {
         pdf
     }
 
+    fn cyclic_page_tree_pdf() -> Vec<u8> {
+        object_pdf(&[
+            ObjectDef {
+                id: 1,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Catalog /Pages 2 0 R >>",
+            },
+            ObjectDef {
+                id: 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 999999 >>",
+            },
+            ObjectDef {
+                id: 3,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Pages /Kids [2 0 R 5 0 R] /Count -1 >>",
+            },
+            ObjectDef {
+                id: 4,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+            ObjectDef {
+                id: 5,
+                object_generation: 0,
+                xref_generation: 0,
+                body: b"<< /Type /Page >>",
+            },
+        ])
+    }
+
+    fn assert_page_map_snapshot_matches_legacy(reader: &IndexedReader) {
+        let legacy_page_map = reader.page_map().unwrap();
+        let legacy_stats = reader.index_stats().unwrap();
+        let (page_map, stats) = reader.page_map_with_stats().unwrap();
+        assert_eq!(page_map, legacy_page_map);
+        assert_eq!(stats, legacy_stats);
+        assert_eq!(stats.page_count(), page_map.len());
+    }
+
+    fn assert_indexed_errors_equal(expected: &IndexedReaderError, actual: &IndexedReaderError) {
+        assert_eq!(std::mem::discriminant(expected), std::mem::discriminant(actual));
+        assert_eq!(expected.to_string(), actual.to_string());
+        assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+    }
+
+    fn assert_page_map_snapshot_error_matches_legacy(reader: &IndexedReader) {
+        let page_map_error = reader.page_map().unwrap_err();
+        let stats_error = reader.index_stats().unwrap_err();
+        let combined_error = reader.page_map_with_stats().unwrap_err();
+        assert_indexed_errors_equal(&page_map_error, &stats_error);
+        assert_indexed_errors_equal(&page_map_error, &combined_error);
+    }
+
     fn repeated_page_dag_pdf(levels: u32) -> Vec<u8> {
         let mut document = Document::with_version("1.7");
         document.objects.insert(
@@ -7575,6 +7650,7 @@ mod tests {
         ));
         let page_map = reader.page_map().unwrap_err();
         assert_eq!(page_map.to_string(), direct.to_string());
+        assert_page_map_snapshot_error_matches_legacy(&reader);
     }
 
     #[test]
@@ -7664,38 +7740,7 @@ mod tests {
 
     #[test]
     fn page_map_bounds_cycles_depth_and_page_count_without_trusting_count() {
-        let cyclic = object_pdf(&[
-            ObjectDef {
-                id: 1,
-                object_generation: 0,
-                xref_generation: 0,
-                body: b"<< /Type /Catalog /Pages 2 0 R >>",
-            },
-            ObjectDef {
-                id: 2,
-                object_generation: 0,
-                xref_generation: 0,
-                body: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 999999 >>",
-            },
-            ObjectDef {
-                id: 3,
-                object_generation: 0,
-                xref_generation: 0,
-                body: b"<< /Type /Pages /Kids [2 0 R 5 0 R] /Count -1 >>",
-            },
-            ObjectDef {
-                id: 4,
-                object_generation: 0,
-                xref_generation: 0,
-                body: b"<< /Type /Page >>",
-            },
-            ObjectDef {
-                id: 5,
-                object_generation: 0,
-                xref_generation: 0,
-                body: b"<< /Type /Page >>",
-            },
-        ]);
+        let cyclic = cyclic_page_tree_pdf();
         let reader = open_reader(&cyclic, ResolverLimits::default());
         let eager = Document::load_mem(&cyclic).unwrap();
         let eager_pages: Vec<_> = eager.page_iter().collect();
@@ -7991,6 +8036,58 @@ mod tests {
                 .iter()
                 .all(|page| { page.inherited.resources == Some((2, 0)) && page.inherited.media_box == Some((2, 0)) })
         );
+    }
+
+    #[test]
+    fn page_map_with_stats_matches_normal_legacy_results_and_walks_once() {
+        let reader = open_reader(&generated_page_tree_pdf(3, 999), ResolverLimits::default());
+        let legacy_page_map = reader.page_map().unwrap();
+        let legacy_stats = reader.index_stats().unwrap();
+
+        PAGE_TREE_WALK_CALLS.with(|calls| calls.set(0));
+        let (page_map, stats) = reader.page_map_with_stats().unwrap();
+        assert_eq!(PAGE_TREE_WALK_CALLS.with(Cell::get), 1);
+        assert_eq!(page_map, legacy_page_map);
+        assert_eq!(stats, legacy_stats);
+
+        PAGE_TREE_WALK_CALLS.with(|calls| calls.set(0));
+        let _ = reader.page_map().unwrap();
+        let _ = reader.index_stats().unwrap();
+        assert_eq!(PAGE_TREE_WALK_CALLS.with(Cell::get), 2);
+    }
+
+    #[test]
+    fn page_map_with_stats_matches_large_and_encrypted_legacy_results() {
+        for page_count in [5_000, 10_000] {
+            let reader = open_reader(&generated_page_tree_pdf(page_count, -1), ResolverLimits::default());
+            assert_page_map_snapshot_matches_legacy(&reader);
+        }
+
+        let pdf = encrypted_page_tree_pdf();
+        let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
+        assert_page_map_snapshot_matches_legacy(&reader);
+    }
+
+    #[test]
+    fn page_map_with_stats_matches_cycle_depth_and_limit_legacy_results() {
+        let reader = open_reader(&cyclic_page_tree_pdf(), ResolverLimits::default());
+        assert_page_map_snapshot_matches_legacy(&reader);
+
+        let reader = open_reader(
+            &generated_deep_page_tree_pdf(DEFAULT_PAGE_TREE_DEPTH_LIMIT + 1),
+            ResolverLimits::default(),
+        );
+        assert_page_map_snapshot_matches_legacy(&reader);
+
+        let reader = IndexedReader::open_with_options(
+            BytesSource::from(generated_page_tree_pdf(2, 2)),
+            IndexedReaderOptions {
+                max_pages: 1,
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+        assert_page_map_snapshot_error_matches_legacy(&reader);
     }
 
     #[test]
@@ -11279,6 +11376,7 @@ mod tests {
                 PageMap::from_reader(&reader),
                 Err(IndexedReaderError::Source(_))
             ));
+            assert_page_map_snapshot_error_matches_legacy(&reader);
         }
 
         let reader = IndexedReader::open_with_limits(
@@ -11293,6 +11391,7 @@ mod tests {
             PageMap::from_reader(&reader),
             Err(IndexedReaderError::ObjectLimitExceeded { limit: 8, .. })
         ));
+        assert_page_map_snapshot_error_matches_legacy(&reader);
     }
 
     #[test]

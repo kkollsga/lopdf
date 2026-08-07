@@ -113,7 +113,12 @@ fn object_ids_exclude_free_entries_and_preserve_generations() {
 #[test]
 fn index_stats_count_actual_pages_and_bound_structural_residency() {
     let reader = IndexedReader::open(BytesSource::from(indexed_fixture())).unwrap();
-    let stats = reader.index_stats().unwrap();
+    let legacy_map = reader.page_map().unwrap();
+    let legacy_stats = reader.index_stats().unwrap();
+    let (page_map, stats) = reader.page_map_with_stats().unwrap();
+
+    assert_eq!(page_map, legacy_map);
+    assert_eq!(stats, legacy_stats);
 
     assert_eq!(stats.object_count(), 5);
     assert_eq!(stats.page_count(), 1);
