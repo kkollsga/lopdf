@@ -3457,6 +3457,15 @@ impl IndexedReader {
         }
     }
 
+    /// Return an owned trailer value without dereferencing an indirect entry.
+    ///
+    /// This is a structural index lookup only: missing keys return `None`,
+    /// direct values are cloned as-is, and references remain
+    /// [`Object::Reference`] values. No target object or source bytes are read.
+    pub fn trailer_entry_raw_owned(&self, key: &[u8]) -> Option<Object> {
+        self.index.trailer.get(key).ok().cloned()
+    }
+
     /// Enumerate every live indexed indirect object id in deterministic order.
     ///
     /// Free entries are excluded. Normal entries preserve their xref
@@ -13499,5 +13508,32 @@ mod tests {
         assert_eq!(stream_object.content, b"encrypted payload");
         drop(stream);
         assert_eq!(stream_permit.stats().current_bytes, 0);
+    }
+
+    #[test]
+    fn encrypted_raw_trailer_lookup_never_resolves_or_reads_reference_targets() {
+        let source = Arc::new(TracingBytesSource {
+            bytes: encrypted_pdf_with_stream(6, "owner", "user", b"encrypted payload"),
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let reader = IndexedReader::open_shared(
+            erased,
+            IndexedReaderOptions {
+                password: Some(b"user".to_vec()),
+                ..IndexedReaderOptions::default()
+            },
+        )
+        .unwrap();
+        source.requests.lock().unwrap().clear();
+
+        assert_eq!(reader.trailer_entry_raw_owned(b"Root"), Some(Object::Reference((3, 0))));
+        assert!(matches!(
+            reader.trailer_entry_raw_owned(b"Encrypt"),
+            Some(Object::Reference(_))
+        ));
+        assert!(matches!(reader.trailer_entry_raw_owned(b"ID"), Some(Object::Array(_))));
+        assert_eq!(reader.trailer_entry_raw_owned(b"Missing"), None);
+        assert!(source.requests.lock().unwrap().is_empty());
     }
 }

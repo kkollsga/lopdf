@@ -95,6 +95,16 @@ fn trailer_entries_are_owned_and_indirect_values_are_resolved() {
 }
 
 #[test]
+fn raw_trailer_entries_preserve_missing_direct_and_reference_shapes() {
+    let reader = IndexedReader::open(BytesSource::from(indexed_fixture())).unwrap();
+
+    assert_eq!(reader.trailer_entry_raw_owned(b"Missing"), None);
+    assert_eq!(reader.trailer_entry_raw_owned(b"Flag"), Some(Object::Boolean(true)));
+    assert_eq!(reader.trailer_entry_raw_owned(b"Info"), Some(Object::Reference((5, 2))));
+    assert!(reader.trailer_entry_owned(b"Info").unwrap().unwrap().as_dict().is_ok());
+}
+
+#[test]
 fn object_ids_exclude_free_entries_and_preserve_generations() {
     let reader = IndexedReader::open(BytesSource::from(indexed_fixture())).unwrap();
     assert_eq!(reader.object_ids(), vec![(1, 4), (2, 0), (3, 0), (5, 2), (6, 0)]);
