@@ -921,8 +921,29 @@ pub struct BoundedObjectStream {
     container_id: crate::ObjectId,
     selected: crate::object_stream::SelectedObjectStream,
     permit: ScalarResolutionPermit,
-    charges: Vec<ScalarCharge>,
+    charges: Box<[ScalarCharge]>,
 }
+
+/// Conservative bytes retained by a prepared object-stream owner which are
+/// deliberately not included in [`BoundedObjectStream::retained_bytes`].
+///
+/// The decoded buffer and member-index capacities are charged by the scalar
+/// permit. This envelope covers their allocation owners, the shared permit
+/// state, two retained charge handles, and allocator headers. Downstream cell
+/// caches must precharge at least this amount before preparing a container.
+pub const BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES: u64 = 512;
+
+const BOUNDED_OBJECT_STREAM_CHARGE_HANDLES: usize = 2;
+const BOUNDED_OBJECT_STREAM_ALLOCATIONS: usize = 5;
+const ALLOCATOR_HEADER_ENVELOPE_BYTES: usize = 2 * std::mem::size_of::<usize>();
+const BOUNDED_OBJECT_STREAM_EXCLUDED_STRUCTURAL_BYTES: usize = std::mem::size_of::<Vec<u8>>()
+    + 4 * std::mem::size_of::<usize>()
+    + crate::scalar_budget::PERMIT_INNER_STRUCTURAL_BYTES
+    + BOUNDED_OBJECT_STREAM_CHARGE_HANDLES * crate::scalar_budget::SCALAR_CHARGE_STRUCTURAL_BYTES
+    + BOUNDED_OBJECT_STREAM_ALLOCATIONS * ALLOCATOR_HEADER_ENVELOPE_BYTES;
+const _: () = assert!(
+    BOUNDED_OBJECT_STREAM_EXCLUDED_STRUCTURAL_BYTES <= BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES as usize
+);
 
 impl std::fmt::Debug for BoundedObjectStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -946,6 +967,18 @@ impl BoundedObjectStream {
             .iter()
             .map(ScalarCharge::bytes)
             .fold(0, u64::saturating_add)
+    }
+
+    /// Exact target-layout structural weight excluded from `retained_bytes`.
+    /// The returned value is bounded by
+    /// [`BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES`] in production builds.
+    pub fn excluded_structural_bytes(&self) -> u64 {
+        let actual = std::mem::size_of::<Vec<u8>>()
+            + 4 * std::mem::size_of::<usize>()
+            + crate::scalar_budget::PERMIT_INNER_STRUCTURAL_BYTES
+            + self.charges.len() * crate::scalar_budget::SCALAR_CHARGE_STRUCTURAL_BYTES
+            + BOUNDED_OBJECT_STREAM_ALLOCATIONS * ALLOCATOR_HEADER_ENVELOPE_BYTES;
+        u64::try_from(actual).unwrap_or(u64::MAX)
     }
 
     /// Parse one declared member while keeping both the prepared container and
@@ -2297,7 +2330,7 @@ impl IndexedReader {
             container_id: container,
             selected,
             permit: permit.clone(),
-            charges,
+            charges: charges.into_boxed_slice(),
         })
     }
 
@@ -13600,6 +13633,12 @@ mod tests {
         let prepared = reader
             .prepare_object_stream_with_permit(container, &container_permit)
             .unwrap();
+        assert_eq!(prepared.charges.len(), BOUNDED_OBJECT_STREAM_CHARGE_HANDLES);
+        assert_eq!(
+            prepared.excluded_structural_bytes(),
+            BOUNDED_OBJECT_STREAM_EXCLUDED_STRUCTURAL_BYTES as u64
+        );
+        assert!(prepared.excluded_structural_bytes() <= BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES);
         assert_eq!(container_permit.stats().current_bytes, prepared.retained_bytes());
         assert_eq!(member_permit.stats().current_bytes, 0);
 

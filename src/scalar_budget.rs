@@ -39,6 +39,9 @@ struct PermitState {
     closed: bool,
 }
 
+pub(crate) const PERMIT_INNER_STRUCTURAL_BYTES: usize = std::mem::size_of::<PermitInner>();
+pub(crate) const SCALAR_CHARGE_STRUCTURAL_BYTES: usize = std::mem::size_of::<ScalarCharge>();
+
 pub(crate) struct ScalarCharge {
     inner: Arc<PermitInner>,
     bytes: u64,
