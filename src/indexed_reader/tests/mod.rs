@@ -470,11 +470,32 @@ fn encrypted_object_stream_pdf_with_options(
     if prefix_padding != 0 {
         container_dictionary.set("PrefixPad", Object::Name(vec![b'x'; prefix_padding]));
     }
-    let mut container = Object::Stream(Stream::new(container_dictionary, content));
-    if flate {
-        container.as_stream_mut().unwrap().compress().unwrap();
-    }
-    encryption::encrypt_object(&state, (CONTAINER_ID, 0), &mut container).unwrap();
+    // ISO 32000-1 §7.3.8.1 only permits LF or CRLF after the `stream` keyword. The bare-CR
+    // variant these fixtures can emit is deliberate — it pins the lenient recovery both the
+    // eager and the indexed reader implement — but it is only unambiguous while the first
+    // payload byte is not itself an EOL byte: `stream\r` followed by 0x0A reads as a legal
+    // CRLF and silently swallows a payload byte. AES crypt filters prefix the ciphertext with
+    // a random IV, so re-encrypt a fresh copy of the plaintext until the leading byte cannot
+    // be misread. RC4 revisions are deterministic, hence the bounded attempt count.
+    let plain_container = Object::Stream(Stream::new(container_dictionary, content));
+    let mut attempts = 0_u32;
+    let mut container = loop {
+        let mut candidate = plain_container.clone();
+        if flate {
+            candidate.as_stream_mut().unwrap().compress().unwrap();
+        }
+        encryption::encrypt_object(&state, (CONTAINER_ID, 0), &mut candidate).unwrap();
+        let leading = candidate.as_stream().unwrap().content.first().copied();
+        if stream_eol != b"\r" || !matches!(leading, Some(b'\n' | b'\r')) {
+            break candidate;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 64,
+            "bare-CR encrypted ObjStm fixture (revision {revision}, flate {flate}) could not \
+             produce a leading ciphertext byte outside {{CR, LF}}"
+        );
+    };
     if let Some(declared_length) = declared_length {
         container.as_stream_mut().unwrap().dict.set("Length", declared_length);
     }
