@@ -6513,11 +6513,13 @@ const MAX_OBJECT_STREAM_PREDICTOR_ROW_BYTES: i64 = 64 * 1024;
 /// reproduce faithfully, or `None` to fail closed and let the caller fall back.
 ///
 /// The envelope is deliberately narrower than [`Stream::decode_filters`]
-/// supports: it admits only the forms that decoder decodes *correctly*. In
-/// particular `decode_filters` reads `/DecodeParms` with `as_dict`, so the
-/// array form documented for filter chains (ISO 32000-1, 7.4.1) reaches the
-/// decoder as "no parameters at all" — faithful only when every entry in it is
-/// a no-op, and refused otherwise rather than decoded to the wrong bytes.
+/// supports: it admits only the forms that decoder decodes *correctly*, and
+/// only the ones whose peak memory the permit can charge. `/DecodeParms` is
+/// read the same way the decoder reads it — [`Stream::decode_parms`] zips the
+/// array form (ISO 32000-1, 7.4.1) onto the filter chain — so the check here
+/// looks at whatever entry the *terminal* Flate/LZW layer will actually
+/// receive; the ASCIIHex/ASCII85 prefix this envelope admits takes no
+/// parameters at all and ignores whatever sits opposite it.
 fn limited_object_stream_encoding(dictionary: &Dictionary) -> Option<LimitedObjectStreamEncoding> {
     let filters: Vec<&[u8]> = match dictionary.get(b"Filter") {
         Err(_) | Ok(Object::Null) => return Some(LimitedObjectStreamEncoding::Plain),
@@ -6545,33 +6547,30 @@ fn limited_object_stream_encoding(dictionary: &Dictionary) -> Option<LimitedObje
     {
         return None;
     }
-    match dictionary.get(b"DecodeParms") {
-        Err(_) | Ok(Object::Null) => {}
-        // A single parameter dictionary reaches every layer, but only the
-        // terminal Flate/LZW reads one, and the chain admits exactly one of
-        // those.
-        Ok(Object::Dictionary(params)) => {
-            if !limited_decode_parameters_are_reproducible(params) {
-                return None;
-            }
-        }
+    // Whatever the terminal Flate/LZW layer will be handed: a single dictionary
+    // reaches every layer, an array hands entry *i* to filter *i*, and a shorter
+    // array (or a `null` entry) leaves that layer on its defaults.
+    let terminal_params = match dictionary.get(b"DecodeParms") {
+        Err(_) | Ok(Object::Null) => None,
+        Ok(Object::Dictionary(params)) => Some(params),
         Ok(Object::Array(items)) => {
             if items.len() > MAX_OBJECT_STREAM_FILTERS {
                 return None;
             }
-            for item in items {
-                match item {
-                    Object::Null => {}
-                    Object::Dictionary(params) => {
-                        if !limited_decode_parameters_are_absent_or_neutral(params) {
-                            return None;
-                        }
-                    }
-                    _ => return None,
-                }
+            match items.get(prefix.len()) {
+                None | Some(Object::Null) => None,
+                Some(Object::Dictionary(params)) => Some(params),
+                // Anything else — a reference above all — reaches the decoder as
+                // "defaults", which is not what the document asked for.
+                Some(_) => return None,
             }
         }
         Ok(_) => return None,
+    };
+    if let Some(params) = terminal_params
+        && !limited_decode_parameters_are_reproducible(params)
+    {
+        return None;
     }
     Some(LimitedObjectStreamEncoding::Decoded)
 }
@@ -6612,20 +6611,6 @@ fn limited_decode_parameters_are_reproducible(params: &Dictionary) -> bool {
         .checked_mul(colors)
         .and_then(|samples| samples.checked_mul(bits))
         .is_some_and(|row_bits| (row_bits + 7) / 8 <= MAX_OBJECT_STREAM_PREDICTOR_ROW_BYTES)
-}
-
-/// Whether `params` changes nothing about the decode, so dropping it — which is
-/// what the array `/DecodeParms` form does today — is faithful.
-fn limited_decode_parameters_are_absent_or_neutral(params: &Dictionary) -> bool {
-    let neutral_predictor = matches!(
-        params.get(b"Predictor"),
-        Err(_) | Ok(Object::Null) | Ok(Object::Integer(1))
-    );
-    let neutral_early_change = matches!(
-        params.get(b"EarlyChange"),
-        Err(_) | Ok(Object::Null) | Ok(Object::Integer(1))
-    );
-    neutral_predictor && neutral_early_change
 }
 
 fn limited_decode_parameter(params: &Dictionary, key: &[u8], default: i64) -> Option<i64> {
@@ -14789,6 +14774,13 @@ mod tests {
             .unwrap()
     }
 
+    /// The `/EarlyChange 0` counterpart of [`lzw_encode`]: the plain (non-TIFF)
+    /// code-size switch `Stream::decompress_lzw` selects when the parameter
+    /// reaches it.
+    fn lzw_encode_late_change(data: &[u8]) -> Vec<u8> {
+        weezl::encode::Encoder::new(weezl::BitOrder::Msb, 8).encode(data).unwrap()
+    }
+
     fn ascii_hex_encode(data: &[u8]) -> Vec<u8> {
         let mut output = Vec::with_capacity(data.len() * 2 + 1);
         for byte in data {
@@ -14901,6 +14893,34 @@ mod tests {
                 "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 1 >>]".into(),
                 ascii_hex_encode(&flate_encode(&plain)),
             ),
+            // ISO 32000-1, 7.4.1: a filter chain carries its parameters as an
+            // array parallel to `/Filter`, `null` for the layers that take none.
+            // The predictor here is live, so an implementation that dropped the
+            // array would hand back predicted (wrong) bytes.
+            (
+                "live-array-decode-parms",
+                format!(
+                    "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>]"
+                ),
+                ascii_hex_encode(&flate_encode(&png_up_predict(&rows, ROW))),
+            ),
+            (
+                "single-filter-array-decode-parms",
+                format!(
+                    "/Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>]"
+                ),
+                flate_encode(&png_up_predict(&rows, ROW)),
+            ),
+            (
+                "lzw-early-change-array-decode-parms",
+                "/Filter [/LZWDecode] /DecodeParms [<< /EarlyChange 0 >>]".into(),
+                lzw_encode_late_change(&plain),
+            ),
+            (
+                "lzw-early-change-dictionary-decode-parms",
+                "/Filter /LZWDecode /DecodeParms << /EarlyChange 0 >>".into(),
+                lzw_encode_late_change(&plain),
+            ),
         ];
 
         let expected = crate::parser::direct_object(body.as_slice()).unwrap();
@@ -14941,11 +14961,12 @@ mod tests {
             "/Filter /FlateDecode /DecodeParms << /Predictor 3 >>",
             // An operand the decoder would silently replace with its default.
             "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 8 0 R >>",
-            // The array `/DecodeParms` form reaches the decoder as no parameters
-            // at all, so a live predictor inside one cannot be reproduced.
-            "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 8 >>]",
-            "/Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 8 >>]",
-            "/Filter [/LZWDecode] /DecodeParms [<< /EarlyChange 0 >>]",
+            // The array form is decoded now, so the same operand limits apply to
+            // whatever entry the terminal layer is handed, and an entry that is
+            // neither a dictionary nor `null` still reaches it as its defaults.
+            "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 3 >>]",
+            "/Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 1000000 >>]",
+            "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null 9 0 R]",
             // Terminal filters and chain shapes outside the envelope.
             "/Filter /RunLengthDecode",
             "/Filter /Crypt",

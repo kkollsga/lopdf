@@ -863,6 +863,36 @@ impl Stream {
         }
     }
 
+    /// This stream's `/DecodeParms`, one entry per filter, in decoding order.
+    ///
+    /// ISO 32000-1, 7.4.1: when `/Filter` is an array, `/DecodeParms` shall be
+    /// an array of the same length whose entry *i* carries filter *i*'s
+    /// parameters, with `null` standing in for any filter that takes none. A
+    /// single dictionary is the form used for a single filter; it is applied to
+    /// every layer here, which stays unambiguous because at most one filter in a
+    /// realistic chain reads parameters at all (the ASCII and run-length filters
+    /// take none).
+    ///
+    /// Any entry that is absent, `null`, an indirect reference (a `Stream` has
+    /// no document to resolve it against), or otherwise not a dictionary yields
+    /// `None`, i.e. "that layer decodes with its defaults" — which is exactly
+    /// how the whole key was treated before the array form was understood.
+    ///
+    /// Returns exactly `filter_count` entries so the caller can zip it against
+    /// [`Stream::filters`] without a length check.
+    pub fn decode_parms(&self, filter_count: usize) -> Vec<Option<&Dictionary>> {
+        match self.dict.get(b"DecodeParms") {
+            Ok(Object::Array(items)) => (0..filter_count)
+                .map(|index| items.get(index).and_then(|item| item.as_dict().ok()))
+                .collect(),
+            Ok(other) => {
+                let params = other.as_dict().ok();
+                vec![params; filter_count]
+            }
+            Err(_) => vec![None; filter_count],
+        }
+    }
+
     pub fn set_content(&mut self, content: Vec<u8>) {
         self.content = content;
         self.dict.set("Length", self.content.len() as i64);
@@ -962,7 +992,6 @@ impl Stream {
     /// variants. `limit` is `None` to decode without a size limit, or
     /// `Some(max)` to cap the decoded output at `max` bytes per filter layer.
     fn decode_filters(&self, limit: Option<usize>) -> Result<Vec<u8>> {
-        let params = self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
         let filters = match self.filters() {
             Ok(f) => f,
             // No /Filter key means the stream is uncompressed. The raw content is
@@ -977,11 +1006,13 @@ impl Stream {
             }
         };
 
+        let params = self.decode_parms(filters.len());
         let mut input = self.content.as_slice();
         let mut output = vec![];
 
-        // Filters are in decoding order.
-        for filter in filters {
+        // Filters are in decoding order, and `decode_parms` hands back one entry
+        // per filter in that same order, so layer *i* gets its own parameters.
+        for (filter, params) in filters.into_iter().zip(params) {
             output = match filter {
                 b"FlateDecode" => Self::decompress_zlib(input, params, limit)?,
                 b"LZWDecode" => Self::decompress_lzw(input, params, limit)?,
