@@ -336,14 +336,14 @@ fn incremental_merge_keeps_newest_object_and_trailer() {
 }
 
 #[test]
-fn hybrid_supplement_is_merged_after_current_and_previous_tables() {
+fn hybrid_supplement_is_merged_with_its_own_section() {
     let pdf = hybrid_incremental_pdf();
     let eager = assert_shared_fingerprint(&pdf, "hybrid", 7, false);
 
     assert_eq!(trailer_text(&eager, b"Revision"), "hybrid");
     assert!(
         eager.trailer.get(b"XRefStm").is_err(),
-        "XRefStm is consumed while following Prev"
+        "XRefStm is consumed with the section that declares it"
     );
     assert!(matches!(
         eager.reference_table.get(7),
@@ -363,31 +363,46 @@ fn hybrid_supplement_is_merged_after_current_and_previous_tables() {
 }
 
 #[test]
-fn xrefstm_without_prev_remains_unconsumed_and_unmerged() {
-    let (pdf, xref_stream_offset) = xrefstm_without_prev_pdf();
-    let eager = assert_shared_fingerprint(&pdf, "no-prev", 6, false);
+fn xrefstm_of_the_only_section_is_consumed_and_merged() {
+    let (pdf, _) = xrefstm_without_prev_pdf();
+    let eager = assert_shared_fingerprint(&pdf, "no-prev", 7, false);
 
     assert_eq!(trailer_text(&eager, b"Revision"), "no-prev");
-    assert_eq!(
-        eager.trailer.get(b"XRefStm").unwrap().as_i64().unwrap(),
-        xref_stream_offset as i64,
-        "XRefStm remains in the newest trailer when there is no Prev"
+    assert!(
+        eager.trailer.get(b"XRefStm").is_err(),
+        "the supplement of the newest section is consumed even without a Prev"
     );
     assert!(
-        eager.reference_table.get(7).is_none(),
-        "the supplement is not merged unless the Prev loop runs"
+        matches!(
+            eager.reference_table.get(7),
+            Some(XrefEntry::Compressed { container: 5, index: 0 })
+        ),
+        "a section's own supplement is read whether or not the chain continues"
+    );
+    assert!(
+        eager
+            .get_object((7, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Supplement")
+            .unwrap()
+            .as_bool()
+            .unwrap()
     );
 }
 
 #[test]
-fn previous_table_entry_wins_collision_with_hybrid_supplement() {
-    let (pdf, previous_object_offset) = hybrid_collision_pdf();
+fn hybrid_supplement_wins_collision_with_previous_table() {
+    let (pdf, _) = hybrid_collision_pdf();
     let eager = assert_shared_fingerprint(&pdf, "collision", 9, false);
 
     assert_eq!(trailer_text(&eager, b"Revision"), "newest");
+    // ISO 32000-1, 7.5.8.4: the newest section's supplement describes that
+    // revision, so it supersedes an older section's entry for the same object.
     assert!(matches!(
         eager.reference_table.get(7),
-        Some(XrefEntry::Normal { offset, generation: 0 }) if *offset == previous_object_offset as u32
+        Some(XrefEntry::Compressed { container: 8, index: 0 })
     ));
     let winner = eager
         .get_object((7, 0))
@@ -398,7 +413,7 @@ fn previous_table_entry_wins_collision_with_hybrid_supplement() {
         .unwrap()
         .as_str()
         .unwrap();
-    assert_eq!(winner, b"previous-table");
+    assert_eq!(winner, b"supplement");
 }
 
 #[test]

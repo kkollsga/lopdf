@@ -592,32 +592,36 @@ impl Reader<'_> {
         let (mut reference_table, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], self)?;
 
         // Read previous Xrefs of linearized or incremental updated document.
+        //
+        // Every section along the chain carries its own hybrid-reference
+        // supplement: `/XRefStm` describes the section's *own* revision, so it
+        // is applied to that section before the section is merged and before
+        // descending to `/Prev`. In a linearized hybrid file the first-page
+        // section's `/XRefStm` is the only place the compressed objects are
+        // described at all, so reading only the newest section's supplement
+        // loses every object stream member in the file.
         let mut already_seen = HashSet::new();
+        let mut already_seen_supplements = HashSet::new();
+        let xref_stream_start = trailer.remove(b"XRefStm");
+        self.apply_hybrid_supplement(&mut reference_table, xref_stream_start, &mut already_seen_supplements)?;
+
         let mut prev_xref_start = trailer.remove(b"Prev");
-        while let Some(prev) = prev_xref_start.and_then(|offset| offset.as_i64().ok()) {
-            if already_seen.contains(&prev) {
+        while let Some(prev) = prev_xref_start.take().and_then(|offset| offset.as_i64().ok()) {
+            if !already_seen.insert(prev) {
                 break;
             }
-            already_seen.insert(prev);
             if prev < 0 || prev as usize > self.buffer.len() {
                 return Err(Error::Xref(XrefError::PrevStart));
             }
 
-            let (prev_xref, prev_trailer) = parser::xref_and_trailer(&self.buffer[prev as usize..], self)?;
-            reference_table.merge(prev_xref);
+            let (mut prev_xref, mut prev_trailer) = parser::xref_and_trailer(&self.buffer[prev as usize..], self)?;
 
             // Read xref stream in hybrid-reference file.
-            let prev_xref_stream_start = trailer.remove(b"XRefStm");
-            if let Some(prev) = prev_xref_stream_start.and_then(|offset| offset.as_i64().ok()) {
-                if prev < 0 || prev as usize > self.buffer.len() {
-                    return Err(Error::Xref(XrefError::StreamStart));
-                }
+            let prev_xref_stream_start = prev_trailer.remove(b"XRefStm");
+            self.apply_hybrid_supplement(&mut prev_xref, prev_xref_stream_start, &mut already_seen_supplements)?;
+            reference_table.merge(prev_xref);
 
-                let (prev_xref, _) = parser::xref_and_trailer(&self.buffer[prev as usize..], self)?;
-                reference_table.merge(prev_xref);
-            }
-
-            prev_xref_start = prev_trailer.get(b"Prev").cloned().ok();
+            prev_xref_start = prev_trailer.remove(b"Prev");
         }
         let xref_entry_count = reference_table.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
         if reference_table.size != xref_entry_count {
@@ -634,6 +638,33 @@ impl Reader<'_> {
             reference_table,
             trailer,
         })
+    }
+
+    /// Apply a hybrid-reference section's `/XRefStm` supplement to that
+    /// section's own entries.
+    ///
+    /// Per ISO 32000-1, 7.5.8.4 the supplement lists the revision's compressed
+    /// objects, which the classic section must mask as free for the benefit of
+    /// readers that do not support object streams. A reader that does support
+    /// them has to let the supplement take precedence within the revision, so
+    /// the entries are superseded rather than merged. `already_seen` keeps a
+    /// chain that names the same supplement twice from re-reading it.
+    fn apply_hybrid_supplement(
+        &self, section: &mut Xref, start: Option<Object>, already_seen: &mut HashSet<i64>,
+    ) -> Result<()> {
+        let Some(start) = start.and_then(|offset| offset.as_i64().ok()) else {
+            return Ok(());
+        };
+        if start < 0 || start as usize > self.buffer.len() {
+            return Err(Error::Xref(XrefError::StreamStart));
+        }
+        if !already_seen.insert(start) {
+            return Ok(());
+        }
+
+        let (supplement, _) = parser::xref_and_trailer(&self.buffer[start as usize..], self)?;
+        section.supersede(supplement);
+        Ok(())
     }
 
     /// Read metadata (title and page count) without loading the entire document.

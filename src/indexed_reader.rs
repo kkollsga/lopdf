@@ -4921,10 +4921,13 @@ impl PdfIndex {
                 declared_size =
                     trailer_unsigned(&section.trailer, b"Size").ok_or(IndexedReaderError::InvalidTrailer { offset })?;
             }
-            merge_newest(&mut locations, section.entries);
+            let mut entries = section.entries;
 
-            // A hybrid-reference table supplements its own revision. Its
-            // entries fill holes but never replace entries from that revision.
+            // A hybrid-reference table supplements its own revision: it lists
+            // the compressed objects that the classic section is required to
+            // mask as free, so within that revision the supplement takes
+            // precedence (ISO 32000-1, 7.5.8.4). The revision as a whole still
+            // wins over everything older down the `/Prev` chain.
             if let Some(hybrid) = trailer_offset(&section.trailer, b"XRefStm", "XRefStm")? {
                 let hybrid_physical = source_origin
                     .checked_add(hybrid)
@@ -4933,8 +4936,9 @@ impl PdfIndex {
                 if supplement.kind != IndexXrefType::Stream {
                     return Err(IndexedReaderError::InvalidXref { offset: hybrid });
                 }
-                merge_newest(&mut locations, supplement.entries);
+                entries.extend(supplement.entries);
             }
+            merge_newest(&mut locations, entries);
 
             next = trailer_offset(&section.trailer, b"Prev", "Prev")?;
         }
@@ -8744,6 +8748,126 @@ mod tests {
                 offset: marker,
                 generation: 0
             })
+        );
+        assert_eager_normal_fingerprint(&pdf, &index);
+    }
+
+    /// Uncompressed `/Type /ObjStm` holding a single generation-zero member.
+    fn push_single_member_object_stream(pdf: &mut Vec<u8>, container: u32, member: u32, body: &str) -> u64 {
+        let header = format!("{member} 0 ");
+        let content = format!("{header}{body}");
+        let offset = u64::try_from(pdf.len()).unwrap();
+        pdf.extend_from_slice(
+            format!(
+                "{container} 0 obj\n<< /Type /ObjStm /N 1 /First {} /Length {} >>\nstream\n",
+                header.len(),
+                content.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(content.as_bytes());
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offset
+    }
+
+    /// Cross-reference stream describing exactly one compressed member, for use
+    /// as a classic section's `/XRefStm` supplement.
+    fn push_compressed_supplement(pdf: &mut Vec<u8>, id: u32, member: u32, container: u32, size: u32) -> u64 {
+        let mut encoded = Vec::new();
+        encode_field(2, 1, &mut encoded);
+        encode_field(u64::from(container), 8, &mut encoded);
+        encode_field(0, 2, &mut encoded);
+        let offset = u64::try_from(pdf.len()).unwrap();
+        pdf.extend_from_slice(
+            format!(
+                "{id} 0 obj\n<< /Type /XRef /Size {size} /Index [{member} 1] /W [1 8 2] /Length {} >>\nstream\n",
+                encoded.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&encoded);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offset
+    }
+
+    /// A hybrid-reference file whose newest section carries no `/XRefStm` of its
+    /// own: object 6 is superseded across two object streams, and only the
+    /// *second* section's supplement names the newer container. Both readers
+    /// must walk every section's own supplement — and merge it before
+    /// descending to that section's `/Prev` — to land on the newest revision
+    /// (ISO 32000-1, 7.5.8.4).
+    fn hybrid_superseded_across_object_streams() -> Vec<u8> {
+        let (mut pdf, offsets) = basic_body();
+        let base_container = push_single_member_object_stream(&mut pdf, 5, 6, "<< /Rev (base) >>");
+        let base_supplement = push_compressed_supplement(&mut pdf, 7, 6, 5, 11);
+        let mut base_entries: Vec<ClassicEntry> = offsets
+            .into_iter()
+            .enumerate()
+            .map(|(id, offset)| (offset, if id == 0 { 65535 } else { 0 }, id != 0))
+            .collect();
+        base_entries.push((base_container, 0, true));
+        let base_xref = append_classic(
+            &mut pdf,
+            &[(0, base_entries)],
+            &format!("<< /Size 11 /Root 1 0 R /Info 4 0 R /XRefStm {base_supplement} >>"),
+        );
+
+        let update_container = push_single_member_object_stream(&mut pdf, 8, 6, "<< /Rev (update) >>");
+        let update_supplement = push_compressed_supplement(&mut pdf, 9, 6, 8, 11);
+        let update_xref = append_classic(
+            &mut pdf,
+            &[
+                (0, vec![(0, 65535, false)]),
+                // The hybrid mask: a legacy reader must not see object 6.
+                (6, vec![(0, 65535, false)]),
+                (8, vec![(update_container, 0, true), (update_supplement, 0, true)]),
+            ],
+            &format!(
+                "<< /Size 11 /Root 1 0 R /Info 4 0 R /Prev {base_xref} /XRefStm {update_supplement} >>"
+            ),
+        );
+
+        let newest_info = push_object(&mut pdf, 10, b"<< /Title (newest) >>");
+        append_classic(
+            &mut pdf,
+            &[(0, vec![(0, 65535, false)]), (10, vec![(newest_info, 0, true)])],
+            &format!("<< /Size 11 /Root 1 0 R /Info 10 0 R /Prev {update_xref} >>"),
+        );
+        pdf
+    }
+
+    #[test]
+    fn hybrid_supplement_of_an_inner_section_supersedes_older_object_streams() {
+        let pdf = hybrid_superseded_across_object_streams();
+        let newest = Object::Dictionary(dictionary! { "Rev" => Object::string_literal("update") });
+
+        let index = open_bytes(&pdf);
+        assert_eq!(
+            index.locations.get(&6),
+            Some(&ObjectLocation64::Compressed {
+                container: 8,
+                index: 0
+            })
+        );
+
+        let eager = Document::load_mem(&pdf).unwrap();
+        assert!(
+            matches!(
+                eager.reference_table.get(6),
+                Some(XrefEntry::Compressed { container: 8, index: 0 })
+            ),
+            "eager kept {:?} for the superseded object",
+            eager.reference_table.get(6)
+        );
+        assert_eq!(eager.get_object((6, 0)).unwrap(), &newest);
+
+        let reader = IndexedReader::open(BytesSource::from(pdf.clone())).unwrap();
+        assert_eq!(reader.resolve_object((6, 0)).unwrap(), newest);
+
+        // The newest section still wins for everything it does declare.
+        assert_eq!(
+            eager.trailer.get(b"Info").unwrap().as_reference().unwrap(),
+            (10, 0)
         );
         assert_eager_normal_fingerprint(&pdf, &index);
     }

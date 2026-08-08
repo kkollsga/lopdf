@@ -57,9 +57,29 @@ impl Xref {
 
     /// Combine Xref entries. Only add them if they do not exists already.
     /// Do not replace existing entries.
+    ///
+    /// Cross-reference sections are merged newest-first, so keeping the entry
+    /// that is already present is what makes a newer revision of an object win
+    /// over every older one further down the `/Prev` chain.
     pub fn merge(&mut self, xref: Xref) {
         for (id, entry) in xref.entries {
             self.entries.entry(id).or_insert(entry);
+        }
+    }
+
+    /// Overlay `xref` on top of `self`, **replacing** entries that already
+    /// exist.
+    ///
+    /// This is the hybrid-reference rule of ISO 32000-1, 7.5.8.4: the
+    /// cross-reference stream named by a section's `/XRefStm` describes that
+    /// same revision's compressed objects, which the classic section is
+    /// required to mask as free so that a legacy reader cannot see them. A
+    /// reader that understands compressed objects must therefore let the
+    /// supplement take precedence *within* its own section — while the section
+    /// as a whole still wins over anything older (see [`Xref::merge`]).
+    pub fn supersede(&mut self, xref: Xref) {
+        for (id, entry) in xref.entries {
+            self.insert(id, entry);
         }
     }
 
