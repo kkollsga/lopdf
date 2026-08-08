@@ -693,6 +693,8 @@ pub enum IndexedReaderError {
     },
     #[error("page tree exceeds the {limit}-page limit")]
     PageCountLimitExceeded { limit: usize },
+    #[error("page tree nests deeper than the {limit}-level limit")]
+    PageTreeDepthLimitExceeded { limit: usize },
 }
 
 /// Typed proof for an [`IndexedReaderError::ObjectLimitExceeded`] result.
@@ -2226,8 +2228,15 @@ impl PageMapBuilder<'_> {
             let Some(id) = kid.id else {
                 continue;
             };
+            // A tree nested past the cap is a *refusal*, not a truncation. Skipping the
+            // subtree here used to hand back a short — often empty — page map with no error,
+            // which reads downstream as a successfully opened blank document. Reporting it
+            // the way `PageCountLimitExceeded` reports the sibling `max_pages` cap lets the
+            // caller fall back to an unbounded walk instead of trusting a partial answer.
             if usize::try_from(kid.depth).unwrap_or(usize::MAX) > self.limits.max_depth {
-                continue;
+                return Err(IndexedReaderError::PageTreeDepthLimitExceeded {
+                    limit: self.limits.max_depth,
+                });
             }
             let Some(mut dictionary) = self.reader.resolve_dictionary_deref(id)? else {
                 continue;
@@ -7799,6 +7808,40 @@ mod tests {
         pdf
     }
 
+    /// A finite chain of `distinct_nodes` wide `/Pages` nodes: each carries one reference kid
+    /// followed by `non_reference_kids` nulls, and the last carries nulls only. Unlike
+    /// [`wide_page_tree_pdf`] no node ever points back at itself, so the walk ends by exhausting
+    /// its work budget rather than by hitting the depth cap.
+    fn wide_page_tree_chain_pdf(distinct_nodes: u32, non_reference_kids: usize) -> Vec<u8> {
+        assert!(distinct_nodes > 0);
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        for node in 0..distinct_nodes {
+            let id = node + 2;
+            let mut kids = Vec::with_capacity(non_reference_kids + 1);
+            if node + 1 < distinct_nodes {
+                kids.push(Object::Reference((id + 1, 0)));
+            }
+            kids.extend(std::iter::repeat_n(Object::Null, non_reference_kids));
+            document.objects.insert(
+                (id, 0),
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => kids,
+                    "Count" => 0,
+                }),
+            );
+        }
+        document.max_id = distinct_nodes + 1;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
     fn open_encrypted(pdf: &[u8], password: Option<&[u8]>) -> IndexedReaderResult<IndexedReader> {
         IndexedReader::open_with_password(
             Arc::new(BytesSource::from(pdf.to_vec())),
@@ -8191,15 +8234,16 @@ mod tests {
         );
         assert_eq!(work, eager.objects.len());
 
-        let depth_limited = PageMap::from_reader_with_limits(
-            &reader,
-            PageMapLimits {
-                max_depth: 0,
-                max_pages: 10,
-            },
-        )
-        .unwrap();
-        assert!(depth_limited.pages.is_empty());
+        assert!(matches!(
+            PageMap::from_reader_with_limits(
+                &reader,
+                PageMapLimits {
+                    max_depth: 0,
+                    max_pages: 10,
+                },
+            ),
+            Err(IndexedReaderError::PageTreeDepthLimitExceeded { limit: 0 })
+        ));
 
         let two_pages = generated_page_tree_pdf(2, 1);
         let reader = open_reader(&two_pages, ResolverLimits::default());
@@ -8215,15 +8259,56 @@ mod tests {
         ));
     }
 
+    /// The depth cap is inclusive, and crossing it *reports* rather than truncates.
+    ///
+    /// Returning a short page map for an over-deep tree is indistinguishable from a genuinely
+    /// empty document, so a caller that only watches for errors renders it blank. The typed
+    /// error is the whole signal: at the limit the walk succeeds, one past it the caller is
+    /// told which limit it hit.
     #[test]
-    fn page_map_depth_limit_is_inclusive_and_bounded() {
+    fn page_map_depth_limit_is_inclusive_and_reported() {
         let at_limit = generated_deep_page_tree_pdf(DEFAULT_PAGE_TREE_DEPTH_LIMIT);
         let reader = open_reader(&at_limit, ResolverLimits::default());
         assert_eq!(PageMap::from_reader(&reader).unwrap().pages.len(), 1);
 
         let over_limit = generated_deep_page_tree_pdf(DEFAULT_PAGE_TREE_DEPTH_LIMIT + 1);
         let reader = open_reader(&over_limit, ResolverLimits::default());
-        assert!(PageMap::from_reader(&reader).unwrap().pages.is_empty());
+        assert!(matches!(
+            PageMap::from_reader(&reader),
+            Err(IndexedReaderError::PageTreeDepthLimitExceeded {
+                limit: DEFAULT_PAGE_TREE_DEPTH_LIMIT
+            })
+        ));
+        // The eager walk reads the same file without complaint, so the refusal is the indexed
+        // reader's bound and not a property of the document.
+        let eager = Document::load_mem(&over_limit).unwrap();
+        assert_eq!(eager.page_iter().count(), 1);
+    }
+
+    /// The public `page_tree_depth` option carries the same refusal through
+    /// [`IndexedReader::page_map`], which is the entry point product code calls.
+    #[test]
+    fn public_page_tree_depth_option_reports_an_over_deep_tree() {
+        let pdf = generated_deep_page_tree_pdf(4);
+        let options = IndexedReaderOptions {
+            page_tree_depth: 4,
+            ..IndexedReaderOptions::default()
+        };
+        let reader = IndexedReader::open_with_options(BytesSource::from(pdf.clone()), options.clone()).unwrap();
+        assert_eq!(reader.page_map().unwrap().len(), 1);
+
+        let reader = IndexedReader::open_with_options(
+            BytesSource::from(pdf),
+            IndexedReaderOptions {
+                page_tree_depth: 3,
+                ..options
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.page_map(),
+            Err(IndexedReaderError::PageTreeDepthLimitExceeded { limit: 3 })
+        ));
     }
 
     #[test]
@@ -8247,7 +8332,10 @@ mod tests {
 
         let pdf = generated_deep_page_tree_pdf(1);
         let reader = IndexedReader::open_with_options(BytesSource::from(pdf), options).unwrap();
-        assert!(reader.page_map().unwrap().is_empty());
+        assert!(matches!(
+            reader.page_map(),
+            Err(IndexedReaderError::PageTreeDepthLimitExceeded { limit: 0 })
+        ));
     }
 
     #[test]
@@ -8272,10 +8360,18 @@ mod tests {
         assert!(source.requests.lock().unwrap().len() <= (work + 2) * 4);
     }
 
+    /// Pending traversal metadata stays inside the work budget even when the tree is wide enough
+    /// to saturate it: the queue is capped by remaining work and each slot is a compact
+    /// fixed-size record, never a retained `/Kids` array.
+    ///
+    /// The chain is deliberately *finite* in depth — a self-cycling node reaches the depth cap,
+    /// which is a refusal (see below), so it can no longer be walked to budget exhaustion. ~70
+    /// hops of 14k kids already saturate the budget, so an 80-node chain reaches the same peak.
     #[test]
-    fn wide_self_cycle_pending_metadata_is_capped_by_near_maximum_work() {
+    fn wide_page_tree_pending_metadata_is_capped_by_near_maximum_work() {
         const NON_REFERENCE_KIDS: usize = 14_000;
-        let pdf = wide_page_tree_pdf(1, NON_REFERENCE_KIDS, true);
+        const DISTINCT_NODES: u32 = 80;
+        let pdf = wide_page_tree_chain_pdf(DISTINCT_NODES, NON_REFERENCE_KIDS);
         assert!(pdf.len() > 64 * 1_024);
         let reader = open_reader(&pdf, ResolverLimits::default());
         let work_budget = usize::try_from(MAX_XREF_ENTRIES - 1).unwrap();
@@ -8291,6 +8387,24 @@ mod tests {
             work.peak_pending_items * std::mem::size_of::<PendingKid>()
         );
         assert!(std::mem::size_of::<PendingKid>() <= 32);
+    }
+
+    /// A `/Pages` node that references itself re-enters one level deeper on every hop, so the
+    /// depth cap is what stops it — and stopping now *reports*. Truncating instead handed back an
+    /// empty page map indistinguishable from a genuinely page-less document.
+    #[test]
+    fn wide_self_cycle_is_refused_by_the_depth_limit() {
+        const NON_REFERENCE_KIDS: usize = 14_000;
+        let pdf = wide_page_tree_pdf(1, NON_REFERENCE_KIDS, true);
+        assert!(pdf.len() > 64 * 1_024);
+        let reader = open_reader(&pdf, ResolverLimits::default());
+        let work_budget = usize::try_from(MAX_XREF_ENTRIES - 1).unwrap();
+        assert!(matches!(
+            PageMap::from_reader_with_work_budget_and_stats(&reader, PageMapLimits::default(), work_budget),
+            Err(IndexedReaderError::PageTreeDepthLimitExceeded {
+                limit: DEFAULT_PAGE_TREE_DEPTH_LIMIT
+            })
+        ));
     }
 
     #[test]
@@ -8513,11 +8627,13 @@ mod tests {
         let reader = open_reader(&cyclic_page_tree_pdf(), ResolverLimits::default());
         assert_page_map_snapshot_matches_legacy(&reader);
 
+        // Over-deep is now a refusal, so the three entry points must agree on the *error*
+        // rather than on a truncated page map.
         let reader = open_reader(
             &generated_deep_page_tree_pdf(DEFAULT_PAGE_TREE_DEPTH_LIMIT + 1),
             ResolverLimits::default(),
         );
-        assert_page_map_snapshot_matches_legacy(&reader);
+        assert_page_map_snapshot_error_matches_legacy(&reader);
 
         let reader = IndexedReader::open_with_options(
             BytesSource::from(generated_page_tree_pdf(2, 2)),
