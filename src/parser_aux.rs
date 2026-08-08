@@ -608,9 +608,14 @@ pub fn decode_xref_stream_with_limit(
                 };
                 match entry_type {
                     0 => {
-                        // free object
+                        // Free object. The entry is recorded rather than discarded: it is
+                        // how this revision deletes the object, and `Xref::merge` needs it
+                        // to mask an older `/Prev` section's definition of the same number.
+                        // Field 2 is the next free object (a free-list link we do not
+                        // model); field 3 is the generation to use on reuse.
                         read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                        let generation = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                        xref.insert((start + j) as u32, XrefEntry::free_for_generation(generation));
                     }
                     1 => {
                         // normal object
