@@ -518,8 +518,18 @@ fn xref(input: ParserInput) -> NomResult<Xref> {
             || -> Xref { Xref::new(0, XrefType::CrossReferenceTable) },
             |mut xref, ((start, _count), entries)| {
                 for (index, ((offset, generation), is_normal)) in entries.into_iter().enumerate() {
-                    if is_normal && let Ok(generation) = generation.try_into() {
-                        xref.insert((start + index) as u32, XrefEntry::Normal { offset, generation });
+                    let id = (start + index) as u32;
+                    if is_normal {
+                        if let Ok(generation) = generation.try_into() {
+                            xref.insert(id, XrefEntry::Normal { offset, generation });
+                        }
+                    } else {
+                        // An `f` row is not noise to be skipped: it is how a revision
+                        // *deletes* an object. Recording it lets `Xref::merge` mask the
+                        // definition an older `/Prev` section still carries for the same
+                        // number, instead of resurrecting it. `Xref::max_id` ignores free
+                        // entries, so this cannot move `Document::max_id`.
+                        xref.insert(id, XrefEntry::free_for_generation(generation));
                     }
                 }
                 xref
@@ -877,7 +887,17 @@ startxref
 %%EOF
 ";
         match xref(test_span(input)) {
-            Ok((_, re)) => assert_eq!(re.entries.len(), 15),
+            Ok((_, re)) => {
+                // 15 defined objects, plus the free-list head at object 0 — free entries
+                // are recorded so a newer revision can mask an older definition. The head's
+                // first spelling here has generation 65536, past `u16`, which must still
+                // land as a free entry rather than being dropped for not fitting.
+                assert_eq!(re.entries.len(), 16);
+                assert_eq!(re.entries.values().filter(|entry| entry.is_normal()).count(), 15);
+                assert!(matches!(re.get(0), Some(crate::xref::XrefEntry::UnusableFree)));
+                // The free head does not extend the id space the save path numbers from.
+                assert_eq!(re.max_id(), 15);
+            }
             Err(err) => panic!("unexpected {:?}", err),
         }
     }
@@ -1005,7 +1025,12 @@ EI";
         // Some PDF generators emit "xref \n" with a trailing space.
         let input = b"xref \n0 3\n0000000000 65535 f \n0000000017 00000 n \n0000000081 00000 n \ntrailer\n<</Size 3/Root 1 0 R>>\nstartxref\n175\n%%EOF\n";
         match xref(test_span(input)) {
-            Ok((_, re)) => assert_eq!(re.entries.len(), 2),
+            Ok((_, re)) => {
+                // Two defined objects plus the recorded free-list head at 0.
+                assert_eq!(re.entries.len(), 3);
+                assert_eq!(re.entries.values().filter(|entry| entry.is_normal()).count(), 2);
+                assert_eq!(re.max_id(), 2);
+            }
             Err(err) => panic!("xref with trailing space should parse: {:?}", err),
         }
     }

@@ -8230,12 +8230,17 @@ mod tests {
         let cyclic = cyclic_page_tree_pdf();
         let reader = open_reader(&cyclic, ResolverLimits::default());
         let eager = Document::load_mem(&cyclic).unwrap();
-        let eager_pages: Vec<_> = eager.page_iter().collect();
         let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
-        assert_eq!(
-            page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
-            eager_pages
-        );
+
+        // The fixture's `/Pages` nodes 2 and 3 name each other, and the two walks bound that
+        // cycle differently — so both sides are pinned exactly rather than to each other.
+        // The eager walk holds the whole document in memory, so it can carry the ancestor set
+        // that identifies the back edge, skip it, and reach the pages beside the cycle. The
+        // indexed walk streams the tree with no ancestor state and only its work budget,
+        // which the cycle consumes before either page is reached. Neither loops; neither
+        // trusts `/Count` (which claims 999999).
+        assert_eq!(eager.page_iter().collect::<Vec<_>>(), vec![(5, 0), (4, 0)]);
+        assert!(page_map.pages.is_empty());
         assert_eq!(work, eager.objects.len());
 
         assert!(matches!(

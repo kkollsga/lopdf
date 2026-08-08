@@ -805,16 +805,36 @@ impl Default for Document {
     }
 }
 
+/// Depth-first walk of a `/Pages` tree, yielding every `/Page` leaf.
+///
+/// Nesting is **not** capped. It used to be, at 256 entries of `stack` — but `stack` holds
+/// only the levels that still have siblings pending, so that never was a depth bound: a
+/// single-kid chain nested a thousand deep pushed nothing and walked fine, while a tree that
+/// was deep *and* broad quietly lost every page below its 256th retained level. No error, no
+/// marker, just a short page list. Two bounds replace it, and each answers the shape the old
+/// one was really guarding:
+///
+///   * `ancestors` is the set of `/Pages` nodes on the path to the current one. A `/Kids`
+///     entry naming one of them is a cycle rather than a subtree, and is skipped — so a
+///     self-referencing node no longer re-enters itself forever, and the real pages beside it
+///     are still reached.
+///   * `iter_limit` starts at the document's object count and is spent one unit per visited
+///     kid, so the walk — and `stack`, which grows by at most one frame per visit — stays
+///     proportional to a document that is already fully in memory.
 struct PageTreeIter<'a> {
     doc: &'a Document,
-    stack: Vec<&'a [Object]>,
+    /// The pending siblings of each ancestor, innermost last, each paired with the node whose
+    /// `/Kids` they are.
+    stack: Vec<(&'a [Object], ObjectId)>,
     kids: Option<&'a [Object]>,
+    /// The `/Pages` node whose `/Kids` are in `kids`.
+    node: ObjectId,
+    /// `node` and every `/Pages` node above it.
+    ancestors: HashSet<ObjectId>,
     iter_limit: usize,
 }
 
 impl<'a> PageTreeIter<'a> {
-    const PAGE_TREE_DEPTH_LIMIT: usize = 256;
-
     fn new(doc: &'a Document) -> Self {
         if let Ok(page_tree_id) = doc
             .catalog()
@@ -825,6 +845,8 @@ impl<'a> PageTreeIter<'a> {
                 doc,
                 kids: Self::kids(doc, page_tree_id),
                 stack: Vec::with_capacity(32),
+                node: page_tree_id,
+                ancestors: HashSet::from([page_tree_id]),
                 iter_limit: doc.objects.len(),
             }
         } else {
@@ -832,6 +854,8 @@ impl<'a> PageTreeIter<'a> {
                 doc,
                 kids: None,
                 stack: Vec::new(),
+                node: (0, 0),
+                ancestors: HashSet::new(),
                 iter_limit: doc.objects.len(),
             }
         }
@@ -866,22 +890,27 @@ impl Iterator for PageTreeIter<'_> {
                         b"Page" => {
                             return Some(kid_id);
                         }
-                        b"Pages" if self.stack.len() < Self::PAGE_TREE_DEPTH_LIMIT => {
-                            let kids = self.kids.unwrap();
-                            if !kids.is_empty() {
-                                self.stack.push(kids);
-                            }
+                        // Descend, unless this kid is already on the path to itself: a
+                        // `/Pages` node reachable from its own subtree is a cycle, and
+                        // following it would re-enter one level deeper forever. Skipping the
+                        // edge — rather than capping the nesting — keeps the pages that sit
+                        // beside it reachable. Every level is pushed, so `stack` is the
+                        // ancestor chain and popping it is what retires an ancestor.
+                        b"Pages" if self.ancestors.insert(kid_id) => {
+                            self.stack.push((self.kids.unwrap(), self.node));
+                            self.node = kid_id;
                             self.kids = Self::kids(self.doc, kid_id);
                         }
-                        b"Pages" => {}
                         _ => {}
                     }
                 }
             }
 
             // Current level exhausted, try to pop.
-            if let kids @ Some(_) = self.stack.pop() {
-                self.kids = kids;
+            if let Some((kids, node)) = self.stack.pop() {
+                self.ancestors.remove(&self.node);
+                self.node = node;
+                self.kids = Some(kids);
             } else {
                 return None;
             }
@@ -893,7 +922,7 @@ impl Iterator for PageTreeIter<'_> {
 
         let nb_pages: usize = kids
             .iter()
-            .chain(self.stack.iter().flat_map(|k| k.iter()))
+            .chain(self.stack.iter().flat_map(|(kids, _)| kids.iter()))
             .map(|kid| {
                 if let Ok(dict) = kid.as_reference().and_then(|id| self.doc.get_dictionary(id)) {
                     if let Ok(b"Pages") = dict.get_type() {
@@ -914,3 +943,164 @@ impl Iterator for PageTreeIter<'_> {
 }
 
 impl std::iter::FusedIterator for PageTreeIter<'_> {}
+
+#[cfg(test)]
+mod page_tree_tests {
+    use super::*;
+
+    /// A page tree that is deep **and** broad: every level holds the next `/Pages` node *and*
+    /// a `/Page` sibling, so the walk always leaves a sibling pending when it descends.
+    ///
+    /// That is what separates this shape from the single-kid chain: a retained sibling is
+    /// exactly what makes the iterator push a stack frame, so a tree like this pushes one
+    /// frame per level. Page trees grown by repeated appends look like this.
+    fn deep_and_broad_page_tree(levels: u32) -> Document {
+        assert!(levels > 0);
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        for level in 0..levels {
+            let node = 2 + 2 * level;
+            let page = node + 1;
+            let kids = if level + 1 == levels {
+                vec![Object::Reference((page, 0))]
+            } else {
+                vec![Object::Reference((node + 2, 0)), Object::Reference((page, 0))]
+            };
+            document.objects.insert(
+                (node, 0),
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => kids,
+                    "Count" => i64::from(levels - level),
+                }),
+            );
+            document.objects.insert(
+                (page, 0),
+                Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => Object::Reference((node, 0)) }),
+            );
+        }
+        document.max_id = 2 * levels + 1;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        document
+    }
+
+    /// The walk used to cap itself at 256 *retained frames* and then simply keep going, so a
+    /// tree deep and broad enough to push that many frames lost every page below — no error,
+    /// no marker, just a short page list. 300 levels is past that old cap.
+    #[test]
+    fn a_deep_and_broad_page_tree_keeps_every_page() {
+        const LEVELS: u32 = 300;
+        let document = deep_and_broad_page_tree(LEVELS);
+
+        let walked: Vec<ObjectId> = document.page_iter().collect();
+        assert_eq!(walked.len() as u32, LEVELS);
+
+        // The pages that used to disappear are the deepest ones, which this shape yields
+        // first: nothing below the old cap may be missing.
+        let mut expected: Vec<ObjectId> = (0..LEVELS).map(|level| (3 + 2 * level, 0)).collect();
+        expected.sort_unstable();
+        let mut found = walked.clone();
+        found.sort_unstable();
+        assert_eq!(found, expected);
+
+        assert_eq!(document.get_pages().len() as u32, LEVELS);
+        assert_eq!(document.get_pages().get(&1), Some(&(3 + 2 * (LEVELS - 1), 0)));
+    }
+
+    /// The single-kid chain never retained a sibling, so it always walked to any depth. It
+    /// still must.
+    #[test]
+    fn a_deep_single_kid_chain_still_reads() {
+        const LEVELS: u32 = 300;
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        for level in 0..LEVELS {
+            let node = 2 + level;
+            document.objects.insert(
+                (node, 0),
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages", "Kids" => vec![Object::Reference((node + 1, 0))], "Count" => 1,
+                }),
+            );
+        }
+        document
+            .objects
+            .insert((2 + LEVELS, 0), Object::Dictionary(dictionary! { "Type" => "Page" }));
+        document.max_id = 2 + LEVELS;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+
+        assert_eq!(document.page_iter().collect::<Vec<_>>(), vec![(2 + LEVELS, 0)]);
+    }
+
+    /// A `/Pages` node that names itself is the shape the removed frame cap was read as
+    /// guarding. Cycle detection answers it exactly: the self-edge is skipped, so the walk
+    /// terminates *and* the pages sitting beside the cycle are still returned — where the cap
+    /// only stopped the descent after 256 wasted levels, and dropping the cap without a cycle
+    /// check spent the whole object budget re-entering the node and returned nothing.
+    #[test]
+    fn a_self_referencing_page_tree_skips_the_cycle_and_keeps_its_pages() {
+        const PAGES: u32 = 1_000;
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        let mut kids = vec![Object::Reference((2, 0))];
+        for page in 0..PAGES {
+            let id = 3 + page;
+            kids.push(Object::Reference((id, 0)));
+            document
+                .objects
+                .insert((id, 0), Object::Dictionary(dictionary! { "Type" => "Page" }));
+        }
+        document.objects.insert(
+            (2, 0),
+            Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => i64::from(PAGES) }),
+        );
+        document.max_id = 2 + PAGES;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+
+        let walked: Vec<ObjectId> = document.page_iter().collect();
+        assert_eq!(walked.len() as u32, PAGES);
+        assert_eq!(walked, (0..PAGES).map(|page| (3 + page, 0)).collect::<Vec<_>>());
+        assert!(walked.len() <= document.objects.len());
+    }
+
+    /// A `/Pages` node reached twice as a *sibling* is duplication, not a cycle, and both
+    /// visits still count — only an edge back to an ancestor is refused.
+    #[test]
+    fn a_repeated_sibling_subtree_is_walked_once_per_reference() {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        document.objects.insert(
+            (2, 0),
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference((3, 0)), Object::Reference((3, 0))],
+                "Count" => 2,
+            }),
+        );
+        document.objects.insert(
+            (3, 0),
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference((4, 0))], "Count" => 1,
+            }),
+        );
+        document
+            .objects
+            .insert((4, 0), Object::Dictionary(dictionary! { "Type" => "Page" }));
+        document.max_id = 4;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+
+        assert_eq!(document.page_iter().collect::<Vec<_>>(), vec![(4, 0), (4, 0)]);
+    }
+}

@@ -87,11 +87,22 @@ impl Xref {
         self.entries.clear()
     }
 
+    /// The highest object number this table actually **defines**.
+    ///
+    /// Free entries are deliberately excluded. A free entry is a *deletion*
+    /// marker, not a definition: it says the slot holds no object, so it must
+    /// not extend the document's id space. `Reader::read_bootstrap` derives
+    /// [`Xref::size`] from this value, and `Document::max_id` — which numbers
+    /// every object a later `save` appends — is `size - 1`. Counting a
+    /// trailing free entry here would therefore renumber saved output purely
+    /// because some revision deleted an object, which is exactly the
+    /// regression that kept the parsers from recording free entries at all.
     pub fn max_id(&self) -> u32 {
-        match self.entries.keys().max() {
-            Some(&id) => id,
-            None => 0,
-        }
+        self.entries
+            .iter()
+            .rev()
+            .find(|(_, entry)| !entry.is_free())
+            .map_or(0, |(&id, _)| id)
     }
 }
 
@@ -100,8 +111,31 @@ impl XrefEntry {
         matches!(*self, XrefEntry::Normal { .. })
     }
 
+    /// Whether this entry marks the slot as holding no object.
+    ///
+    /// Both free flavours mask an older revision's definition of the same
+    /// object number (see [`Xref::merge`]); they differ only in the generation
+    /// number a writer emits for them.
+    pub fn is_free(&self) -> bool {
+        matches!(*self, XrefEntry::Free | XrefEntry::UnusableFree)
+    }
+
     pub fn is_compressed(&self) -> bool {
         matches!(*self, XrefEntry::Compressed { .. })
+    }
+
+    /// The free entry a parsed `f` row (or a type-0 cross-reference stream
+    /// row) denotes, given its generation field.
+    ///
+    /// That field is the generation a writer shall use if the slot is ever
+    /// reused; the maximum value marks the slot as never reusable, which lopdf
+    /// models as [`XrefEntry::UnusableFree`].
+    pub fn free_for_generation(generation: u32) -> XrefEntry {
+        if generation >= u32::from(u16::MAX) {
+            XrefEntry::UnusableFree
+        } else {
+            XrefEntry::Free
+        }
     }
 
     /// Encode entry for use in cross-reference stream

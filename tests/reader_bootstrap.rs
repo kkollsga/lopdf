@@ -3,8 +3,8 @@ use flate2::write::ZlibEncoder;
 use log::{Level, LevelFilter, Metadata, Record};
 use lopdf::xref::{XrefEntry, XrefType};
 use lopdf::{
-    DecompressError, Document, EncryptionState, EncryptionVersion, Error, LoadOptions, Object, Permissions,
-    StringFormat, dictionary,
+    BytesSource, DecompressError, Document, EncryptionState, EncryptionVersion, Error, IndexedReader, LoadOptions,
+    Object, Permissions, StringFormat, dictionary,
 };
 use std::io::Write;
 use std::sync::{Mutex, Once};
@@ -601,4 +601,126 @@ fn encryption_behavior_remains_owned_by_each_public_call_site() {
     assert_eq!(metadata.page_count, eager.get_pages().len() as u32);
     assert_eq!(metadata.title.as_deref(), Some("encrypted"));
     assert!(!eager.trailer.has(b"Encrypt"));
+}
+
+/// Three revisions around one object: revision 1 defines object 5, revision 2 **frees** it,
+/// revision 3 defines it again. `revisions` picks how many are written, so the same body reads
+/// as live / deleted / redefined.
+///
+/// Freeing is how a PDF deletes: a redaction or a form flatten drops the object and leaves the
+/// reference to it dangling, which ISO 32000-1 7.3.10 makes a reference to null. A reader that
+/// discards free entries never sees the deletion and resurrects the object from the older
+/// section instead.
+fn deleted_object_pdf(revisions: usize) -> (Vec<u8>, usize) {
+    assert!((1..=3).contains(&revisions));
+    let (mut pdf, base_offsets) = basic_body("deletion");
+    let doomed = push_object(&mut pdf, 5, b"<< /RevisionObject (doomed) >>");
+    let mut entries: Vec<Option<usize>> = base_offsets.into_iter().map(Some).collect();
+    entries.push(Some(doomed));
+    let base_xref = append_classic_revision(&mut pdf, vec![(0, entries)], |_| {
+        "<< /Size 6 /Root 1 0 R /Info 4 0 R /Revision (base) >>".to_string()
+    });
+    if revisions == 1 {
+        return (pdf, base_xref);
+    }
+
+    // Revision 2 deletes object 5: the free-list head points at it, and its own entry links
+    // back to the head carrying the generation a reuse would take. Written by hand because it
+    // is the *non*-65535 free flavour, which `append_classic_revision` cannot spell.
+    let delete_xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 1\n0000000005 65535 f \n5 1\n0000000000 00001 f \n");
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 6 /Root 1 0 R /Info 4 0 R /Prev {base_xref} /Revision (deleted) >>\
+             \nstartxref\n{delete_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    if revisions == 2 {
+        return (pdf, delete_xref);
+    }
+
+    let revived = push_object(&mut pdf, 5, b"<< /RevisionObject (revived) >>");
+    let revive_xref = append_classic_revision(&mut pdf, vec![(0, vec![None]), (5, vec![Some(revived)])], |_| {
+        format!("<< /Size 6 /Root 1 0 R /Info 4 0 R /Prev {delete_xref} /Revision (revived) >>")
+    });
+    (pdf, revive_xref)
+}
+
+fn revision_object(document: &Document, id: u32) -> Option<String> {
+    let object = document.get_object((id, 0)).ok()?;
+    let name = object.as_dict().ok()?.get(b"RevisionObject").ok()?.as_str().ok()?;
+    Some(String::from_utf8_lossy(name).into_owned())
+}
+
+fn indexed_resolves(pdf: &[u8], id: u32) -> bool {
+    IndexedReader::open(BytesSource::from(pdf.to_vec()))
+        .unwrap()
+        .resolve_object((id, 0))
+        .is_ok()
+}
+
+#[test]
+fn a_newer_revision_free_entry_masks_the_older_definition() {
+    let (live, _) = deleted_object_pdf(1);
+    let (deleted, _) = deleted_object_pdf(2);
+
+    let live_doc = Document::load_mem(&live).unwrap();
+    assert_eq!(revision_object(&live_doc, 5).as_deref(), Some("doomed"));
+    assert!(indexed_resolves(&live, 5));
+
+    let deleted_doc = Document::load_mem(&deleted).unwrap();
+    // The deletion is recorded rather than dropped, so the base section's `Normal` entry for
+    // object 5 no longer wins the merge and nothing resurrects it.
+    assert!(matches!(deleted_doc.reference_table.get(5), Some(XrefEntry::Free)));
+    assert_eq!(revision_object(&deleted_doc, 5), None);
+    assert!(deleted_doc.get_object((5, 0)).is_err());
+    assert!(!deleted_doc.has_object((5, 0)));
+    // Both readers agree the object is gone — this is the last xref-layer disagreement
+    // between them.
+    assert!(!indexed_resolves(&deleted, 5));
+}
+
+#[test]
+fn an_older_revision_free_entry_does_not_delete_a_newer_definition() {
+    let (revived, _) = deleted_object_pdf(3);
+
+    let document = Document::load_mem(&revived).unwrap();
+    // Sections merge newest-first and the newest wins, so a free entry only ever masks what is
+    // *older* than it. Recording free entries must not invert that.
+    assert!(matches!(
+        document.reference_table.get(5),
+        Some(XrefEntry::Normal { generation: 0, .. })
+    ));
+    assert_eq!(revision_object(&document, 5).as_deref(), Some("revived"));
+    assert!(indexed_resolves(&revived, 5));
+}
+
+#[test]
+fn a_deleted_object_does_not_move_the_id_a_save_numbers_from() {
+    let (deleted, _) = deleted_object_pdf(2);
+    let mut document = assert_shared_fingerprint(&deleted, "deletion", 4, false);
+
+    // `Xref::size` — and `Document::max_id`, which is `size - 1` — count *definitions*. The
+    // trailer still declares `/Size 6` because object 5 once existed; the deletion must leave
+    // the id space at 4 so the save path keeps numbering new objects from 5 rather than
+    // stepping over a slot nothing occupies.
+    assert_eq!(document.max_id, 4);
+    assert_eq!(document.reference_table.size, 5);
+    assert_eq!(
+        document.add_object(dictionary! { "RevisionObject" => Object::string_literal("added") }),
+        (5, 0)
+    );
+
+    let mut saved = Vec::new();
+    document.save_to(&mut saved).unwrap();
+
+    // A full save writes a fresh table from the objects it holds, so the deletion does not
+    // survive it — but neither does the object that was deleted.
+    let reloaded = Document::load_mem(&saved).unwrap();
+    assert_eq!(reloaded.max_id, 5);
+    assert_eq!(reloaded.reference_table.size, 6);
+    assert_eq!(revision_object(&reloaded, 5).as_deref(), Some("added"));
+    assert_eq!(reloaded.get_pages().len(), 1);
+    assert_eq!(eager_title(&reloaded), "deletion");
 }

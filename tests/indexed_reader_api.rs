@@ -337,6 +337,7 @@ fn cached_api_is_opt_in_bounded_and_matches_uncached_results() {
 fn total_cache_budgets_bound_all_partitions_at_8_32_and_128_mib() {
     const MIB: u64 = 1024 * 1024;
     let pdf = stream_pdf(40, 512 * 1024);
+    let mut retained = Vec::new();
     for total_mib in [8_u64, 32, 128] {
         let options = IndexedReaderCacheOptions::new(total_mib * MIB, 16 * 1024);
         let reader =
@@ -370,15 +371,36 @@ fn total_cache_budgets_bound_all_partitions_at_8_32_and_128_mib() {
         assert!(stats.current_entries() <= options.max_entries());
         assert!(stats.peak_entries() <= options.max_entries());
         assert!(object.object_loads >= 40);
-        assert!(object.probation_bytes > usize::try_from(options.max_bytes() / 16).unwrap());
+        retained.push(object_bytes);
     }
+
+    // Every cap above is satisfied vacuously by a cache that retains nothing, so the budgets
+    // also have to buy retention. The object cache is *sharded*, and each shard carries its
+    // slice of the configured budget — including the per-entry admission cap — so whether a
+    // 512 KiB object is admitted at all is a function of the total budget rather than a
+    // constant. What must hold is that a larger budget never retains less, and that the
+    // largest one retains at least a whole object.
+    assert!(
+        retained.windows(2).all(|pair| pair[0] <= pair[1]),
+        "retention must be monotone in the budget: {retained:?}"
+    );
+    assert!(
+        retained.last().copied().unwrap() >= 512 * 1024,
+        "the largest budget must admit at least one object: {retained:?}"
+    );
 }
 
 #[test]
 fn unique_three_mib_object_is_shared_promoted_and_large_source_read_bypasses() {
     const MIB: usize = 1024 * 1024;
     let pdf = stream_pdf(1, 3 * MIB);
-    let options = IndexedReaderCacheOptions::default();
+    // A single entry may claim at most a quarter of its cache's byte budget, and the object
+    // cache splits into shards once the *entry* budget is large enough to give each shard a
+    // usable one — each shard then carrying its slice of the bytes, and of that quarter. A
+    // 255-entry budget keeps this cache single-shard, so its 32 MiB buys the whole 8 MiB
+    // admission envelope and the 3 MiB object is retained and promoted, which is the policy
+    // this test is about. The sharded counterpart is pinned by the test below.
+    let options = IndexedReaderCacheOptions::new(32 * 1024 * 1024, 255);
     let reader = IndexedReader::open_cached(BytesSource::from(pdf), IndexedReaderOptions::default(), options).unwrap();
     let first = reader.resolve_object_shared((1, 0)).unwrap();
     let second = reader.resolve_object_shared((1, 0)).unwrap();
@@ -393,6 +415,38 @@ fn unique_three_mib_object_is_shared_promoted_and_large_source_read_bypasses() {
     assert_eq!(stats.object().protected_entries, 1);
     assert!(stats.source().bypass_reads() > 0);
     assert!(stats.source().bypass_bytes() >= 3 * u64::try_from(MIB).unwrap());
+    assert!(stats.current_bytes() <= options.max_bytes());
+    assert!(stats.peak_bytes() <= options.max_bytes());
+}
+
+/// The same object under a *sharded* object cache: one shard's slice of the budget is smaller
+/// than the object, so it is never admitted.
+///
+/// Retention is the only thing cache pressure decides — the value still resolves, identically,
+/// on every call. Pinning that here keeps the shard split from quietly becoming a correctness
+/// change the way it would if only the single-shard case were covered.
+#[test]
+fn a_sharded_object_cache_bypasses_an_object_larger_than_one_shard_admits() {
+    const MIB: usize = 1024 * 1024;
+    let pdf = stream_pdf(1, 3 * MIB);
+    let options = IndexedReaderCacheOptions::default();
+    assert_eq!(options.max_bytes(), 32 * 1024 * 1024);
+    assert_eq!(options.max_entries(), 16 * 1024);
+    let reader = IndexedReader::open_cached(BytesSource::from(pdf), IndexedReaderOptions::default(), options).unwrap();
+    let first = reader.resolve_object_shared((1, 0)).unwrap();
+    let second = reader.resolve_object_shared((1, 0)).unwrap();
+
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(first, second);
+    assert_eq!(first.as_stream().unwrap().content.len(), 3 * MIB);
+
+    let stats = reader.cache_stats();
+    assert_eq!(stats.object().object_loads, 2);
+    assert_eq!(stats.object().object_hits, 0);
+    assert_eq!(stats.object().object_promotions, 0);
+    assert_eq!(stats.object().probation_entries, 0);
+    assert_eq!(stats.object().protected_entries, 0);
+    assert!(stats.object().object_bypasses >= 2);
     assert!(stats.current_bytes() <= options.max_bytes());
     assert!(stats.peak_bytes() <= options.max_bytes());
 }
