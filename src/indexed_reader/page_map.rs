@@ -104,6 +104,7 @@ struct PageMapBuilder<'a> {
     remaining_work: usize,
     consumed_work: usize,
     pub(super) peak_pending_items: usize,
+    reuse: ContainerReuse,
 }
 
 #[derive(Clone)]
@@ -118,6 +119,10 @@ pub(super) struct PageMapWork {
     pub(super) consumed: usize,
     pub(super) peak_pending_items: usize,
     pub(super) peak_pending_bytes: usize,
+    /// Decoded object-stream bytes the walk's container prefetch held at once.
+    /// Bounded by [`PAGE_TREE_CONTAINER_REUSE_BYTES`], and by the widest set of
+    /// distinct containers the page tree actually spans below that.
+    pub(super) peak_container_bytes: usize,
 }
 
 impl PageMap {
@@ -165,7 +170,8 @@ impl PageMap {
         else {
             return Ok((Self::default(), PageMapWork::default()));
         };
-        let Some(catalog) = reader.resolve_dictionary_deref(root_id)? else {
+        let mut reuse = ContainerReuse::with_budget(PAGE_TREE_CONTAINER_REUSE_BYTES);
+        let Some(catalog) = reader.resolve_dictionary_deref(root_id, &mut reuse)? else {
             return Ok((Self::default(), PageMapWork::default()));
         };
         let Some(pages_id) = catalog.get(b"Pages").ok().and_then(|pages| pages.as_reference().ok()) else {
@@ -179,6 +185,7 @@ impl PageMap {
             remaining_work: work_budget,
             consumed_work: 0,
             peak_pending_items: 0,
+            reuse,
         };
         builder.walk_page_tree(&mut page_map, pages_id)?;
         Ok((
@@ -189,6 +196,7 @@ impl PageMap {
                 peak_pending_bytes: builder
                     .peak_pending_items
                     .saturating_mul(std::mem::size_of::<PendingKid>()),
+                peak_container_bytes: builder.reuse.peak_retained_bytes(),
             },
         ))
     }
@@ -198,7 +206,7 @@ impl PageMapBuilder<'_> {
     fn walk_page_tree(&mut self, page_map: &mut PageMap, root_id: crate::ObjectId) -> IndexedReaderResult<()> {
         #[cfg(test)]
         PAGE_TREE_WALK_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let Some(mut root) = self.reader.resolve_dictionary_deref(root_id)? else {
+        let Some(mut root) = self.reader.resolve_dictionary_deref(root_id, &mut self.reuse)? else {
             return Ok(());
         };
         let inherited = InheritedPageAttributeOwners::default().updated(root_id, &root);
@@ -206,7 +214,7 @@ impl PageMapBuilder<'_> {
         // Do not retain the resolved dictionary alongside its potentially wide
         // `/Kids`; only compact pending slots survive into traversal.
         drop(root);
-        let Some(kids) = self.reader.resolve_array_value(kids_value)? else {
+        let Some(kids) = self.reader.resolve_array_value(kids_value, &mut self.reuse)? else {
             return Ok(());
         };
         let mut pending = VecDeque::new();
@@ -229,7 +237,7 @@ impl PageMapBuilder<'_> {
                     limit: self.limits.max_depth,
                 });
             }
-            let Some(mut dictionary) = self.reader.resolve_dictionary_deref(id)? else {
+            let Some(mut dictionary) = self.reader.resolve_dictionary_deref(id, &mut self.reuse)? else {
                 continue;
             };
             let inherited = (*kid.inherited).updated(id, &dictionary);
@@ -245,7 +253,7 @@ impl PageMapBuilder<'_> {
                 Ok(b"Pages") => {
                     let kids_value = dictionary.remove(b"Kids");
                     drop(dictionary);
-                    if let Some(kids) = self.reader.resolve_array_value(kids_value)? {
+                    if let Some(kids) = self.reader.resolve_array_value(kids_value, &mut self.reuse)? {
                         self.prepend_kids(&mut pending, kids, Rc::new(inherited), kid.depth.saturating_add(1));
                     }
                 }
@@ -294,34 +302,40 @@ impl IndexedReader {
 }
 
 impl IndexedReader {
-    fn resolve_dictionary_deref(&self, id: crate::ObjectId) -> IndexedReaderResult<Option<Dictionary>> {
-        let Some(object) = self.resolve_page_tree_object(id)? else {
+    fn resolve_dictionary_deref(
+        &self, id: crate::ObjectId, reuse: &mut ContainerReuse,
+    ) -> IndexedReaderResult<Option<Dictionary>> {
+        let Some(object) = self.resolve_page_tree_object(id, reuse)? else {
             return Ok(None);
         };
-        Ok(match self.resolve_deref_value(object)? {
+        Ok(match self.resolve_deref_value(object, reuse)? {
             Some(Object::Dictionary(dictionary)) => Some(dictionary),
             _ => None,
         })
     }
 
-    fn resolve_array_value(&self, value: Option<Object>) -> IndexedReaderResult<Option<Vec<Object>>> {
+    fn resolve_array_value(
+        &self, value: Option<Object>, reuse: &mut ContainerReuse,
+    ) -> IndexedReaderResult<Option<Vec<Object>>> {
         let Some(value) = value else {
             return Ok(None);
         };
-        Ok(match self.resolve_deref_value(value)? {
+        Ok(match self.resolve_deref_value(value, reuse)? {
             Some(Object::Array(array)) => Some(array),
             _ => None,
         })
     }
 
-    fn resolve_deref_value(&self, mut object: Object) -> IndexedReaderResult<Option<Object>> {
+    fn resolve_deref_value(
+        &self, mut object: Object, reuse: &mut ContainerReuse,
+    ) -> IndexedReaderResult<Option<Object>> {
         let mut seen = HashSet::new();
         let mut dereferences = 0;
         while let Object::Reference(id) = object {
             if dereferences >= PAGE_TREE_DEREFERENCE_LIMIT || !seen.insert(id) {
                 return Ok(None);
             }
-            let Some(resolved) = self.resolve_page_tree_object(id)? else {
+            let Some(resolved) = self.resolve_page_tree_object(id, reuse)? else {
                 return Ok(None);
             };
             object = resolved;
@@ -330,8 +344,10 @@ impl IndexedReader {
         Ok(Some(object))
     }
 
-    fn resolve_page_tree_object(&self, id: crate::ObjectId) -> IndexedReaderResult<Option<Object>> {
-        match self.resolve_object(id) {
+    fn resolve_page_tree_object(
+        &self, id: crate::ObjectId, reuse: &mut ContainerReuse,
+    ) -> IndexedReaderResult<Option<Object>> {
+        match self.resolve_object_reusing(id, reuse) {
             Ok(object) => Ok(Some(object)),
             Err(
                 IndexedReaderError::MissingNormalObject { .. } | IndexedReaderError::MissingNormalObjectAtXref { .. },

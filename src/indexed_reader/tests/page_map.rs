@@ -438,6 +438,98 @@ fn page_map_propagates_malformed_and_decompression_object_stream_failures() {
     ));
 }
 
+/// A page tree that lives inside one object stream decodes that container once
+/// for the whole walk, not once per page node.
+///
+/// The reuse is a prefetch, so what it may not change is the answer: the map,
+/// its order and its inherited owners stay the eager page order, and the walk
+/// still consumes one work unit per node. What it does change is the source
+/// traffic — before this, every one of the 32 page dictionaries re-read and
+/// re-inflated the same container body.
+#[test]
+fn page_tree_inside_one_object_stream_decodes_the_container_once() {
+    const PAGES: u32 = 32;
+
+    let mut bodies: Vec<(u32, Vec<u8>)> = vec![
+        (10, b"<< /Type /Catalog /Pages 11 0 R >>".to_vec()),
+        (
+            11,
+            format!(
+                "<< /Type /Pages /Count {PAGES} /Resources 9 0 R /Kids [{}] >>",
+                (0..PAGES)
+                    .map(|page| format!("{} 0 R", 12 + page))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+            .into_bytes(),
+        ),
+    ];
+    for page in 0..PAGES {
+        bodies.push((12 + page, b"<< /Type /Page /MediaBox [0 0 612 792] >>".to_vec()));
+    }
+    let members: Vec<(u32, &[u8])> = bodies.iter().map(|(id, body)| (*id, body.as_slice())).collect();
+    let (first, decoded) = object_stream_content(&members);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(&decoded).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let entries: Vec<(u32, u32)> = members
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (*id, u32::try_from(index).unwrap()))
+        .collect();
+    let fixture = object_stream_fixture(
+        &format!("/Type /ObjStm /N {} /First {first} /Filter /FlateDecode", members.len()),
+        &compressed,
+        &entries,
+    );
+
+    let eager = Document::load_mem(&fixture.pdf).unwrap();
+    let eager_pages: Vec<_> = eager.page_iter().collect();
+    assert_eq!(eager_pages.len(), usize::try_from(PAGES).unwrap());
+
+    let source = Arc::new(TracingBytesSource {
+        bytes: fixture.pdf.clone(),
+        requests: Mutex::new(Vec::new()),
+    });
+    let reader = IndexedReader::open_with_limits(source.clone(), ResolverLimits::default()).unwrap();
+    source.requests.lock().unwrap().clear();
+
+    let (page_map, work) = PageMap::from_reader_with_limits_and_stats(&reader, PageMapLimits::default()).unwrap();
+    assert_eq!(
+        page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+        eager_pages
+    );
+    // Every page inherits `/Resources` from the one `/Pages` node and owns its
+    // own `/MediaBox`, so the projection is not vacuously equal either.
+    assert!(
+        page_map
+            .pages
+            .iter()
+            .all(|page| page.inherited.resources == Some((11, 0)) && page.inherited.media_box == Some(page.id))
+    );
+    assert_eq!(work.consumed, usize::try_from(PAGES).unwrap());
+
+    // One decode means one pass over the container body. Each source request is
+    // bounded, so count the reads that touch the payload rather than assuming a
+    // single call covers it: reading it 32 times cannot fit in one body's worth
+    // of bytes plus one window.
+    let payload_bytes: usize = source
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(offset, _)| *offset >= fixture.container_stream_start)
+        .map(|(_, length)| *length)
+        .sum();
+    assert!(
+        payload_bytes < 2 * (compressed.len() + INITIAL_OBJECT_WINDOW as usize),
+        "container payload re-read {payload_bytes} bytes for a {} byte body",
+        compressed.len()
+    );
+    // The whole residency the reuse adds is that one decoded image.
+    assert_eq!(work.peak_container_bytes, decoded.len());
+}
+
 #[test]
 fn encrypted_page_map_matches_authenticated_eager_order() {
     let pdf = encrypted_page_tree_pdf();

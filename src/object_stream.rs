@@ -175,6 +175,20 @@ impl ObjectStream {
             ));
         }
 
+        let decoded = Self::decode_selected_member_source(stream, max_decompressed_size)?;
+        Self::parse_selected_member_from_decoded(&stream.dict, &decoded, expected_id, member_index)
+    }
+
+    /// Produce the decoded container image [`Self::parse_selected_member_with_limit`]
+    /// reads its header index and member bodies out of.
+    ///
+    /// Split out so one caller resolving several members of the same container
+    /// can decode it once. The step is a pure function of the container stream
+    /// and the limit, so reusing its result is indistinguishable from repeating
+    /// it — which is what makes the page-tree walk's per-container reuse safe.
+    pub(crate) fn decode_selected_member_source(
+        stream: &Stream, max_decompressed_size: Option<usize>,
+    ) -> Result<Cow<'_, [u8]>> {
         // Keep the scalar path allocation-compatible with the original
         // selected-member parser. The compact full header index is reserved for
         // multi-member batch calls.
@@ -194,6 +208,23 @@ impl ObjectStream {
             }
             Cow::Borrowed(stream.content.as_slice())
         };
+        Ok(decoded)
+    }
+
+    /// Parse one declared member out of an already decoded container image.
+    ///
+    /// This is the whole of [`Self::parse_selected_member_with_limit`] after the
+    /// decode: a pure function of the container dictionary, the decoded bytes,
+    /// the expected id and the member index. Every check, message and parser
+    /// prefix policy is the one the single-shot entry point applies.
+    pub(crate) fn parse_selected_member_from_decoded(
+        dict: &crate::Dictionary, decoded: &[u8], expected_id: ObjectId, member_index: u32,
+    ) -> Result<Object> {
+        if expected_id.1 != 0 {
+            return Err(Error::InvalidObjectStream(
+                "compressed objects must have generation zero".to_string(),
+            ));
+        }
 
         if decoded.is_empty() {
             return Err(Error::InvalidObjectStream(
@@ -201,8 +232,7 @@ impl ObjectStream {
             ));
         }
 
-        let first = stream
-            .dict
+        let first = dict
             .get(b"First")
             .and_then(Object::as_i64)?
             .try_into()
@@ -221,7 +251,7 @@ impl ObjectStream {
         }
         let pair_count = number_count / 2;
 
-        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
+        let n = dict.get(b"N").and_then(Object::as_i64)?;
         let member_limit = i64::try_from(MAX_SELECTED_OBJECT_STREAM_MEMBERS)
             .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
         if n > member_limit {

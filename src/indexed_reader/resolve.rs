@@ -6,6 +6,84 @@ use super::*;
 pub(super) struct ResolutionState {
     pub(super) active: HashSet<crate::ObjectId>,
     pub(super) depth: usize,
+    /// Count of nested indirect resolutions started under this state.
+    ///
+    /// A resolution that never bumps this consulted neither `active` nor
+    /// `depth` beyond its own frame, so its result is a pure function of the
+    /// source bytes and the reader limits. [`ContainerReuse`] uses exactly that
+    /// to decide whether one decoded object-stream container may stand in for
+    /// re-reading it under a different caller's active set.
+    pub(super) nested_resolutions: usize,
+}
+
+/// Walk-local reuse of decoded object-stream containers.
+///
+/// A page-tree walk resolves one object per `/Kids` entry. On a document that
+/// keeps its page dictionaries in object streams — the common modern shape —
+/// every one of those nodes re-read, re-framed and re-inflated the same
+/// container: 383 pages over 3 containers meant 383 inflations. This retains
+/// the decoded image between nodes so each container is inflated once.
+///
+/// Reuse is a pure prefetch, never a semantic shortcut. An entry is only
+/// retained when resolving its container started no nested indirect resolution
+/// (the container's `/Length` was direct), which is what makes the retained
+/// image provably identical to the one a fresh read would produce under any
+/// other caller's active set. Every other check, in every other order, is the
+/// one the unbatched walk applies, so a miss and a hit are indistinguishable
+/// apart from time.
+pub(super) struct ContainerReuse {
+    entries: HashMap<crate::ObjectId, ReusedContainer>,
+    order: VecDeque<crate::ObjectId>,
+    retained_bytes: usize,
+    peak_bytes: usize,
+    budget_bytes: usize,
+}
+
+struct ReusedContainer {
+    dictionary: Dictionary,
+    decoded: Vec<u8>,
+}
+
+impl ContainerReuse {
+    pub(super) fn with_budget(budget_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            retained_bytes: 0,
+            peak_bytes: 0,
+            budget_bytes,
+        }
+    }
+
+    fn get(&self, container: crate::ObjectId) -> Option<&ReusedContainer> {
+        self.entries.get(&container)
+    }
+
+    fn retain(&mut self, container: crate::ObjectId, dictionary: Dictionary, decoded: Vec<u8>) {
+        let bytes = decoded.len();
+        if bytes > self.budget_bytes || self.entries.contains_key(&container) {
+            return;
+        }
+        // Oldest-first release: a page tree walks its containers in runs, so the
+        // container a bounded budget gives up is the one furthest behind the
+        // frontier. Releasing one only costs a re-read, never a different answer.
+        while self.retained_bytes.saturating_add(bytes) > self.budget_bytes
+            && let Some(evicted) = self.order.pop_front()
+        {
+            if let Some(entry) = self.entries.remove(&evicted) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(entry.decoded.len());
+            }
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        self.peak_bytes = self.peak_bytes.max(self.retained_bytes);
+        self.order.push_back(container);
+        self.entries.insert(container, ReusedContainer { dictionary, decoded });
+    }
+
+    /// Most decoded container bytes held at once, for residency accounting.
+    pub(super) fn peak_retained_bytes(&self) -> usize {
+        self.peak_bytes
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1251,6 +1329,7 @@ impl IndexedReader {
 
 impl IndexedReader {
     fn resolve_inner(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
+        state.nested_resolutions += 1;
         if state.depth >= self.limits.max_length_depth {
             return Err(IndexedReaderError::ResolutionDepthExceeded {
                 limit: self.limits.max_length_depth,
@@ -1307,6 +1386,100 @@ impl IndexedReader {
                 source,
             }
         })
+    }
+
+    /// [`Self::resolve_object`] over a caller-owned decoded-container prefetch.
+    ///
+    /// Every branch, check and error below is [`Self::resolve_inner`]'s; the
+    /// only difference is that a compressed object may read its container out
+    /// of `reuse` instead of off the source again.
+    pub(super) fn resolve_object_reusing(
+        &self, id: crate::ObjectId, reuse: &mut ContainerReuse,
+    ) -> IndexedReaderResult<Object> {
+        let mut state = ResolutionState::default();
+        self.resolve_inner_reusing(id, &mut state, reuse)
+    }
+
+    fn resolve_inner_reusing(
+        &self, id: crate::ObjectId, state: &mut ResolutionState, reuse: &mut ContainerReuse,
+    ) -> IndexedReaderResult<Object> {
+        state.nested_resolutions += 1;
+        if state.depth >= self.limits.max_length_depth {
+            return Err(IndexedReaderError::ResolutionDepthExceeded {
+                limit: self.limits.max_length_depth,
+            });
+        }
+        if !state.active.insert(id) {
+            return Err(IndexedReaderError::ResolutionCycle { id });
+        }
+        state.depth += 1;
+        let result = match self.index.locations.get(&id.0).cloned() {
+            Some(ObjectLocation64::Normal { .. }) => self.resolve_normal(id, state),
+            Some(ObjectLocation64::Compressed { container, index }) => {
+                self.resolve_compressed_reusing(id, container, index, state, reuse)
+            }
+            Some(ObjectLocation64::Free { .. }) | None => Err(IndexedReaderError::MissingNormalObject { id }),
+        };
+        state.depth -= 1;
+        state.active.remove(&id);
+        result
+    }
+
+    fn resolve_compressed_reusing(
+        &self, id: crate::ObjectId, container: u32, index: u32, state: &mut ResolutionState, reuse: &mut ContainerReuse,
+    ) -> IndexedReaderResult<Object> {
+        if id.1 != 0 {
+            return Err(IndexedReaderError::GenerationMismatch { id, indexed: 0 });
+        }
+        let container = (container, 0);
+        if state.depth >= self.limits.max_length_depth {
+            return Err(IndexedReaderError::ResolutionDepthExceeded {
+                limit: self.limits.max_length_depth,
+            });
+        }
+        // The cycle guard runs before the prefetch is consulted: a container
+        // that is its own member must still refuse, even once a sibling member
+        // has put its decoded image in reach.
+        if !state.active.insert(container) {
+            return Err(IndexedReaderError::ResolutionCycle { id: container });
+        }
+        state.depth += 1;
+        let reused = reuse.get(container).is_some();
+        // Object streams must themselves be ordinary, generation-zero indirect
+        // objects. Do not recursively accept a compressed container here.
+        let fetched = (!reused).then(|| {
+            let nested_before = state.nested_resolutions;
+            let resolved = self.resolve_normal(container, state);
+            (resolved, state.nested_resolutions == nested_before)
+        });
+        state.depth -= 1;
+        state.active.remove(&container);
+
+        let member_error = |source| IndexedReaderError::ObjectStreamMember {
+            id,
+            container,
+            index,
+            source,
+        };
+        let Some((resolved, self_contained)) = fetched else {
+            let entry = reuse.get(container).expect("a hit stays retained for this call");
+            return ObjectStream::parse_selected_member_from_decoded(&entry.dictionary, &entry.decoded, id, index)
+                .map_err(member_error);
+        };
+
+        let object = resolved?;
+        let Object::Stream(stream) = object else {
+            return Err(IndexedReaderError::ObjectStreamContainerNotStream { id, container });
+        };
+        let limit = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
+        let decoded = ObjectStream::decode_selected_member_source(&stream, Some(limit)).map_err(member_error)?;
+        let member =
+            ObjectStream::parse_selected_member_from_decoded(&stream.dict, &decoded, id, index).map_err(member_error);
+        if self_contained {
+            let decoded = decoded.into_owned();
+            reuse.retain(container, stream.dict, decoded);
+        }
+        member
     }
 
     fn resolve_compressed_shared(
@@ -1439,6 +1612,7 @@ impl IndexedReader {
             // Reserve the same target-object and container depths used by the
             // scalar compressed path.
             depth: 2,
+            nested_resolutions: 0,
         };
         let object = match self.resolve_normal(container, &mut state) {
             Ok(object) => object,
@@ -1837,6 +2011,7 @@ impl IndexedReader {
     }
 
     fn resolve_length_reference(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<i64> {
+        state.nested_resolutions += 1;
         if state.depth >= self.limits.max_length_depth {
             return Err(IndexedReaderError::ResolutionDepthExceeded {
                 limit: self.limits.max_length_depth,

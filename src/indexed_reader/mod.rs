@@ -280,6 +280,15 @@ const DEFAULT_PAGE_TREE_DEPTH_LIMIT: usize = 256;
 const DEFAULT_PAGE_COUNT_LIMIT: usize = 1_000_000;
 const ENCODED_STREAM_CHUNK_LIMIT: usize = 64 * 1_024;
 const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
+/// Decoded object-stream bytes one page-tree walk may hold across nodes.
+///
+/// A page tree that keeps its dictionaries in object streams used to re-inflate
+/// the same container once per node; retaining the decoded image between nodes
+/// turns that into one inflation per container. The bound is what keeps that a
+/// prefetch rather than a document-wide map: a walk holds at most this many
+/// bytes no matter how many containers the tree spans, and releasing an entry
+/// only costs a re-read.
+const PAGE_TREE_CONTAINER_REUSE_BYTES: usize = 16 * 1_024 * 1_024;
 const SHARED_OBJECT_PROTECTED_PERCENT: usize = 75;
 /// Maximum consecutive non-evictable (loading, or still held by a caller) candidates one
 /// eviction pass rotates past before giving up.
