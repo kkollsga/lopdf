@@ -907,6 +907,13 @@ struct SharedCacheInner<T> {
     probation_bytes: usize,
     protected_bytes: usize,
     loading_entries: usize,
+    /// Residency this shard last published into the cross-shard aggregate.
+    ///
+    /// Held under the shard's own lock, so the read-modify-write that turns a
+    /// new residency into a signed delta is serialised per shard even though
+    /// the aggregate itself is only `Relaxed`.
+    reported_entries: usize,
+    reported_bytes: usize,
 }
 
 impl<T> Default for SharedCacheInner<T> {
@@ -918,6 +925,8 @@ impl<T> Default for SharedCacheInner<T> {
             probation_bytes: 0,
             protected_bytes: 0,
             loading_entries: 0,
+            reported_entries: 0,
+            reported_bytes: 0,
         }
     }
 }
@@ -951,6 +960,13 @@ struct CacheCounters {
     object_bypasses: AtomicU64,
     negative_hits: AtomicU64,
     object_transient_failures: AtomicU64,
+    /// Live entries/bytes summed across every object-cache shard.
+    ///
+    /// Each shard publishes a signed delta against its own last report while it
+    /// holds its lock, so this is the aggregate residency and the peaks below
+    /// are `fetch_max`ed against *it* rather than against one shard's slice.
+    object_live_entries: AtomicUsize,
+    object_live_bytes: AtomicUsize,
     object_peak_entries: AtomicUsize,
     object_peak_bytes: AtomicUsize,
     objstm_hits: AtomicU64,
@@ -960,6 +976,8 @@ struct CacheCounters {
     objstm_evictions: AtomicU64,
     objstm_bypasses: AtomicU64,
     objstm_transient_failures: AtomicU64,
+    objstm_live_entries: AtomicUsize,
+    objstm_live_bytes: AtomicUsize,
     objstm_peak_entries: AtomicUsize,
     objstm_peak_bytes: AtomicUsize,
 }
@@ -1263,7 +1281,7 @@ impl<T> SharedCache<T> {
                     },
                 );
                 inner.loading_entries = inner.loading_entries.saturating_add(1);
-                self.record_residency_peaks(&inner);
+                self.publish_residency(&mut inner);
                 (cell, true)
             }
         };
@@ -1336,7 +1354,7 @@ impl<T> SharedCache<T> {
                 }
             }
             self.enforce_caps(&mut inner);
-            self.record_residency_peaks(&inner);
+            self.publish_residency(&mut inner);
         }
         {
             let mut state = cell.state.lock().unwrap();
@@ -1494,6 +1512,11 @@ impl<T> SharedCache<T> {
         if eviction {
             self.record_eviction();
         }
+        // Every removal path — eviction, cap enforcement, a bypassed or failed
+        // publication — funnels through here, so republishing the shrunken
+        // residency here is what keeps the aggregate from drifting upward
+        // without a call at each of those sites.
+        self.publish_residency(inner);
     }
 
     fn record_hit(&self) {
@@ -1548,15 +1571,52 @@ impl<T> SharedCache<T> {
         )
     }
 
-    fn record_residency_peaks(&self, inner: &SharedCacheInner<T>) {
+    /// Publish this shard's residency into the cross-shard aggregate and raise
+    /// the peaks against the aggregate.
+    ///
+    /// The cache is sharded, so a peak recorded from one shard's own residency
+    /// is the maximum *over* shards, not the maximum of the sum — it can read
+    /// below the concurrently reported `current_bytes()`, which is impossible
+    /// for a peak by definition. Each shard therefore keeps its last reported
+    /// residency in `inner` (so the compare is serialised by the shard lock it
+    /// already holds) and contributes only the signed delta to the shared live
+    /// counter; the delta's own `fetch_add` returns the pre-image, so the
+    /// post-image it implies is what the peak is raised to. Relaxed ordering is
+    /// enough: these are statistics, and every mutation of the aggregate is
+    /// already serialised per shard.
+    fn publish_residency(&self, inner: &mut SharedCacheInner<T>) {
         let entries = inner.entries.len();
         let bytes = inner.probation_bytes.saturating_add(inner.protected_bytes);
-        let (peak_entries, peak_bytes) = match self.kind {
-            CacheKind::Object => (&self.counters.object_peak_entries, &self.counters.object_peak_bytes),
-            CacheKind::ObjectStream => (&self.counters.objstm_peak_entries, &self.counters.objstm_peak_bytes),
+        let (live_entries, live_bytes, peak_entries, peak_bytes) = match self.kind {
+            CacheKind::Object => (
+                &self.counters.object_live_entries,
+                &self.counters.object_live_bytes,
+                &self.counters.object_peak_entries,
+                &self.counters.object_peak_bytes,
+            ),
+            CacheKind::ObjectStream => (
+                &self.counters.objstm_live_entries,
+                &self.counters.objstm_live_bytes,
+                &self.counters.objstm_peak_entries,
+                &self.counters.objstm_peak_bytes,
+            ),
         };
-        peak_entries.fetch_max(entries, Ordering::Relaxed);
-        peak_bytes.fetch_max(bytes, Ordering::Relaxed);
+        let entry_delta = entries.wrapping_sub(inner.reported_entries);
+        if entry_delta != 0 {
+            inner.reported_entries = entries;
+            let total = live_entries
+                .fetch_add(entry_delta, Ordering::Relaxed)
+                .wrapping_add(entry_delta);
+            peak_entries.fetch_max(total, Ordering::Relaxed);
+        }
+        let byte_delta = bytes.wrapping_sub(inner.reported_bytes);
+        if byte_delta != 0 {
+            inner.reported_bytes = bytes;
+            let total = live_bytes
+                .fetch_add(byte_delta, Ordering::Relaxed)
+                .wrapping_add(byte_delta);
+            peak_bytes.fetch_max(total, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1611,7 +1671,7 @@ impl SharedCache<PreparedObjectStream> {
                         },
                     );
                     inner.loading_entries = inner.loading_entries.saturating_add(1);
-                    self.record_residency_peaks(&inner);
+                    self.publish_residency(&mut inner);
                     (cell, true)
                 }
             };
@@ -1724,7 +1784,7 @@ impl SharedCache<PreparedObjectStream> {
                                 }
                             }
                         }
-                        self.record_residency_peaks(&inner);
+                        self.publish_residency(&mut inner);
                         let mut state = cell.state.lock().unwrap();
                         *state = SharedCellState::Ready(Ok(Arc::clone(&prepared)));
                         cell.ready.notify_all();
@@ -10232,6 +10292,52 @@ mod tests {
         atomic_saturating_increment(&counter);
         atomic_saturating_increment(&counter);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn sharded_peaks_aggregate_across_shards_rather_than_maxing_one() {
+        // Two shards' worth of entry budget, one object per shard, all resident at once.
+        let counters = Arc::new(CacheCounters::default());
+        let cache = ShardedCache::<Object>::new(
+            1024 * 1024,
+            SHARED_OBJECT_MIN_ENTRIES_PER_SHARD * 4,
+            1024 * 1024,
+            75,
+            CacheKind::Object,
+            Arc::clone(&counters),
+        );
+        assert!(cache.shards.len() > 1, "this test needs a sharded cache");
+        let mut retained = Vec::new();
+        for id in 0..cache.shards.len() as u32 * 4 {
+            retained.push(
+                cache
+                    .resolve((id, 0), || Ok(Arc::new(Object::Integer(i64::from(id)))), |_| 64)
+                    .unwrap(),
+            );
+        }
+
+        let (probation_entries, probation_bytes, protected_entries, protected_bytes) = cache.residency();
+        let live_entries = probation_entries + protected_entries;
+        let live_bytes = probation_bytes + protected_bytes;
+        let peak_entries = counters.object_peak_entries.load(Ordering::Relaxed);
+        let peak_bytes = counters.object_peak_bytes.load(Ordering::Relaxed);
+        // The peak is over the *sum* of the shards, so it bounds the summed residency —
+        // not just the largest single shard's slice of it.
+        assert_eq!(peak_entries, live_entries);
+        assert_eq!(peak_bytes, live_bytes);
+        assert!(
+            live_entries > cache.shards.len(),
+            "every shard must hold more than one entry"
+        );
+
+        // Dropping every entry and admitting one more keeps the peak at the high-water mark
+        // rather than letting a later single-shard report pull it down.
+        drop(retained);
+        for id in 0..cache.shards.len() as u32 * 4 {
+            let _ = cache.resolve((id, 0), || Ok(Arc::new(Object::Integer(i64::from(id)))), |_| 64);
+        }
+        assert_eq!(counters.object_peak_entries.load(Ordering::Relaxed), peak_entries);
+        assert_eq!(counters.object_peak_bytes.load(Ordering::Relaxed), peak_bytes);
     }
 
     #[test]

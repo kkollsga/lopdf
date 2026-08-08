@@ -370,6 +370,24 @@ fn total_cache_budgets_bound_all_partitions_at_8_32_and_128_mib() {
         assert!(stats.peak_bytes() <= options.max_bytes());
         assert!(stats.current_entries() <= options.max_entries());
         assert!(stats.peak_entries() <= options.max_entries());
+        // A peak is the largest value the *current* reading ever took, so it can never sit
+        // below the current reading. It used to, because the object cache is sharded and the
+        // peak was raised from one shard's own residency while the current reading sums every
+        // shard — the peak was the max over shards, not the max of the sum.
+        assert!(
+            stats.peak_bytes() >= stats.current_bytes(),
+            "peak_bytes {} must not read below current_bytes {}",
+            stats.peak_bytes(),
+            stats.current_bytes()
+        );
+        assert!(
+            stats.peak_entries() >= stats.current_entries(),
+            "peak_entries {} must not read below current_entries {}",
+            stats.peak_entries(),
+            stats.current_entries()
+        );
+        assert!(object.peak_bytes >= object_bytes);
+        assert!(object.peak_entries >= object_entries);
         assert!(object.object_loads >= 40);
         retained.push(object_bytes);
     }
