@@ -1893,7 +1893,7 @@ fn neutralize_cacheable_bounded_error(error: &IndexedReaderError) -> Option<Inde
         IndexedReaderError::UnsupportedBoundedScalar { reason, .. }
             if matches!(
                 *reason,
-                "object-stream filter chains or predictors outside plain/FlateDecode"
+                "object-stream filter chains or decode parameters outside the bounded decode envelope"
                     | "object streams without a bounded nonnegative /Length"
             ) =>
         {
@@ -3188,7 +3188,7 @@ impl IndexedReader {
         let encoding =
             limited_object_stream_encoding(&dictionary).ok_or(IndexedReaderError::UnsupportedBoundedScalar {
                 id,
-                reason: "object-stream filter chains or predictors outside plain/FlateDecode",
+                reason: "object-stream filter chains or decode parameters outside the bounded decode envelope",
             })?;
         let mut length_state = ResolutionState::default();
         let encoded_len = self
@@ -3405,7 +3405,7 @@ impl IndexedReader {
                 drop(decrypt_charge);
                 (content, content_charge)
             }
-            LimitedObjectStreamEncoding::Flate => {
+            LimitedObjectStreamEncoding::Decoded => {
                 let current = permit.stats().current_bytes;
                 let decode_envelope = permit.limit_bytes().saturating_sub(current);
                 const DECODER_FIXED_BYTES: u64 = 128 * 1024;
@@ -6154,22 +6154,152 @@ const fn object_vec_min_capacity() -> usize {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LimitedObjectStreamEncoding {
+    /// The payload is already the object-stream body; no decode runs at all.
     Plain,
-    Flate,
+    /// The payload decodes in one bounded pass through
+    /// [`Stream::decompressed_content_with_limit`], which caps every filter
+    /// layer's output at the charged allowance.
+    Decoded,
 }
 
+/// Longest filter chain admitted for a bounded object-stream decode.
+///
+/// Each layer holds its predecessor's output alive while producing its own, so
+/// the chain length is what turns the per-layer output cap into a peak-memory
+/// bound. Real object streams use one or two layers.
+const MAX_OBJECT_STREAM_FILTERS: usize = 4;
+
+/// Widest predictor row admitted for a bounded object-stream decode.
+///
+/// `png::decode_frame` reserves two rows before it reads anything, and that
+/// pair is outside the permit's per-layer output accounting, so it is bounded
+/// here instead. Cross-reference and object streams predict over a handful of
+/// columns; this leaves three orders of magnitude of headroom.
+const MAX_OBJECT_STREAM_PREDICTOR_ROW_BYTES: i64 = 64 * 1024;
+
+/// Which encoding of `dictionary`'s payload the bounded object-stream path can
+/// reproduce faithfully, or `None` to fail closed and let the caller fall back.
+///
+/// The envelope is deliberately narrower than [`Stream::decode_filters`]
+/// supports: it admits only the forms that decoder decodes *correctly*. In
+/// particular `decode_filters` reads `/DecodeParms` with `as_dict`, so the
+/// array form documented for filter chains (ISO 32000-1, 7.4.1) reaches the
+/// decoder as "no parameters at all" — faithful only when every entry in it is
+/// a no-op, and refused otherwise rather than decoded to the wrong bytes.
 fn limited_object_stream_encoding(dictionary: &Dictionary) -> Option<LimitedObjectStreamEncoding> {
-    match dictionary.get(b"Filter") {
-        Err(_) => Some(LimitedObjectStreamEncoding::Plain),
-        Ok(Object::Name(filter)) if filter == b"FlateDecode" => match dictionary.get(b"DecodeParms") {
-            Err(_) | Ok(Object::Null) => Some(LimitedObjectStreamEncoding::Flate),
-            Ok(Object::Dictionary(params)) => match params.get(b"Predictor") {
-                Err(_) => Some(LimitedObjectStreamEncoding::Flate),
-                Ok(Object::Integer(1)) => Some(LimitedObjectStreamEncoding::Flate),
-                Ok(_) => None,
-            },
-            Ok(_) => None,
-        },
+    let filters: Vec<&[u8]> = match dictionary.get(b"Filter") {
+        Err(_) | Ok(Object::Null) => return Some(LimitedObjectStreamEncoding::Plain),
+        Ok(Object::Name(filter)) => vec![filter.as_slice()],
+        Ok(Object::Array(items)) => {
+            if items.len() > MAX_OBJECT_STREAM_FILTERS {
+                return None;
+            }
+            items.iter().map(|item| item.as_name().ok()).collect::<Option<_>>()?
+        }
+        Ok(_) => return None,
+    };
+    // An empty `/Filter []` declares no encoding, which is the plain payload.
+    // `decode_filters` would run zero layers and return an empty buffer, so this
+    // case must never reach it.
+    let Some((terminal, prefix)) = filters.split_last() else {
+        return Some(LimitedObjectStreamEncoding::Plain);
+    };
+    if !matches!(*terminal, b"FlateDecode" | b"LZWDecode") {
+        return None;
+    }
+    if !prefix
+        .iter()
+        .all(|filter| matches!(*filter, b"ASCIIHexDecode" | b"ASCII85Decode"))
+    {
+        return None;
+    }
+    match dictionary.get(b"DecodeParms") {
+        Err(_) | Ok(Object::Null) => {}
+        // A single parameter dictionary reaches every layer, but only the
+        // terminal Flate/LZW reads one, and the chain admits exactly one of
+        // those.
+        Ok(Object::Dictionary(params)) => {
+            if !limited_decode_parameters_are_reproducible(params) {
+                return None;
+            }
+        }
+        Ok(Object::Array(items)) => {
+            if items.len() > MAX_OBJECT_STREAM_FILTERS {
+                return None;
+            }
+            for item in items {
+                match item {
+                    Object::Null => {}
+                    Object::Dictionary(params) => {
+                        if !limited_decode_parameters_are_absent_or_neutral(params) {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        Ok(_) => return None,
+    }
+    Some(LimitedObjectStreamEncoding::Decoded)
+}
+
+/// Whether `params` names a predictor the bounded path can run within its
+/// charged allowance, and states every operand the decoder would otherwise
+/// silently default.
+fn limited_decode_parameters_are_reproducible(params: &Dictionary) -> bool {
+    let predictor = match params.get(b"Predictor") {
+        Err(_) | Ok(Object::Null) => 1,
+        Ok(Object::Integer(value)) => *value,
+        Ok(_) => return false,
+    };
+    if predictor == 1 {
+        return true;
+    }
+    // TIFF Predictor 2 and the PNG predictors 10-15 are the two families
+    // `Stream::decompress_predictor` implements.
+    if predictor != 2 && !(10..=15).contains(&predictor) {
+        return false;
+    }
+    // The decoder substitutes its defaults for any operand it cannot read as an
+    // integer, so a reference or a real here would decode to the wrong bytes
+    // rather than fail.
+    let Some(columns) = limited_decode_parameter(params, b"Columns", 1) else {
+        return false;
+    };
+    let Some(colors) = limited_decode_parameter(params, b"Colors", 1) else {
+        return false;
+    };
+    let Some(bits) = limited_decode_parameter(params, b"BitsPerComponent", 8) else {
+        return false;
+    };
+    if columns < 1 || !(1..=32).contains(&colors) || !matches!(bits, 1 | 2 | 4 | 8 | 16) {
+        return false;
+    }
+    columns
+        .checked_mul(colors)
+        .and_then(|samples| samples.checked_mul(bits))
+        .is_some_and(|row_bits| (row_bits + 7) / 8 <= MAX_OBJECT_STREAM_PREDICTOR_ROW_BYTES)
+}
+
+/// Whether `params` changes nothing about the decode, so dropping it — which is
+/// what the array `/DecodeParms` form does today — is faithful.
+fn limited_decode_parameters_are_absent_or_neutral(params: &Dictionary) -> bool {
+    let neutral_predictor = matches!(
+        params.get(b"Predictor"),
+        Err(_) | Ok(Object::Null) | Ok(Object::Integer(1))
+    );
+    let neutral_early_change = matches!(
+        params.get(b"EarlyChange"),
+        Err(_) | Ok(Object::Null) | Ok(Object::Integer(1))
+    );
+    neutral_predictor && neutral_early_change
+}
+
+fn limited_decode_parameter(params: &Dictionary, key: &[u8], default: i64) -> Option<i64> {
+    match params.get(key) {
+        Err(_) | Ok(Object::Null) => Some(default),
+        Ok(Object::Integer(value)) => Some(*value),
         Ok(_) => None,
     }
 }
@@ -9939,7 +10069,7 @@ mod tests {
         ));
         second.close().unwrap();
 
-        const REASON: &str = "object-stream filter chains or predictors outside plain/FlateDecode";
+        const REASON: &str = "object-stream filter chains or decode parameters outside the bounded decode envelope";
         let third = crate::ScalarResolutionPermit::new(1024);
         assert!(matches!(
             cache.resolve_bounded((6, 0), (10, 0), 0, &third, || {
@@ -14170,26 +14300,200 @@ mod tests {
         assert_eq!(attempts, 3, "growth must terminate logarithmically at O");
     }
 
+    fn flate_encode(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn lzw_encode(data: &[u8]) -> Vec<u8> {
+        // `Stream::decompress_lzw` defaults `/EarlyChange` to 1, which is the
+        // TIFF code-size switch.
+        weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+            .encode(data)
+            .unwrap()
+    }
+
+    fn ascii_hex_encode(data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(data.len() * 2 + 1);
+        for byte in data {
+            output.extend_from_slice(format!("{byte:02X}").as_bytes());
+        }
+        output.push(b'>');
+        output
+    }
+
+    fn ascii85_encode(data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for group in data.chunks(4) {
+            let mut padded = [0_u8; 4];
+            padded[..group.len()].copy_from_slice(group);
+            let mut value = u32::from_be_bytes(padded);
+            let mut digits = [0_u8; 5];
+            for slot in digits.iter_mut().rev() {
+                *slot = b'!' + u8::try_from(value % 85).unwrap();
+                value /= 85;
+            }
+            output.extend_from_slice(&digits[..group.len() + 1]);
+        }
+        output.extend_from_slice(b"~>");
+        output
+    }
+
+    /// Pad to a whole number of predictor rows. PNG predictors are row-framed,
+    /// so a trailing partial row has nothing to predict against; the padding is
+    /// whitespace past the last member body, which the member index never reads.
+    fn pad_to_rows(data: &[u8], row_bytes: usize) -> Vec<u8> {
+        let mut padded = data.to_vec();
+        while !padded.len().is_multiple_of(row_bytes) {
+            padded.push(b' ');
+        }
+        padded
+    }
+
+    /// Apply the PNG `Up` filter (type 2) to every row, which is what a
+    /// `/Predictor 12` stream carries.
+    fn png_up_predict(data: &[u8], row_bytes: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(data.len() / row_bytes * (row_bytes + 1));
+        let mut previous = vec![0_u8; row_bytes];
+        for row in data.chunks(row_bytes) {
+            output.push(2);
+            for (index, byte) in row.iter().enumerate() {
+                output.push(byte.wrapping_sub(previous[index]));
+            }
+            previous.copy_from_slice(row);
+        }
+        output
+    }
+
+    /// Apply TIFF Predictor 2 (horizontal differencing) at 8 bits, 1 colour.
+    fn tiff_predict2(data: &[u8], row_bytes: usize) -> Vec<u8> {
+        let mut output = data.to_vec();
+        for row in output.chunks_mut(row_bytes) {
+            for index in (1..row.len()).rev() {
+                row[index] = row[index].wrapping_sub(row[index - 1]);
+            }
+        }
+        output
+    }
+
     #[test]
-    fn bounded_compressed_scalar_refuses_predictor_before_encoded_allocation() {
+    fn bounded_object_stream_decodes_every_admitted_filter_and_predictor_form() {
+        const ROW: usize = 8;
+        let body = b"<< /Type /Catalog /Pages 11 0 R >>";
+        let (first, plain) = object_stream_content(&[(10, body.as_slice())]);
+        let rows = pad_to_rows(&plain, ROW);
+        let forms: Vec<(&str, String, Vec<u8>)> = vec![
+            ("plain", String::new(), plain.clone()),
+            ("flate", "/Filter /FlateDecode".into(), flate_encode(&plain)),
+            (
+                "flate-in-a-one-element-array",
+                "/Filter [/FlateDecode]".into(),
+                flate_encode(&plain),
+            ),
+            (
+                "flate-png-predictor",
+                format!("/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>"),
+                flate_encode(&png_up_predict(&rows, ROW)),
+            ),
+            (
+                "flate-tiff-predictor",
+                format!("/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>"),
+                flate_encode(&tiff_predict2(&rows, ROW)),
+            ),
+            (
+                "ascii85-then-flate",
+                "/Filter [/ASCII85Decode /FlateDecode]".into(),
+                ascii85_encode(&flate_encode(&plain)),
+            ),
+            (
+                "asciihex-then-flate",
+                "/Filter [/ASCIIHexDecode /FlateDecode]".into(),
+                ascii_hex_encode(&flate_encode(&plain)),
+            ),
+            ("lzw", "/Filter /LZWDecode".into(), lzw_encode(&plain)),
+            (
+                "ascii85-then-lzw",
+                "/Filter [/ASCII85Decode /LZWDecode]".into(),
+                ascii85_encode(&lzw_encode(&plain)),
+            ),
+            (
+                "neutral-array-decode-parms",
+                "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 1 >>]".into(),
+                ascii_hex_encode(&flate_encode(&plain)),
+            ),
+        ];
+
+        let expected = crate::parser::direct_object(body.as_slice()).unwrap();
+        for (name, filter, content) in forms {
+            let fixture = object_stream_fixture(
+                &format!("/Type /ObjStm /N 1 /First {first} {filter}"),
+                &content,
+                &[(10, 0)],
+            );
+            let reader = IndexedReader::open(BytesSource::from(fixture.pdf.clone())).unwrap();
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            let resolved = reader
+                .resolve_scalar_with_permit((10, 0), &permit)
+                .unwrap_or_else(|error| panic!("{name} must decode within the envelope: {error:?}"));
+            assert_eq!(resolved.as_object(), &expected, "{name}");
+            assert!(permit.stats().peak_bytes <= permit.limit_bytes(), "{name}");
+            drop(resolved);
+            assert_eq!(permit.stats().current_bytes, 0, "{name}");
+            permit.close().unwrap();
+
+            // Whatever the encoding, the lazy answer is the eager answer.
+            let eager = crate::Document::load_mem(&fixture.pdf).unwrap();
+            assert_eq!(eager.get_object((10, 0)).unwrap(), &expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn bounded_compressed_scalar_refuses_unsupported_encodings_before_encoded_allocation() {
         let body = b"<< /Type /Catalog >>";
         let (first, plain) = object_stream_content(&[(10, body.as_slice())]);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-        encoder.write_all(&plain).unwrap();
-        let fixture = object_stream_fixture(
-            &format!("/Type /ObjStm /N 1 /First {first} /Filter /FlateDecode /DecodeParms << /Predictor 12 >>"),
-            &encoder.finish().unwrap(),
-            &[(10, 0)],
-        );
-        let reader = IndexedReader::open(BytesSource::from(fixture.pdf)).unwrap();
-        let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
-        assert!(matches!(
-            reader.resolve_scalar_with_permit((10, 0), &permit),
-            Err(IndexedReaderError::UnsupportedBoundedScalar { .. })
-        ));
-        assert!(permit.stats().peak_bytes < permit.limit_bytes());
-        assert_eq!(permit.stats().current_bytes, 0);
-        permit.close().unwrap();
+        let encoded = flate_encode(&plain);
+        let refused = [
+            // Predictor operands outside the range the bounded decode is defined
+            // and budgeted for.
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 64 >>",
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /BitsPerComponent 12 >>",
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 1000000 >>",
+            "/Filter /FlateDecode /DecodeParms << /Predictor 3 >>",
+            // An operand the decoder would silently replace with its default.
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 8 0 R >>",
+            // The array `/DecodeParms` form reaches the decoder as no parameters
+            // at all, so a live predictor inside one cannot be reproduced.
+            "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 8 >>]",
+            "/Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 8 >>]",
+            "/Filter [/LZWDecode] /DecodeParms [<< /EarlyChange 0 >>]",
+            // Terminal filters and chain shapes outside the envelope.
+            "/Filter /RunLengthDecode",
+            "/Filter /Crypt",
+            "/Filter [/FlateDecode /ASCII85Decode]",
+            "/Filter [/FlateDecode /FlateDecode]",
+            "/Filter [/ASCIIHexDecode /ASCIIHexDecode /ASCIIHexDecode /ASCII85Decode /FlateDecode]",
+            "/Filter 7 0 R",
+        ];
+        for filter in refused {
+            let fixture = object_stream_fixture(
+                &format!("/Type /ObjStm /N 1 /First {first} {filter}"),
+                &encoded,
+                &[(10, 0)],
+            );
+            let reader = IndexedReader::open(BytesSource::from(fixture.pdf)).unwrap();
+            let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
+            assert!(
+                matches!(
+                    reader.resolve_scalar_with_permit((10, 0), &permit),
+                    Err(IndexedReaderError::UnsupportedBoundedScalar { .. })
+                ),
+                "{filter} must fail closed with a typed refusal"
+            );
+            assert!(permit.stats().peak_bytes < permit.limit_bytes(), "{filter}");
+            assert_eq!(permit.stats().current_bytes, 0, "{filter}");
+            permit.close().unwrap();
+        }
     }
 
     #[test]
