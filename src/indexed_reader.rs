@@ -41,6 +41,28 @@ const DEFAULT_PAGE_COUNT_LIMIT: usize = 1_000_000;
 const ENCODED_STREAM_CHUNK_LIMIT: usize = 64 * 1_024;
 const PAGE_TREE_DEREFERENCE_LIMIT: usize = 128;
 const SHARED_OBJECT_PROTECTED_PERCENT: usize = 75;
+/// Maximum consecutive non-evictable (loading, or still held by a caller) candidates one
+/// eviction pass rotates past before giving up.
+///
+/// Eviction is best effort by construction: the pass already stops once it has rotated every
+/// probation candidate, because a cache in which nothing is currently releasable must stay
+/// briefly over its byte target rather than block a caller. Without a constant bound, though,
+/// a caller that legitimately holds a wide fan-out of resolved objects — a structure-tree walk
+/// holding one handle per sibling, say — pins a long prefix of the queue, and every insertion
+/// re-locks each pinned cell in turn. That is quadratic in the retained set: one 144-page
+/// corpus render spent 4.25M rotations across 6.5k passes and ran 1.64x the eager wall.
+/// Giving up after a constant prefix only forgoes reclaiming an entry sitting behind it — the
+/// next insertion tries again — and changes nothing a caller can observe, since cache pressure
+/// decides retention, never whether a value resolves.
+const MAX_PINNED_EVICTION_SCAN: usize = 16;
+/// Entries a shard must be able to hold before the object cache is split across more of them.
+///
+/// Sharding trades a smaller per-shard budget for independent locks. Below this many entries a
+/// shard's own budget starts to distort admission, so small caches (every test fixture, and any
+/// document whose index is tiny) stay single-shard and behave exactly as before.
+const SHARED_OBJECT_MIN_ENTRIES_PER_SHARD: usize = 128;
+/// Upper bound on object-cache shards.
+const SHARED_OBJECT_MAX_SHARDS: usize = 16;
 // Conservative envelope for the map node, queue key, Arc allocation/header,
 // mutex/condvar cell, and allocator slack of one retained ObjStm entry.
 const OBJECT_STREAM_CACHE_ENTRY_BYTES: usize = 512;
@@ -1116,6 +1138,76 @@ impl PreparedObjectStream {
     }
 }
 
+/// The object cache, split into independently locked shards keyed by object number.
+///
+/// One `Mutex` in front of the whole resolved-object cache serialises every resolution in the
+/// process: at full rayon width a page-dense document spends more time waiting for that lock
+/// than resolving. Object numbers are dense and sequential, so `number % shards` spreads a
+/// document's working set evenly, and each shard carries its own slice of the configured
+/// budget — the totals a caller asked for are unchanged, only the lock they contend on.
+struct ShardedCache<T> {
+    shards: Box<[SharedCache<T>]>,
+    mask: usize,
+}
+
+impl<T> ShardedCache<T> {
+    fn new(
+        max_bytes: usize, max_entries: usize, max_entry_bytes: usize, protected_percent: usize, kind: CacheKind,
+        counters: Arc<CacheCounters>,
+    ) -> Self {
+        let shards = (max_entries / SHARED_OBJECT_MIN_ENTRIES_PER_SHARD)
+            .clamp(1, SHARED_OBJECT_MAX_SHARDS)
+            .next_power_of_two()
+            .min(SHARED_OBJECT_MAX_SHARDS);
+        let shard_bytes = max_bytes / shards;
+        let shard_entries = max_entries / shards;
+        let shard_entry_bytes = max_entry_bytes / shards;
+        let shards: Vec<_> = (0..shards)
+            .map(|_| {
+                SharedCache::new(
+                    shard_bytes,
+                    shard_entries,
+                    shard_entry_bytes,
+                    protected_percent,
+                    kind,
+                    Arc::clone(&counters),
+                )
+            })
+            .collect();
+        let mask = shards.len() - 1;
+        Self {
+            shards: shards.into_boxed_slice(),
+            mask,
+        }
+    }
+
+    fn shard(&self, id: crate::ObjectId) -> &SharedCache<T> {
+        &self.shards[id.0 as usize & self.mask]
+    }
+
+    fn resolve<F, W>(&self, id: crate::ObjectId, load: F, weight: W) -> SharedCellResult<T>
+    where
+        F: FnOnce() -> SharedCellResult<T>,
+        W: FnOnce(&T) -> usize,
+    {
+        self.shard(id).resolve(id, load, weight)
+    }
+
+    fn residency(&self) -> (usize, usize, usize, usize) {
+        self.shards
+            .iter()
+            .map(SharedCache::residency)
+            .fold((0, 0, 0, 0), |total, shard| {
+                (
+                    total.0.saturating_add(shard.0),
+                    total.1.saturating_add(shard.1),
+                    total.2.saturating_add(shard.2),
+                    total.3.saturating_add(shard.3),
+                )
+            })
+    }
+}
+
 impl<T> SharedCache<T> {
     fn new(
         max_bytes: usize, max_entries: usize, max_entry_bytes: usize, protected_percent: usize, kind: CacheKind,
@@ -1327,7 +1419,7 @@ impl<T> SharedCache<T> {
                     CacheSegment::Protected => inner.protected.push_back(id),
                 }
                 pinned += 1;
-                if pinned >= inner.probation.len().max(1) {
+                if pinned >= inner.probation.len().clamp(1, MAX_PINNED_EVICTION_SCAN) {
                     break;
                 }
                 continue;
@@ -1338,7 +1430,11 @@ impl<T> SharedCache<T> {
     }
 
     fn evict_one_ready(&self, inner: &mut SharedCacheInner<T>) -> bool {
-        let candidates = inner.probation.len().saturating_add(inner.protected.len());
+        let candidates = inner
+            .probation
+            .len()
+            .saturating_add(inner.protected.len())
+            .min(MAX_PINNED_EVICTION_SCAN);
         for _ in 0..candidates {
             let Some(id) = inner.probation.pop_front().or_else(|| inner.protected.pop_front()) else {
                 return false;
@@ -1908,7 +2004,7 @@ pub struct IndexedReader {
     index: Arc<PdfIndex>,
     limits: ResolverLimits,
     options: IndexedReaderOptions,
-    object_cache: Option<SharedCache<Object>>,
+    object_cache: Option<ShardedCache<Object>>,
     object_stream_cache: Option<SharedCache<PreparedObjectStream>>,
     cache_counters: Option<Arc<CacheCounters>>,
 }
@@ -3877,7 +3973,7 @@ impl IndexedReader {
             return IndexedObjectCacheStats::default();
         };
         let (probation_entries, probation_bytes, protected_entries, protected_bytes) =
-            self.object_cache.as_ref().map_or((0, 0, 0, 0), SharedCache::residency);
+            self.object_cache.as_ref().map_or((0, 0, 0, 0), ShardedCache::residency);
         IndexedObjectCacheStats {
             object_hits: counters.object_hits.load(Ordering::Relaxed),
             object_misses: counters.object_misses.load(Ordering::Relaxed),
@@ -3935,7 +4031,7 @@ impl IndexedReader {
         let counters = Arc::new(CacheCounters::default());
         self.cache_counters = Some(Arc::clone(&counters));
         self.object_cache = (object_bytes > 0 && object_entries > 0).then(|| {
-            SharedCache::new(
+            ShardedCache::new(
                 object_bytes,
                 object_entries,
                 // A new item enters probation; do not allow one item to
@@ -9047,6 +9143,91 @@ mod tests {
         assert_eq!(stats.object_promotions, 1);
         assert_eq!(stats.probation_entries, 0);
         assert_eq!(stats.protected_entries, 1);
+    }
+
+    /// A PDF with `count` tiny integer objects (`2 0 obj` upwards) behind object 1.
+    fn wide_object_pdf(count: u32) -> Vec<u8> {
+        let bodies: Vec<Vec<u8>> = (0..count)
+            .map(|index| format!("<< /Index {index} >>").into_bytes())
+            .collect();
+        let mut definitions: Vec<ObjectDef<'_>> = vec![ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Type /Catalog >>",
+        }];
+        for (index, body) in bodies.iter().enumerate() {
+            definitions.push(ObjectDef {
+                id: u32::try_from(index).unwrap() + 2,
+                object_generation: 0,
+                xref_generation: 0,
+                body: body.as_slice(),
+            });
+        }
+        object_pdf(&definitions)
+    }
+
+    #[test]
+    fn sharded_object_cache_resolves_every_id_and_respects_the_aggregate_entry_cap() {
+        let count = 600u32;
+        let pdf = wide_object_pdf(count);
+        let mut reader = IndexedReader::open_with_limits(
+            Arc::new(BytesSource::from(pdf.clone())),
+            ResolverLimits::default(),
+        )
+        .unwrap();
+        // 4096 total entries => 2048 object entries => more than one shard.
+        configure_test_caches(&mut reader, 8 * 1024 * 1024, 4096);
+        let uncached = open_reader(&pdf, ResolverLimits::default());
+        for index in 0..count {
+            let id = (index + 2, 0);
+            // Twice, so the second call exercises the shard's hit path.
+            let first = reader.resolve_object_shared(id).unwrap();
+            let second = reader.resolve_object_shared(id).unwrap();
+            assert!(Arc::ptr_eq(&first, &second), "shard lost {id:?} between calls");
+            assert_eq!(first.as_ref(), &uncached.resolve_object(id).unwrap());
+        }
+        let stats = reader.object_cache_stats();
+        assert_eq!(stats.object_misses, u64::from(count));
+        assert_eq!(stats.object_hits, u64::from(count));
+        // Residency is reported across every shard and stays inside the configured cap.
+        assert!(stats.probation_entries + stats.protected_entries <= 2048);
+        assert_eq!(
+            stats.probation_entries + stats.protected_entries,
+            usize::try_from(count).unwrap()
+        );
+    }
+
+    #[test]
+    fn bounded_eviction_scan_keeps_resolving_while_the_working_set_is_pinned() {
+        let count = 400u32;
+        let pdf = wide_object_pdf(count);
+        let mut reader = IndexedReader::open_with_limits(
+            Arc::new(BytesSource::from(pdf.clone())),
+            ResolverLimits::default(),
+        )
+        .unwrap();
+        // One shard, and an entry cap far below the working set, so every insertion after the
+        // 32nd has to run the eviction pass against a queue the caller is still holding.
+        configure_test_caches(&mut reader, 64 * 1024, 128);
+        let uncached = open_reader(&pdf, ResolverLimits::default());
+        // Hold every resolved object, which pins its cache entry for the whole loop.
+        let mut held = Vec::new();
+        for index in 0..count {
+            let id = (index + 2, 0);
+            let object = reader.resolve_object_shared(id).unwrap();
+            assert_eq!(object.as_ref(), &uncached.resolve_object(id).unwrap());
+            held.push(object);
+        }
+        // A pinned prefix never lets the cache exceed the configured entry cap: an insertion
+        // that cannot make room bypasses the cache instead of growing it.
+        let stats = reader.object_cache_stats();
+        assert!(
+            stats.probation_entries + stats.protected_entries <= 64,
+            "residency {} exceeded the object entry cap",
+            stats.probation_entries + stats.protected_entries
+        );
+        assert_eq!(held.len(), usize::try_from(count).unwrap());
     }
 
     #[test]
