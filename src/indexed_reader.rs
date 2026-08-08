@@ -512,6 +512,7 @@ pub struct IndexedReaderIndexStats {
     index_retained_bytes: u64,
     page_map_retained_bytes: u64,
     estimated_retained_bytes: u64,
+    recovered: bool,
 }
 
 impl IndexedReaderIndexStats {
@@ -538,6 +539,15 @@ impl IndexedReaderIndexStats {
     /// Sum of index and page-map retained-byte estimates.
     pub const fn estimated_retained_bytes(&self) -> u64 {
         self.estimated_retained_bytes
+    }
+
+    /// Whether the index was rebuilt by scanning the body for indirect-object
+    /// headers because the cross-reference sections were unusable.
+    ///
+    /// `false` for every healthy document: recovery runs only after a
+    /// `startxref`/xref failure, never speculatively.
+    pub const fn recovered(&self) -> bool {
+        self.recovered
     }
 }
 
@@ -774,6 +784,9 @@ pub(crate) struct PdfIndex {
     pub(crate) trailer: Dictionary,
     pub(crate) encryption_state: Option<EncryptionState>,
     pub(crate) encrypt_object_id: Option<crate::ObjectId>,
+    /// Whether this index came from a body rescan rather than a cross-reference
+    /// section, so a caller can count and report the provenance of the open.
+    pub(crate) recovered: bool,
 }
 
 /// Resource limits and optional password used by [`IndexedReader`].
@@ -4008,6 +4021,7 @@ impl IndexedReader {
             index_retained_bytes,
             page_map_retained_bytes,
             estimated_retained_bytes: index_retained_bytes.saturating_add(page_map_retained_bytes),
+            recovered: self.index.recovered,
         }
     }
 
@@ -4926,6 +4940,25 @@ impl PdfIndex {
     pub(crate) fn open(source: Arc<dyn RandomAccessSource>) -> IndexedReaderResult<Self> {
         let source_len = source.len()?;
         let (source_origin, version) = read_header(source.as_ref(), source_len)?;
+        match Self::open_from_xref(&source, source_len, source_origin, &version) {
+            Ok(index) => Ok(index),
+            Err(error) if error_admits_xref_recovery(&error) => {
+                // The cross-reference machinery is unusable, but the body may be
+                // intact. Rebuilding the index from a scan keeps the document on
+                // the indexed route rather than surrendering it to a reader that
+                // must materialize the whole file. A recovery that cannot prove
+                // it found a usable catalog reports the original failure, so a
+                // caller's own fallback still sees exactly what it saw before.
+                recover_index(source.as_ref(), source_len, source_origin, version).map_err(|_| error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_from_xref(
+        source: &Arc<dyn RandomAccessSource>, source_len: u64, source_origin: u64, version: &str,
+    ) -> IndexedReaderResult<Self> {
+        let version = version.to_owned();
         let xref_start = read_startxref(source.as_ref(), source_len)?;
         let logical_len = source_len
             .checked_sub(source_origin)
@@ -5015,6 +5048,7 @@ impl PdfIndex {
             trailer,
             encryption_state: None,
             encrypt_object_id: None,
+            recovered: false,
         })
     }
 }
@@ -5057,6 +5091,304 @@ fn read_header(source: &dyn RandomAccessSource, source_len: u64) -> IndexedReade
         limit: HEADER_SCAN_LIMIT,
     })?;
     Ok((origin, version))
+}
+
+/// Whether `error` says the cross-reference machinery is unusable — the only
+/// class of failure a body rescan can answer.
+///
+/// A source failure, a resource limit or a malformed header is deliberately not
+/// in the set: rescanning would not fix any of them, and a healthy document
+/// never reaches recovery at all.
+fn error_admits_xref_recovery(error: &IndexedReaderError) -> bool {
+    matches!(
+        error,
+        IndexedReaderError::InvalidStartXref { .. }
+            | IndexedReaderError::StartXrefOutOfBounds { .. }
+            | IndexedReaderError::InvalidXref { .. }
+    )
+}
+
+/// Bytes of the recovery scan's sliding window, one physical read each.
+const RECOVERY_CHUNK_BYTES: u64 = 64 * 1_024;
+
+/// Bytes retained ahead of a window's scan boundary so a token that straddles
+/// two reads is still matched whole.
+const RECOVERY_LOOKAHEAD_BYTES: usize = 16;
+
+/// Bytes retained behind a window's scan boundary so the object number and
+/// generation preceding a matched `obj` are still in the window.
+const RECOVERY_LOOKBEHIND_BYTES: usize = 64;
+
+/// Upper bound on recovered object headers, so a hostile source cannot turn the
+/// offsets map into unbounded growth.
+const MAX_RECOVERED_OBJECTS: usize = 1 << 21;
+
+/// Newest classic trailers retained as candidates during the scan.
+const MAX_RECOVERY_TRAILER_CANDIDATES: usize = 32;
+
+/// Recovered objects probed, newest first, for a trailer when the file carries
+/// no classic `trailer` keyword.
+const MAX_RECOVERY_ROOT_PROBES: usize = 256;
+
+/// Bytes read to parse one trailer or object dictionary during recovery.
+const RECOVERY_DICTIONARY_WINDOW_BYTES: u64 = 8 * 1_024;
+
+/// Rebuild an index by scanning the body for `N G obj` headers.
+///
+/// The scan is one forward pass through the same chunked physical-read path the
+/// resolver uses — 64 KiB at a time into a reused window, never the whole file —
+/// so a document recovers without giving up the memory profile that made the
+/// indexed route worth taking. Retention is the offsets map itself, which is
+/// O(live objects) and capped.
+///
+/// A later header for an object number wins, which is how an incremental update
+/// supersedes the revision it was appended to.
+fn recover_index(
+    source: &dyn RandomAccessSource, source_len: u64, source_origin: u64, version: String,
+) -> IndexedReaderResult<PdfIndex> {
+    let scan = scan_for_indirect_objects(source, source_len, source_origin)?;
+    if scan.locations.is_empty() {
+        return Err(IndexedReaderError::InvalidXref { offset: 0 });
+    }
+    let (trailer, root) = recover_trailer(source, source_len, source_origin, &scan)?;
+    // A trailer is only worth having if the catalog it names was actually found
+    // by the scan. Anything else — a catalog inside an object stream the scan
+    // cannot expand, a `/Root` into a revision that is gone — would open a
+    // document that resolves to nothing, which is strictly worse than reporting
+    // the original cross-reference failure.
+    if !matches!(scan.locations.get(&root.0), Some(ObjectLocation64::Normal { .. })) {
+        return Err(IndexedReaderError::InvalidXref { offset: 0 });
+    }
+    let declared_size = scan
+        .locations
+        .keys()
+        .next_back()
+        .and_then(|highest| u64::from(*highest).checked_add(1))
+        .unwrap_or_default();
+    Ok(PdfIndex {
+        version,
+        source_len,
+        source_origin,
+        // No cross-reference section survived; there is no offset to report.
+        xref_start: 0,
+        xref_type: IndexXrefType::Table,
+        declared_size,
+        locations: scan.locations,
+        trailer,
+        encryption_state: None,
+        encrypt_object_id: None,
+        recovered: true,
+    })
+}
+
+struct RecoveryScan {
+    locations: BTreeMap<u32, ObjectLocation64>,
+    /// Logical offsets just past a classic `trailer` keyword, newest last.
+    trailer_offsets: VecDeque<u64>,
+    /// Whether the body mentions `/Encrypt` anywhere. A synthesized trailer
+    /// cannot carry an encryption dictionary, so seeing this forbids synthesis.
+    saw_encrypt: bool,
+}
+
+fn scan_for_indirect_objects(
+    source: &dyn RandomAccessSource, source_len: u64, source_origin: u64,
+) -> IndexedReaderResult<RecoveryScan> {
+    let mut scan = RecoveryScan {
+        locations: BTreeMap::new(),
+        trailer_offsets: VecDeque::new(),
+        saw_encrypt: false,
+    };
+    // `window` holds the bytes physically at [base, base + window.len()); it is
+    // reused across reads and never exceeds one chunk plus the straddle margin.
+    let mut window: Vec<u8> = Vec::new();
+    let mut base = source_origin;
+    let mut next_read = source_origin;
+    let mut scanned = source_origin;
+    while next_read < source_len {
+        let chunk = read_window(source, source_len, next_read, RECOVERY_CHUNK_BYTES)?;
+        if chunk.is_empty() {
+            break;
+        }
+        next_read = next_read.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        window.extend_from_slice(&chunk);
+        drop(chunk);
+        let final_chunk = next_read >= source_len;
+        let scan_end = if final_chunk {
+            window.len()
+        } else {
+            window.len().saturating_sub(RECOVERY_LOOKAHEAD_BYTES)
+        };
+        let scan_start = usize::try_from(scanned.saturating_sub(base)).unwrap_or(window.len());
+        if scan_start < scan_end {
+            scan_window(&window[..scan_end], scan_start, base, &mut scan)?;
+        }
+        scanned = base.saturating_add(u64::try_from(scan_end).unwrap_or(0));
+        let keep = window.len().min(RECOVERY_LOOKAHEAD_BYTES + RECOVERY_LOOKBEHIND_BYTES);
+        let drained = window.len() - keep;
+        window.drain(..drained);
+        base = base.saturating_add(u64::try_from(drained).unwrap_or(0));
+    }
+    Ok(scan)
+}
+
+/// Match every `obj` header and `trailer` keyword whose keyword starts at or
+/// after `from` in `window`, whose first byte lies at physical offset `base`.
+fn scan_window(window: &[u8], from: usize, base: u64, scan: &mut RecoveryScan) -> IndexedReaderResult<()> {
+    for index in from..window.len() {
+        if window[index..].starts_with(b"obj") {
+            if !is_token_boundary(window.get(index + 3).copied()) {
+                continue;
+            }
+            if let Some((id, header_start)) = indirect_header_before(window, index) {
+                let offset = base
+                    .checked_add(u64::try_from(header_start).unwrap_or(u64::MAX))
+                    .ok_or(IndexedReaderError::InvalidXref { offset: base })?;
+                if scan.locations.len() >= MAX_RECOVERED_OBJECTS && !scan.locations.contains_key(&id.0) {
+                    return Err(IndexedReaderError::InvalidXref { offset });
+                }
+                scan.locations.insert(
+                    id.0,
+                    ObjectLocation64::Normal {
+                        offset,
+                        generation: id.1,
+                    },
+                );
+            }
+        } else if window[index..].starts_with(b"trailer") {
+            if !is_token_boundary(window.get(index + 7).copied())
+                || !is_token_start_boundary(index.checked_sub(1).map(|before| window[before]))
+            {
+                continue;
+            }
+            let offset = base
+                .checked_add(u64::try_from(index + 7).unwrap_or(u64::MAX))
+                .ok_or(IndexedReaderError::InvalidXref { offset: base })?;
+            if scan.trailer_offsets.len() == MAX_RECOVERY_TRAILER_CANDIDATES {
+                scan.trailer_offsets.pop_front();
+            }
+            scan.trailer_offsets.push_back(offset);
+        } else if window[index..].starts_with(b"/Encrypt") {
+            scan.saw_encrypt = true;
+        }
+    }
+    Ok(())
+}
+
+/// Read the `N G` pair immediately before the `obj` keyword at `keyword`,
+/// returning the object id and where its header starts.
+fn indirect_header_before(window: &[u8], keyword: usize) -> Option<(crate::ObjectId, usize)> {
+    let mut cursor = keyword;
+    cursor = skip_whitespace_back(window, cursor)?;
+    let (generation, cursor) = digits_back(window, cursor)?;
+    let cursor = skip_whitespace_back(window, cursor)?;
+    let (number, start) = digits_back(window, cursor)?;
+    if !is_token_start_boundary(start.checked_sub(1).map(|before| window[before])) {
+        return None;
+    }
+    Some(((u32::try_from(number).ok()?, u16::try_from(generation).ok()?), start))
+}
+
+/// Step back over at least one whitespace byte, returning the index just past
+/// the run's first byte.
+fn skip_whitespace_back(window: &[u8], end: usize) -> Option<usize> {
+    let mut cursor = end;
+    while cursor > 0 && is_pdf_whitespace(window[cursor - 1]) {
+        cursor -= 1;
+    }
+    (cursor < end).then_some(cursor)
+}
+
+/// Read an ASCII digit run ending at `end`, returning its value and start.
+fn digits_back(window: &[u8], end: usize) -> Option<(u64, usize)> {
+    let mut cursor = end;
+    while cursor > 0 && window[cursor - 1].is_ascii_digit() {
+        cursor -= 1;
+    }
+    if cursor == end {
+        return None;
+    }
+    // A run longer than 20 digits cannot be a PDF object number and would only
+    // overflow the parse.
+    let digits = &window[cursor..end];
+    if digits.len() > 20 {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok().map(|value| (value, cursor))
+}
+
+fn is_token_start_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|byte| is_pdf_whitespace(byte) || is_pdf_delimiter(byte))
+}
+
+/// Find the newest trailer the scan can prove usable, and the `/Root` it names.
+fn recover_trailer(
+    source: &dyn RandomAccessSource, source_len: u64, source_origin: u64, scan: &RecoveryScan,
+) -> IndexedReaderResult<(Dictionary, crate::ObjectId)> {
+    for offset in scan.trailer_offsets.iter().rev() {
+        let Some(dictionary) = read_dictionary_at(source, source_len, *offset) else {
+            continue;
+        };
+        if let Ok(root) = dictionary.get(b"Root").and_then(Object::as_reference) {
+            return Ok((dictionary, root));
+        }
+    }
+    // A cross-reference-stream file has no `trailer` keyword: its trailer *is*
+    // an `/Type /XRef` stream dictionary. Probe the recovered objects newest
+    // first, which is the revision order an incremental update appends in.
+    let mut newest: Vec<(u64, u32)> = scan
+        .locations
+        .iter()
+        .filter_map(|(id, location)| match location {
+            ObjectLocation64::Normal { offset, .. } => Some((*offset, *id)),
+            _ => None,
+        })
+        .collect();
+    newest.sort_unstable_by_key(|(offset, _)| std::cmp::Reverse(*offset));
+    let mut catalog = None;
+    for (offset, id) in newest.into_iter().take(MAX_RECOVERY_ROOT_PROBES) {
+        let physical = offset;
+        let Some(dictionary) = read_object_dictionary_at(source, source_len, physical) else {
+            continue;
+        };
+        let kind = dictionary.get(b"Type").and_then(Object::as_name).ok();
+        if kind == Some(b"XRef")
+            && let Ok(root) = dictionary.get(b"Root").and_then(Object::as_reference)
+        {
+            return Ok((dictionary, root));
+        }
+        if kind == Some(b"Catalog") && catalog.is_none() {
+            catalog = Some(id);
+        }
+    }
+    // Last resort: name the catalog the scan found. A synthesized trailer cannot
+    // carry `/Encrypt`, so refuse if the body mentions one rather than open a
+    // document whose strings and streams would decode to ciphertext.
+    let Some(catalog) = catalog.filter(|_| !scan.saw_encrypt) else {
+        return Err(IndexedReaderError::InvalidXref { offset: source_origin });
+    };
+    let mut trailer = Dictionary::new();
+    trailer.set("Root", Object::Reference((catalog, 0)));
+    Ok((trailer, (catalog, 0)))
+}
+
+fn read_dictionary_at(source: &dyn RandomAccessSource, source_len: u64, offset: u64) -> Option<Dictionary> {
+    let window = read_window(source, source_len, offset, RECOVERY_DICTIONARY_WINDOW_BYTES).ok()?;
+    read_dictionary_slice(&window)
+}
+
+fn read_object_dictionary_at(source: &dyn RandomAccessSource, source_len: u64, offset: u64) -> Option<Dictionary> {
+    let window = read_window(source, source_len, offset, RECOVERY_DICTIONARY_WINDOW_BYTES).ok()?;
+    let (_, consumed) = parse_indirect_header(&window)?;
+    read_dictionary_slice(window.get(consumed..)?)
+}
+
+/// Parse the first direct object in `input`, which the parser itself will not
+/// do across leading whitespace or a comment.
+fn read_dictionary_slice(input: &[u8]) -> Option<Dictionary> {
+    match TokenCursor::new(input).direct_object()? {
+        Object::Dictionary(dictionary) => Some(dictionary),
+        _ => None,
+    }
 }
 
 fn read_startxref(source: &dyn RandomAccessSource, source_len: u64) -> IndexedReaderResult<u64> {
@@ -8201,6 +8533,14 @@ mod tests {
         PdfIndex::open(Arc::new(BytesSource::from(pdf.to_vec()))).unwrap()
     }
 
+    /// Open through the cross-reference sections only, with the rescan recovery
+    /// suppressed, so a test can pin what the xref machinery itself accepts.
+    fn open_without_recovery(source: Arc<dyn RandomAccessSource>) -> IndexedReaderResult<PdfIndex> {
+        let source_len = source.len()?;
+        let (source_origin, version) = read_header(source.as_ref(), source_len)?;
+        PdfIndex::open_from_xref(&source, source_len, source_origin, &version)
+    }
+
     fn assert_eager_normal_fingerprint(pdf: &[u8], index: &PdfIndex) {
         let eager = Document::load_mem(pdf).unwrap();
         assert_eq!(index.version, eager.version);
@@ -9095,28 +9435,54 @@ mod tests {
         ));
     }
 
+    fn live_normal_locations(index: &PdfIndex) -> BTreeMap<u32, ObjectLocation64> {
+        index
+            .locations
+            .iter()
+            .filter(|(_, location)| matches!(location, ObjectLocation64::Normal { .. }))
+            .map(|(id, location)| (*id, location.clone()))
+            .collect()
+    }
+
     #[test]
-    fn malformed_startxref_and_prev_fail_without_fallback() {
+    fn corrupt_startxref_recovers_by_rescan_while_other_failures_still_fail() {
+        let healthy = PdfIndex::open(Arc::new(BytesSource::from(classic_pdf()))).unwrap();
+        assert!(!healthy.recovered, "a healthy file must never trigger recovery");
+
+        // `startxref` unreadable — `InvalidStartXref`.
         let mut missing = classic_pdf();
         let marker = rfind(&missing, b"startxref").unwrap();
         missing[marker..marker + b"startxref".len()].fill(b'x');
-        assert!(matches!(
-            PdfIndex::open(Arc::new(BytesSource::from(missing))),
-            Err(IndexedReaderError::InvalidStartXref { .. })
-        ));
 
+        // `startxref` points past the end — `StartXrefOutOfBounds`.
         let mut out_of_bounds = classic_pdf();
         let marker = rfind(&out_of_bounds, b"startxref\n").unwrap() + b"startxref\n".len();
         let end = out_of_bounds[marker..].iter().position(|byte| *byte == b'\n').unwrap() + marker;
         out_of_bounds.splice(marker..end, b"999999999".iter().copied());
-        assert!(matches!(
-            PdfIndex::open(Arc::new(BytesSource::from(out_of_bounds))),
-            Err(IndexedReaderError::StartXrefOutOfBounds {
-                offset: 999_999_999,
-                ..
-            })
-        ));
 
+        // The section `startxref` names is not a cross-reference table — `InvalidXref`.
+        let mut wrong_section = classic_pdf();
+        let marker = rfind(&wrong_section, b"startxref\n").unwrap() + b"startxref\n".len();
+        let end = wrong_section[marker..].iter().position(|byte| *byte == b'\n').unwrap() + marker;
+        wrong_section.splice(marker..end, b"9".iter().copied());
+
+        for (name, damaged) in [
+            ("unreadable-startxref", missing),
+            ("out-of-bounds-startxref", out_of_bounds),
+            ("startxref-into-the-body", wrong_section),
+        ] {
+            let recovered = PdfIndex::open(Arc::new(BytesSource::from(damaged))).unwrap();
+            assert!(recovered.recovered, "{name}");
+            // The rescan finds every live object where the intact table put it,
+            // and reads the same trailer the table's own revision carried.
+            assert_eq!(live_normal_locations(&recovered), live_normal_locations(&healthy), "{name}");
+            assert_eq!(recovered.trailer, healthy.trailer, "{name}");
+            assert_eq!(recovered.declared_size, healthy.declared_size, "{name}");
+            assert_eq!(recovered.version, healthy.version, "{name}");
+        }
+
+        // A trailer offset that is merely nonsense is not an unusable
+        // cross-reference machine, so it keeps failing rather than rescanning.
         let (mut bad_prev, offsets) = basic_body();
         let entries = offsets
             .into_iter()
@@ -9128,6 +9494,103 @@ mod tests {
             PdfIndex::open(Arc::new(BytesSource::from(bad_prev))),
             Err(IndexedReaderError::InvalidTrailerOffset { key: "Prev" })
         ));
+    }
+
+    #[test]
+    fn rescan_that_cannot_prove_a_catalog_reports_the_original_failure() {
+        // No body at all: nothing to recover from, so the caller sees exactly
+        // the cross-reference failure it saw before recovery existed.
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(malformed_startxref_pdf("1")))),
+            Err(IndexedReaderError::InvalidXref { .. })
+        ));
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(malformed_startxref_pdf("-1")))),
+            Err(IndexedReaderError::InvalidStartXref { .. })
+        ));
+
+        // A body whose catalog is gone. The rescan finds objects and a trailer,
+        // but the `/Root` it names is not among them, so opening would produce a
+        // document that resolves to nothing.
+        let mut orphaned = classic_pdf();
+        let catalog = orphaned
+            .windows(b"1 0 obj".len())
+            .position(|window| window == b"1 0 obj")
+            .unwrap();
+        orphaned[catalog..catalog + b"1 0 obj".len()].fill(b'x');
+        let marker = rfind(&orphaned, b"startxref").unwrap();
+        orphaned[marker..marker + b"startxref".len()].fill(b'x');
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(orphaned))),
+            Err(IndexedReaderError::InvalidStartXref { .. })
+        ));
+
+        // An encrypted body cannot be opened from a synthesized trailer, which
+        // would drop `/Encrypt` and decode every string as ciphertext.
+        let mut encrypted = classic_pdf();
+        let trailer = rfind(&encrypted, b"trailer").unwrap();
+        encrypted.splice(trailer..trailer + b"trailer".len(), b"xxxxxxx".iter().copied());
+        let marker = rfind(&encrypted, b"startxref").unwrap();
+        encrypted[marker..marker + b"startxref".len()].fill(b'x');
+        let without_encrypt = PdfIndex::open(Arc::new(BytesSource::from(encrypted.clone()))).unwrap();
+        assert!(without_encrypt.recovered);
+        assert_eq!(
+            without_encrypt.trailer.get(b"Root").unwrap().as_reference().unwrap(),
+            (1, 0)
+        );
+        let catalog = encrypted
+            .windows(b"/Type /Catalog".len())
+            .position(|window| window == b"/Type /Catalog")
+            .unwrap();
+        encrypted.splice(catalog..catalog, b"/Encrypt 9 0 R ".iter().copied());
+        assert!(matches!(
+            PdfIndex::open(Arc::new(BytesSource::from(encrypted))),
+            Err(IndexedReaderError::InvalidStartXref { .. })
+        ));
+    }
+
+    #[test]
+    fn rescan_is_one_forward_pass_of_bounded_chunks_over_a_multi_megabyte_body() {
+        let healthy_pdf = generated_page_tree_pdf(20_000, 20_000);
+        assert!(healthy_pdf.len() > 1024 * 1024, "{}", healthy_pdf.len());
+        let healthy = PdfIndex::open(Arc::new(BytesSource::from(healthy_pdf.clone()))).unwrap();
+
+        let mut damaged = healthy_pdf.clone();
+        let marker = rfind(&damaged, b"startxref").unwrap();
+        damaged[marker..marker + b"startxref".len()].fill(b'x');
+        let source = Arc::new(TracingBytesSource {
+            bytes: damaged,
+            requests: Mutex::new(Vec::new()),
+        });
+        let recovered = PdfIndex::open(source.clone()).unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(live_normal_locations(&recovered), live_normal_locations(&healthy));
+
+        let requests = source.requests.lock().unwrap();
+        let chunk = usize::try_from(RECOVERY_CHUNK_BYTES).unwrap();
+        // Never a whole-file read, and never more than a chunk at a time — the
+        // scan's own retention is the offsets map, not the body.
+        assert!(
+            requests.iter().all(|(_, length)| *length <= chunk),
+            "unbounded read: {requests:?}"
+        );
+        let scan_reads = requests.iter().filter(|(_, length)| *length == chunk).count();
+        let expected = source.bytes.len() / chunk;
+        assert!(
+            scan_reads == expected || scan_reads == expected + 1,
+            "{scan_reads} full chunks for a {}-byte body",
+            source.bytes.len()
+        );
+        // One pass: no chunk offset is ever revisited.
+        let mut offsets: Vec<_> = requests
+            .iter()
+            .filter(|(_, length)| *length == chunk)
+            .map(|(offset, _)| *offset)
+            .collect();
+        let issued = offsets.len();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), issued, "the scan must not re-read a chunk");
     }
 
     #[test]
@@ -9225,7 +9688,10 @@ mod tests {
         ));
 
         let requests = source.requests.lock().unwrap();
-        assert_eq!(requests.as_slice(), &[(0, 46), (0, 46)]);
+        // Header probe, tail probe, then the recovery rescan's single chunk over
+        // this 46-byte body — which finds no object header, so the original
+        // failure is what the caller sees.
+        assert_eq!(requests.as_slice(), &[(0, 46), (0, 46), (0, 46)]);
         assert!(
             requests
                 .iter()
@@ -13095,7 +13561,7 @@ mod tests {
         });
 
         assert!(matches!(
-            PdfIndex::open(source.clone()),
+            open_without_recovery(source.clone()),
             Err(IndexedReaderError::InvalidXref { .. })
         ));
         let requests = source.requests.lock().unwrap();
@@ -13531,20 +13997,29 @@ mod tests {
     fn xref_stream_framing_matches_eager_reader() {
         let valid = xref_stream_pdf(true);
         assert!(Document::load_mem(&valid).is_ok());
-        assert!(PdfIndex::open(Arc::new(BytesSource::from(valid.clone()))).is_ok());
+        assert!(open_without_recovery(Arc::new(BytesSource::from(valid.clone()))).is_ok());
 
         let missing_endstream = corrupt_marker(valid.clone(), b"endstream");
         assert!(Document::load_mem(&missing_endstream).is_err());
         assert!(matches!(
-            PdfIndex::open(Arc::new(BytesSource::from(missing_endstream))),
+            open_without_recovery(Arc::new(BytesSource::from(missing_endstream.clone()))),
             Err(IndexedReaderError::InvalidXref { .. })
         ));
+        // The framing refusal above is what the public open then answers with a
+        // rescan: this file's body is intact and its `/Type /XRef` dictionary
+        // still names the catalog, so the document stays on the indexed route.
+        let recovered = PdfIndex::open(Arc::new(BytesSource::from(missing_endstream))).unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(
+            live_normal_locations(&recovered),
+            live_normal_locations(&open_bytes(&valid))
+        );
 
         let mut missing_endobj = valid.clone();
         let marker = rfind(&missing_endobj, b"endobj").unwrap();
         missing_endobj.drain(marker..marker + b"endobj".len());
         assert!(Document::load_mem(&missing_endobj).is_ok());
-        assert!(PdfIndex::open(Arc::new(BytesSource::from(missing_endobj))).is_ok());
+        assert!(open_without_recovery(Arc::new(BytesSource::from(missing_endobj))).is_ok());
 
         let mut spaced_header = valid.clone();
         let marker = spaced_header
@@ -13556,7 +14031,7 @@ mod tests {
             b" \t".iter().copied(),
         );
         assert!(Document::load_mem(&spaced_header).is_ok());
-        assert!(PdfIndex::open(Arc::new(BytesSource::from(spaced_header))).is_ok());
+        assert!(open_without_recovery(Arc::new(BytesSource::from(spaced_header))).is_ok());
 
         for replacement in [b"".as_slice(), b"\x0c\n", b" % gap\n"] {
             let mut rejected = valid.clone();
@@ -13568,7 +14043,7 @@ mod tests {
             rejected.splice(eol..eol + 1, replacement.iter().copied());
             assert!(Document::load_mem(&rejected).is_err());
             assert!(matches!(
-                PdfIndex::open(Arc::new(BytesSource::from(rejected))),
+                open_without_recovery(Arc::new(BytesSource::from(rejected))),
                 Err(IndexedReaderError::InvalidXref { .. })
             ));
         }
@@ -13579,7 +14054,7 @@ mod tests {
             assert_eq!(accepted[marker - 1], b'\n');
             accepted.splice(marker - 1..marker, replacement.iter().copied());
             assert!(Document::load_mem(&accepted).is_ok());
-            assert!(PdfIndex::open(Arc::new(BytesSource::from(accepted))).is_ok());
+            assert!(open_without_recovery(Arc::new(BytesSource::from(accepted))).is_ok());
         }
 
         for replacement in [b" \n".as_slice(), b"\n% gap\n"] {
@@ -13588,7 +14063,7 @@ mod tests {
             rejected.splice(marker - 1..marker, replacement.iter().copied());
             assert!(Document::load_mem(&rejected).is_err());
             assert!(matches!(
-                PdfIndex::open(Arc::new(BytesSource::from(rejected))),
+                open_without_recovery(Arc::new(BytesSource::from(rejected))),
                 Err(IndexedReaderError::InvalidXref { .. })
             ));
         }
@@ -14393,12 +14868,16 @@ mod tests {
             ),
             (
                 "flate-png-predictor",
-                format!("/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>"),
+                format!(
+                    "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>"
+                ),
                 flate_encode(&png_up_predict(&rows, ROW)),
             ),
             (
                 "flate-tiff-predictor",
-                format!("/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>"),
+                format!(
+                    "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns {ROW} /Colors 1 /BitsPerComponent 8 >>"
+                ),
                 flate_encode(&tiff_predict2(&rows, ROW)),
             ),
             (
