@@ -29,11 +29,27 @@ impl log::Log for CaptureLogger {
     fn flush(&self) {}
 }
 
-fn capture_warnings() {
+/// Held for the duration of any test that reads [`CAPTURED_WARNINGS`]. The capture is one
+/// process-wide buffer, so two such tests running side by side would each see the other's
+/// output; taking this first makes each one's window its own.
+static WARNING_CAPTURE: Mutex<()> = Mutex::new(());
+
+/// Start capturing warnings and clear whatever a previous test left, returning the guard that
+/// keeps this test's window to itself. Poison is ignored: an unrelated test's panic must not
+/// turn every later warning assertion into a failure of its own.
+fn capture_warnings() -> std::sync::MutexGuard<'static, ()> {
     INIT_LOGGER.call_once(|| {
         log::set_logger(&CAPTURE_LOGGER).unwrap();
         log::set_max_level(LevelFilter::Warn);
     });
+    let guard = WARNING_CAPTURE.lock().unwrap_or_else(|error| error.into_inner());
+    captured_warnings().clear();
+    guard
+}
+
+/// The warnings logged since the last [`capture_warnings`] or [`clear`](Vec::clear).
+fn captured_warnings() -> std::sync::MutexGuard<'static, Vec<String>> {
+    CAPTURED_WARNINGS.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn push_object(pdf: &mut Vec<u8>, id: u32, body: &[u8]) -> usize {
@@ -82,6 +98,18 @@ where
     pdf.extend_from_slice(trailer(xref_start).as_bytes());
     pdf.extend_from_slice(format!("\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
     xref_start
+}
+
+/// The offset the file's last `startxref` names, i.e. the section a further revision appended
+/// to it has to point its `/Prev` at.
+fn last_startxref(pdf: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(pdf);
+    let (_, tail) = text.rsplit_once("startxref").expect("a fixture always has one");
+    tail.split_whitespace()
+        .next()
+        .expect("startxref is followed by its offset")
+        .parse()
+        .expect("…which is a number")
 }
 
 fn classic_pdf(size: u32) -> (Vec<u8>, usize) {
@@ -154,6 +182,12 @@ fn incremental_pdf() -> (Vec<u8>, usize) {
 }
 
 fn hybrid_incremental_pdf() -> Vec<u8> {
+    hybrid_incremental_pdf_declaring(|supplement| supplement)
+}
+
+/// [`hybrid_incremental_pdf`], with `declared` choosing the offset the trailer's `/XRefStm`
+/// actually names — so a test can point it somewhere the supplement is not.
+fn hybrid_incremental_pdf_declaring<F: FnOnce(usize) -> usize>(declared: F) -> Vec<u8> {
     let (mut pdf, base_offsets) = basic_body("hybrid");
     let base_entries = base_offsets.into_iter().map(Some).collect();
     let base_xref = append_classic_revision(&mut pdf, vec![(0, base_entries)], |_| {
@@ -181,16 +215,61 @@ fn hybrid_incremental_pdf() -> Vec<u8> {
     pdf.extend_from_slice(&supplement);
     pdf.extend_from_slice(b"\nendstream\nendobj\n");
 
+    let declared_supplement = declared(xref_stream_offset);
     append_classic_revision(
         &mut pdf,
         vec![(5, vec![Some(object_stream_offset), Some(xref_stream_offset)])],
         |_| {
             format!(
                 "<< /Size 8 /Root 1 0 R /Info 4 0 R /Prev {base_xref} \
-                 /XRefStm {xref_stream_offset} /Revision (hybrid) >>"
+                 /XRefStm {declared_supplement} /Revision (hybrid) >>"
             )
         },
     );
+    pdf
+}
+
+/// The canonical hybrid layout of ISO 32000-1, 7.5.8.4, written the way a `/Index` run forces:
+/// the classic section lists objects 1–6 and masks the compressed object 7 as free, while the
+/// supplement's run is contiguous — `/Index [0 8]` — so it describes object 7 and **pads
+/// every other number with a type-0 row**, including the six the classic section defines.
+///
+/// Both directions of the rule live in this one file. The supplement's definition of object 7
+/// must lift the classic mask; its padding must not erase the catalog, the page tree, or the
+/// object stream that holds object 7.
+fn hybrid_padded_supplement_pdf() -> Vec<u8> {
+    let (mut pdf, offsets) = basic_body("padded");
+
+    let member = b"7 0 << /Hybrid true >>";
+    let object_stream = format!("<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n", member.len());
+    let object_stream_offset = pdf.len();
+    pdf.extend_from_slice(b"5 0 obj\n");
+    pdf.extend_from_slice(object_stream.as_bytes());
+    pdf.extend_from_slice(member);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_stream_offset = pdf.len();
+    let mut supplement = Vec::new();
+    for _ in 0..7 {
+        encode_xref_entry(0, 0, 0, &mut supplement);
+    }
+    encode_xref_entry(2, 5, 0, &mut supplement);
+    pdf.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 8 /Index [0 8] /W [1 4 2] /Length {} >>\nstream\n",
+            supplement.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&supplement);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let mut entries: Vec<Option<usize>> = offsets.into_iter().map(Some).collect();
+    entries[0] = None;
+    entries.extend([Some(object_stream_offset), Some(xref_stream_offset), None]);
+    append_classic_revision(&mut pdf, vec![(0, entries)], |_| {
+        format!("<< /Size 8 /Root 1 0 R /Info 4 0 R /XRefStm {xref_stream_offset} /Revision (padded) >>")
+    });
     pdf
 }
 
@@ -292,6 +371,14 @@ fn trailer_text(document: &Document, key: &[u8]) -> String {
 }
 
 fn assert_shared_fingerprint(pdf: &[u8], title: &str, max_id: u32, xref_stream: bool) -> Document {
+    assert_shared_fingerprint_with_size(pdf, title, max_id, max_id + 1, xref_stream)
+}
+
+/// `size` is the id space the file declares and `max_id` the highest object it still defines.
+/// They differ by exactly one thing: a revision that *deletes* its highest-numbered object
+/// keeps `/Size` where it was (ISO 32000-1, 7.5.4 counts free entries) while there is one
+/// less object to number from.
+fn assert_shared_fingerprint_with_size(pdf: &[u8], title: &str, max_id: u32, size: u32, xref_stream: bool) -> Document {
     let eager = Document::load_mem(pdf).unwrap();
     let metadata = Document::load_metadata_mem(pdf).unwrap();
 
@@ -300,7 +387,7 @@ fn assert_shared_fingerprint(pdf: &[u8], title: &str, max_id: u32, xref_stream: 
     assert_eq!(metadata.title.as_deref(), Some(title));
     assert_eq!(eager_title(&eager), title);
     assert_eq!(eager.max_id, max_id);
-    assert_eq!(eager.reference_table.size, max_id + 1);
+    assert_eq!(eager.reference_table.size, size);
     assert_eq!(
         matches!(
             eager.reference_table.cross_reference_type,
@@ -360,6 +447,84 @@ fn hybrid_supplement_is_merged_with_its_own_section() {
             .as_bool()
             .unwrap()
     );
+}
+
+/// Both halves of 7.5.8.4 on the file that states them at once: the supplement's **definition**
+/// of the compressed object lifts the mask the classic section is required to write for legacy
+/// readers, and the type-0 rows the supplement's contiguous `/Index` forces it to emit for
+/// every other number are padding that must not erase the classic section's live entries.
+#[test]
+fn a_supplements_padding_free_rows_do_not_erase_the_classic_section() {
+    let pdf = hybrid_padded_supplement_pdf();
+    let eager = assert_shared_fingerprint(&pdf, "padded", 7, false);
+
+    // The mask-lift direction: the classic section says object 7 is free, the supplement says
+    // where it lives, and the supplement wins.
+    assert!(matches!(
+        eager.reference_table.get(7),
+        Some(XrefEntry::Compressed { container: 5, index: 0 })
+    ));
+    assert!(
+        eager
+            .get_object((7, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Hybrid")
+            .unwrap()
+            .as_bool()
+            .unwrap()
+    );
+
+    // The padding direction: every object the classic section defines survives the overlay —
+    // catalog, page tree, page, info, and the object stream object 7 lives in.
+    for id in 1..=6 {
+        assert!(
+            matches!(eager.reference_table.get(id), Some(XrefEntry::Normal { .. })),
+            "object {id} was erased by a padding row: {:?}",
+            eager.reference_table.get(id)
+        );
+        assert!(eager.has_object((id, 0)), "object {id} was not loaded");
+    }
+    assert_eq!(eager.get_pages().len(), 1);
+
+    // The indexed reader overlays the same supplement and must reach the same table.
+    assert!(indexed_resolves(&pdf, 7));
+    for id in 1..=6 {
+        assert!(
+            !matches!(indexed_object(&pdf, id), Object::Null),
+            "the indexed reader lost object {id}"
+        );
+    }
+}
+
+/// The other direction of "a free entry masks": a hybrid revision records what it *deletes* in
+/// its classic section — the part a legacy reader is guaranteed to read — and that entry still
+/// masks the older revision's definition. Dropping the supplement's type-0 rows must not touch
+/// this path.
+#[test]
+fn a_hybrid_revision_still_deletes_through_its_classic_section() {
+    let mut pdf = hybrid_incremental_pdf();
+    // A third revision, hybrid like the second, that frees the compressed object 7 and points
+    // at the same supplement — whose type-0 padding row for 7 is now agreement, not news.
+    let previous_xref = last_startxref(&pdf);
+    let delete_xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 1\n0000000007 65535 f \n7 1\n0000000000 00001 f \n");
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 8 /Root 1 0 R /Info 4 0 R /Prev {previous_xref} /Revision (deleted) >>\
+             \nstartxref\n{delete_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let document = Document::load_mem(&pdf).unwrap();
+    assert!(matches!(document.reference_table.get(7), Some(XrefEntry::Free)));
+    assert_eq!(document.get_pages().len(), 1);
+    // Read the way the table says: the slot is free, so the reference into it is null.
+    // (The eager loader additionally keeps whatever it expanded out of the object stream it
+    // could still see, which is why this reads the xref rather than `Document::objects`.)
+    assert!(matches!(indexed_object(&pdf, 7), Object::Null));
 }
 
 #[test]
@@ -485,30 +650,79 @@ fn assert_same_bootstrap_error(pdf: &[u8], expected: &str) {
 }
 
 #[test]
-fn prev_and_xrefstm_bounds_errors_match_between_call_sites() {
+fn prev_bounds_errors_match_between_call_sites() {
     let bad_prev = pdf_with_incremental_trailer("-1", "");
     assert_same_bootstrap_error(&bad_prev, "Prev");
 
     let bad_prev_high = pdf_with_incremental_trailer("99999999", "");
     assert_same_bootstrap_error(&bad_prev_high, "Prev");
+}
 
-    let bad_xref_stream = pdf_with_incremental_trailer("base", "/XRefStm -1");
-    assert_same_bootstrap_error(&bad_xref_stream, "StreamStart");
+/// A `/Prev` that does not resolve costs the document a whole revision, so it is fatal. A
+/// `/XRefStm` that does not resolve costs it the *compressed objects of one revision*, and the
+/// classic section beside it is a complete cross-reference table by construction — a hybrid
+/// file is designed to be read by readers that never look at `/XRefStm` at all. So a damaged
+/// supplement is skipped with a warning and the document still opens, at both call sites.
+#[test]
+fn a_damaged_supplement_degrades_to_its_classic_section() {
+    let _capture = capture_warnings();
+
+    let out_of_bounds = pdf_with_incremental_trailer("base", "/XRefStm 99999999");
+    let negative = pdf_with_incremental_trailer("base", "/XRefStm -1");
+    // An offset inside the file that is not a cross-reference section at all: the overwritten
+    // bytes an interrupted incremental update leaves behind.
+    let garbage = pdf_with_incremental_trailer("base", "/XRefStm 9");
+
+    for (pdf, label) in [
+        (out_of_bounds, "out of bounds"),
+        (negative, "negative"),
+        (garbage, "garbage"),
+    ] {
+        captured_warnings().clear();
+        let eager = Document::load_mem(&pdf).unwrap_or_else(|error| panic!("{label} /XRefStm: {error:?}"));
+        let metadata = Document::load_metadata_mem(&pdf).unwrap_or_else(|error| panic!("{label} /XRefStm: {error:?}"));
+
+        assert_eq!(eager_title(&eager), "new", "{label}");
+        assert_eq!(eager.get_pages().len(), 1, "{label}");
+        assert_eq!(metadata.page_count, 1, "{label}");
+        assert!(eager.trailer.get(b"XRefStm").is_err(), "{label}");
+
+        let warnings = captured_warnings().clone();
+        let mentions = warnings.iter().filter(|message| message.contains("XRefStm")).count();
+        assert_eq!(mentions, 2, "{label}: both call sites warn once: {warnings:?}");
+    }
+}
+
+/// A supplement pointed at bytes that are not its own still loses only the compressed objects
+/// it described: everything the classic section defines is untouched.
+#[test]
+fn a_damaged_supplement_keeps_the_rest_of_the_hybrid_file() {
+    // Warns about `/XRefStm` like its sibling above, so it takes the same gate: the two must
+    // not count each other's warnings.
+    let _capture = capture_warnings();
+    let pdf = hybrid_incremental_pdf_declaring(|supplement| supplement + 12);
+    let eager = Document::load_mem(&pdf).unwrap();
+
+    assert_eq!(eager_title(&eager), "hybrid");
+    assert_eq!(eager.get_pages().len(), 1);
+    for id in 1..=6 {
+        assert!(eager.reference_table.get(id).is_some(), "the classic section lost {id}");
+    }
+    // Only the supplement's own contribution is gone: object 7 was described nowhere else, so
+    // the merged table has no row for it at all.
+    assert!(eager.reference_table.get(7).is_none());
 }
 
 #[test]
 fn declared_size_is_normalized_from_the_merged_entries() {
-    capture_warnings();
-    CAPTURED_WARNINGS.lock().unwrap().clear();
+    let _capture = capture_warnings();
 
     let (pdf, _) = classic_pdf(99);
     let eager = assert_shared_fingerprint(&pdf, "classic", 4, false);
     assert_eq!(eager.reference_table.size, 5);
 
     let expected = "Size entry of trailer dictionary is 99, correct value is 5.";
-    let count = CAPTURED_WARNINGS
-        .lock()
-        .unwrap()
+    let count = captured_warnings()
         .iter()
         .filter(|message| message.as_str() == expected)
         .count();
@@ -653,11 +867,15 @@ fn revision_object(document: &Document, id: u32) -> Option<String> {
     Some(String::from_utf8_lossy(name).into_owned())
 }
 
-fn indexed_resolves(pdf: &[u8], id: u32) -> bool {
+fn indexed_object(pdf: &[u8], id: u32) -> Object {
     IndexedReader::open(BytesSource::from(pdf.to_vec()))
         .unwrap()
         .resolve_object((id, 0))
-        .is_ok()
+        .unwrap()
+}
+
+fn indexed_resolves(pdf: &[u8], id: u32) -> bool {
+    matches!(indexed_object(pdf, id), Object::Dictionary(_))
 }
 
 #[test]
@@ -674,11 +892,77 @@ fn a_newer_revision_free_entry_masks_the_older_definition() {
     // object 5 no longer wins the merge and nothing resurrects it.
     assert!(matches!(deleted_doc.reference_table.get(5), Some(XrefEntry::Free)));
     assert_eq!(revision_object(&deleted_doc, 5), None);
-    assert!(deleted_doc.get_object((5, 0)).is_err());
     assert!(!deleted_doc.has_object((5, 0)));
     // Both readers agree the object is gone — this is the last xref-layer disagreement
     // between them.
     assert!(!indexed_resolves(&deleted, 5));
+}
+
+/// A dictionary that still points at an object a later revision freed is ordinary
+/// incremental-writer output — a redaction drops the object and leaves the `/Annots` entry
+/// naming it. ISO 32000-1, 7.3.10 makes that reference the **null object**, not an error, so
+/// a caller walking the array keeps working instead of failing an extraction that used to
+/// succeed. An id the file never mentions is a different thing and stays an error.
+#[test]
+fn a_reference_into_a_freed_slot_reads_as_null() {
+    let (deleted, _) = deleted_object_pdf(2);
+    let document = Document::load_mem(&deleted).unwrap();
+
+    assert!(matches!(document.get_object((5, 0)), Ok(Object::Null)));
+    let (id, resolved) = document.dereference(&Object::Reference((5, 0))).unwrap();
+    assert_eq!(id, Some((5, 0)));
+    assert!(matches!(resolved, Object::Null));
+
+    // Reached the way a document reaches it: through an array the freed object is still
+    // named in. The array resolves, with a null where the deletion happened.
+    let annots = Object::Array(vec![Object::Reference((4, 0)), Object::Reference((5, 0))]);
+    let resolved: Vec<&Object> = annots
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| document.dereference(entry).unwrap().1)
+        .collect();
+    assert!(matches!(resolved[0], Object::Dictionary(_)));
+    assert!(matches!(resolved[1], Object::Null));
+
+    // Both engines answer the same. The indexed reader keeps its typed refusal for an id the
+    // index does not mention at all, which is a file disagreeing with itself rather than a
+    // deletion.
+    assert!(matches!(indexed_object(&deleted, 5), Object::Null));
+    assert!(matches!(
+        document.get_object((99, 0)),
+        Err(Error::ObjectNotFound((99, 0)))
+    ));
+    assert!(
+        IndexedReader::open(BytesSource::from(deleted.clone()))
+            .unwrap()
+            .resolve_object((99, 0))
+            .is_err()
+    );
+}
+
+/// A file that frees its highest-numbered object declares the same `/Size` it did before:
+/// 7.5.4 counts free entries, and the table still holds a row for the freed slot. The reader
+/// used to derive the size from definitions alone, so it warned about — and shrank — a `/Size`
+/// that was right as written.
+#[test]
+fn freeing_the_highest_object_leaves_the_declared_size_alone() {
+    let _capture = capture_warnings();
+
+    let (deleted, _) = deleted_object_pdf(2);
+    let document = Document::load_mem(&deleted).unwrap();
+    let metadata = Document::load_metadata_mem(&deleted).unwrap();
+    assert_eq!(metadata.page_count, 1);
+
+    assert_eq!(document.reference_table.size, 6, "the trailer's /Size 6 is correct");
+    assert_eq!(document.max_id, 4, "…and the highest *definition* is still 4");
+
+    let size_warnings: Vec<String> = captured_warnings()
+        .iter()
+        .filter(|message| message.contains("Size entry of trailer dictionary"))
+        .cloned()
+        .collect();
+    assert!(size_warnings.is_empty(), "unexpected warnings: {size_warnings:?}");
 }
 
 #[test]
@@ -699,14 +983,15 @@ fn an_older_revision_free_entry_does_not_delete_a_newer_definition() {
 #[test]
 fn a_deleted_object_does_not_move_the_id_a_save_numbers_from() {
     let (deleted, _) = deleted_object_pdf(2);
-    let mut document = assert_shared_fingerprint(&deleted, "deletion", 4, false);
+    let mut document = assert_shared_fingerprint_with_size(&deleted, "deletion", 4, 6, false);
 
-    // `Xref::size` — and `Document::max_id`, which is `size - 1` — count *definitions*. The
-    // trailer still declares `/Size 6` because object 5 once existed; the deletion must leave
-    // the id space at 4 so the save path keeps numbering new objects from 5 rather than
-    // stepping over a slot nothing occupies.
+    // `Document::max_id` counts *definitions*: the deletion must leave the id space at 4 so
+    // the save path keeps numbering new objects from 5 rather than stepping over a slot
+    // nothing occupies. `/Size` is the other question and has the other answer — the file
+    // declares 6, which is correct as written (7.5.4 counts the free entry), so the reader
+    // leaves it alone.
     assert_eq!(document.max_id, 4);
-    assert_eq!(document.reference_table.size, 5);
+    assert_eq!(document.reference_table.size, 6);
     assert_eq!(
         document.add_object(dictionary! { "RevisionObject" => Object::string_literal("added") }),
         (5, 0)

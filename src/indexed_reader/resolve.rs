@@ -1344,7 +1344,12 @@ impl IndexedReader {
             Some(ObjectLocation64::Compressed { container, index }) => {
                 self.resolve_compressed(id, container, index, state)
             }
-            Some(ObjectLocation64::Free { .. }) | None => Err(IndexedReaderError::MissingNormalObject { id }),
+            // A slot the index says is free reads as null, the same value the
+            // eager `Document::dereference` hands back for it (ISO 32000-1,
+            // 7.3.10). An id the index does not mention at all keeps the typed
+            // refusal: that is a file disagreeing with itself, not a deletion.
+            Some(ObjectLocation64::Free { .. }) => Ok(Object::Null),
+            None => Err(IndexedReaderError::MissingNormalObject { id }),
         };
         state.depth -= 1;
         state.active.remove(&id);
@@ -1418,7 +1423,9 @@ impl IndexedReader {
             Some(ObjectLocation64::Compressed { container, index }) => {
                 self.resolve_compressed_reusing(id, container, index, state, reuse)
             }
-            Some(ObjectLocation64::Free { .. }) | None => Err(IndexedReaderError::MissingNormalObject { id }),
+            // Same freed-slot rule as `resolve_inner`: null, not an error.
+            Some(ObjectLocation64::Free { .. }) => Ok(Object::Null),
+            None => Err(IndexedReaderError::MissingNormalObject { id }),
         };
         state.depth -= 1;
         state.active.remove(&id);

@@ -873,23 +873,47 @@ impl Stream {
     /// realistic chain reads parameters at all (the ASCII and run-length filters
     /// take none).
     ///
-    /// Any entry that is absent, `null`, an indirect reference (a `Stream` has
-    /// no document to resolve it against), or otherwise not a dictionary yields
+    /// Any entry that is absent, `null`, or otherwise not a dictionary yields
     /// `None`, i.e. "that layer decodes with its defaults" — which is exactly
     /// how the whole key was treated before the array form was understood.
     ///
+    /// An entry that is an **indirect reference** is the one shape that is not
+    /// guessed at: `document` resolves it, and without a `document` the call
+    /// fails with [`DecompressError::UnresolvedDecodeParms`] rather than
+    /// dropping a predictor the stream needs. A reference that resolves to
+    /// something other than a dictionary (including the null a freed object
+    /// reads as) is back to "defaults", like any other non-dictionary entry.
+    ///
     /// Returns exactly `filter_count` entries so the caller can zip it against
     /// [`Stream::filters`] without a length check.
-    pub fn decode_parms(&self, filter_count: usize) -> Vec<Option<&Dictionary>> {
+    pub fn decode_parms<'a>(
+        &'a self, filter_count: usize, document: Option<&'a Document>,
+    ) -> Result<Vec<Option<&'a Dictionary>>> {
         match self.dict.get(b"DecodeParms") {
             Ok(Object::Array(items)) => (0..filter_count)
-                .map(|index| items.get(index).and_then(|item| item.as_dict().ok()))
+                .map(|index| Self::decode_parm_entry(items.get(index), index, document))
                 .collect(),
             Ok(other) => {
-                let params = other.as_dict().ok();
-                vec![params; filter_count]
+                let params = Self::decode_parm_entry(Some(other), 0, document)?;
+                Ok(vec![params; filter_count])
             }
-            Err(_) => vec![None; filter_count],
+            Err(_) => Ok(vec![None; filter_count]),
+        }
+    }
+
+    /// One `/DecodeParms` entry as the layer opposite it receives it.
+    fn decode_parm_entry<'a>(
+        entry: Option<&'a Object>, index: usize, document: Option<&'a Document>,
+    ) -> Result<Option<&'a Dictionary>> {
+        match entry {
+            Some(Object::Reference(id)) => {
+                let Some(document) = document else {
+                    return Err(DecompressError::UnresolvedDecodeParms { index }.into());
+                };
+                Ok(document.get_object(*id)?.as_dict().ok())
+            }
+            Some(object) => Ok(object.as_dict().ok()),
+            None => Ok(None),
         }
     }
 
@@ -957,7 +981,26 @@ impl Stream {
     /// [`Stream::decompress_to_writer`], and load documents with
     /// [`crate::LoadOptions::max_decompressed_size`] set.
     pub fn decompressed_content(&self) -> Result<Vec<u8>> {
-        self.decode_filters(None)
+        self.decode_filters(None, None)
+    }
+
+    /// [`Stream::decompressed_content`] with `document` on hand to resolve an
+    /// indirect `/DecodeParms` entry (ISO 32000-1, 7.4.1).
+    ///
+    /// Identical for every other stream: the only difference is that a stream
+    /// whose parameters live in their own indirect object decodes correctly
+    /// here, where the document-free route reports
+    /// [`DecompressError::UnresolvedDecodeParms`].
+    pub fn decompressed_content_with_document(&self, document: &Document) -> Result<Vec<u8>> {
+        self.decode_filters(None, Some(document))
+    }
+
+    /// [`Stream::decompressed_content_with_limit`] with `document` on hand to
+    /// resolve an indirect `/DecodeParms` entry.
+    pub fn decompressed_content_with_document_and_limit(
+        &self, document: &Document, max_output: usize,
+    ) -> Result<Vec<u8>> {
+        self.decode_filters(Some(max_output), Some(document))
     }
 
     /// Decode this stream's content, rejecting the stream with
@@ -970,7 +1013,7 @@ impl Stream {
     /// more than roughly `max_output` bytes per layer before being rejected,
     /// rather than expanding without limit.
     pub fn decompressed_content_with_limit(&self, max_output: usize) -> Result<Vec<u8>> {
-        self.decode_filters(Some(max_output))
+        self.decode_filters(Some(max_output), None)
     }
 
     /// Decode this stream's content into a caller-provided writer, rejecting the
@@ -991,7 +1034,9 @@ impl Stream {
     /// Shared decoder for [`Stream::decompressed_content`] and its bounded
     /// variants. `limit` is `None` to decode without a size limit, or
     /// `Some(max)` to cap the decoded output at `max` bytes per filter layer.
-    fn decode_filters(&self, limit: Option<usize>) -> Result<Vec<u8>> {
+    /// `document`, where the caller has one, resolves indirect `/DecodeParms`
+    /// entries.
+    fn decode_filters(&self, limit: Option<usize>, document: Option<&Document>) -> Result<Vec<u8>> {
         let filters = match self.filters() {
             Ok(f) => f,
             // No /Filter key means the stream is uncompressed. The raw content is
@@ -1006,7 +1051,7 @@ impl Stream {
             }
         };
 
-        let params = self.decode_parms(filters.len());
+        let params = self.decode_parms(filters.len(), document)?;
         let mut input = self.content.as_slice();
         let mut output = vec![];
 

@@ -158,7 +158,18 @@ impl PdfIndex {
                 if supplement.kind != IndexXrefType::Stream {
                     return Err(IndexedReaderError::InvalidXref { offset: hybrid });
                 }
-                entries.extend(supplement.entries);
+                // Definitions only, on the same rule the eager `Xref::supersede`
+                // states: a `/Index` run is contiguous, so a supplement pads the
+                // numbers it does not describe with type-0 rows, and letting that
+                // padding replace the classic section's live entries would delete
+                // objects the revision never freed. The revision records its
+                // deletions in the classic section, which a legacy reader has to
+                // be able to read on its own.
+                for (id, entry) in supplement.entries {
+                    if !matches!(entry, ObjectLocation64::Free { .. }) {
+                        entries.insert(id, entry);
+                    }
+                }
             }
             merge_newest(&mut locations, entries);
 

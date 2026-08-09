@@ -67,8 +67,8 @@ impl Xref {
         }
     }
 
-    /// Overlay `xref` on top of `self`, **replacing** entries that already
-    /// exist.
+    /// Overlay `xref` on top of `self`, letting its **definitions** replace the
+    /// ones already present.
     ///
     /// This is the hybrid-reference rule of ISO 32000-1, 7.5.8.4: the
     /// cross-reference stream named by a section's `/XRefStm` describes that
@@ -77,9 +77,25 @@ impl Xref {
     /// reader that understands compressed objects must therefore let the
     /// supplement take precedence *within* its own section — while the section
     /// as a whole still wins over anything older (see [`Xref::merge`]).
+    ///
+    /// Precedence runs one way: the supplement contributes **definitions**, and
+    /// its free rows are dropped. `/Index` runs are contiguous, so a supplement
+    /// that describes objects 7 and 9 has to say *something* about 8, and what
+    /// it says is a type-0 row — padding, not a deletion. Letting that padding
+    /// win would erase a live entry the classic section defines (the catalog,
+    /// a page node) and lose objects from a file that is perfectly conforming.
+    /// Nor is the row needed for a deletion the revision *does* make: a hybrid
+    /// file's classic section must be a complete cross-reference table on its
+    /// own — that is what keeps it readable by a legacy reader — so it is
+    /// where the revision records what it freed, and that free entry masks
+    /// every older revision through [`Xref::merge`] as usual. A type-0 row in
+    /// the supplement is therefore either padding or agreement, and carries
+    /// nothing its section does not already say.
     pub fn supersede(&mut self, xref: Xref) {
         for (id, entry) in xref.entries {
-            self.insert(id, entry);
+            if !entry.is_free() {
+                self.insert(id, entry);
+            }
         }
     }
 
@@ -103,6 +119,20 @@ impl Xref {
             .rev()
             .find(|(_, entry)| !entry.is_free())
             .map_or(0, |(&id, _)| id)
+    }
+
+    /// The highest object number this table has a row for **at all**, free
+    /// entries included.
+    ///
+    /// This is the id space the file's own `/Size` counts: ISO 32000-1, 7.5.4
+    /// defines `/Size` as one greater than the highest object number *used*,
+    /// and 7.5.4 requires the table to hold an entry for every number below it,
+    /// free ones included. A revision that deletes its highest-numbered object
+    /// therefore keeps `/Size` where it was, which is why a size check reads
+    /// this rather than [`Xref::max_id`] — see `Reader::read_bootstrap`, which
+    /// treats the two as the bounds a conforming `/Size` may sit between.
+    pub fn max_entry_id(&self) -> u32 {
+        self.entries.keys().next_back().copied().unwrap_or(0)
     }
 }
 

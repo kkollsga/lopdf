@@ -603,7 +603,7 @@ impl Reader<'_> {
         let mut already_seen = HashSet::new();
         let mut already_seen_supplements = HashSet::new();
         let xref_stream_start = trailer.remove(b"XRefStm");
-        self.apply_hybrid_supplement(&mut reference_table, xref_stream_start, &mut already_seen_supplements)?;
+        self.apply_hybrid_supplement(&mut reference_table, xref_stream_start, &mut already_seen_supplements);
 
         let mut prev_xref_start = trailer.remove(b"Prev");
         while let Some(prev) = prev_xref_start.take().and_then(|offset| offset.as_i64().ok()) {
@@ -618,19 +618,12 @@ impl Reader<'_> {
 
             // Read xref stream in hybrid-reference file.
             let prev_xref_stream_start = prev_trailer.remove(b"XRefStm");
-            self.apply_hybrid_supplement(&mut prev_xref, prev_xref_stream_start, &mut already_seen_supplements)?;
+            self.apply_hybrid_supplement(&mut prev_xref, prev_xref_stream_start, &mut already_seen_supplements);
             reference_table.merge(prev_xref);
 
             prev_xref_start = prev_trailer.remove(b"Prev");
         }
-        let xref_entry_count = reference_table.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
-        if reference_table.size != xref_entry_count {
-            warn!(
-                "Size entry of trailer dictionary is {}, correct value is {}.",
-                reference_table.size, xref_entry_count
-            );
-            reference_table.size = xref_entry_count;
-        }
+        Self::normalize_declared_size(&mut reference_table)?;
 
         Ok(ReaderBootstrap {
             version,
@@ -638,6 +631,36 @@ impl Reader<'_> {
             reference_table,
             trailer,
         })
+    }
+
+    /// Reconcile the trailer's declared `/Size` with the table the chain
+    /// actually produced.
+    ///
+    /// A conforming `/Size` sits between two values the merged table knows:
+    /// `max_id() + 1` — one past the highest object the file still *defines*,
+    /// which is the least it can be — and `max_entry_id() + 1`, one past the
+    /// last row the table holds at all, which is the most a file that lists
+    /// every number below `/Size` (ISO 32000-1, 7.5.4) can claim. A revision
+    /// that frees its highest-numbered object lands strictly between them and
+    /// is correct exactly as written, so nothing is warned about and nothing is
+    /// rewritten. Only a `/Size` outside that band is a real disagreement, and
+    /// it is clamped to the nearer bound with the warning this reader has
+    /// always emitted.
+    fn normalize_declared_size(reference_table: &mut Xref) -> Result<()> {
+        let lowest = reference_table.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
+        let highest = reference_table
+            .max_entry_id()
+            .checked_add(1)
+            .ok_or(ParseError::InvalidXref)?;
+        let corrected = reference_table.size.clamp(lowest, highest);
+        if reference_table.size != corrected {
+            warn!(
+                "Size entry of trailer dictionary is {}, correct value is {}.",
+                reference_table.size, corrected
+            );
+            reference_table.size = corrected;
+        }
+        Ok(())
     }
 
     /// Apply a hybrid-reference section's `/XRefStm` supplement to that
@@ -649,22 +672,32 @@ impl Reader<'_> {
     /// them has to let the supplement take precedence within the revision, so
     /// the entries are superseded rather than merged. `already_seen` keeps a
     /// chain that names the same supplement twice from re-reading it.
-    fn apply_hybrid_supplement(
-        &self, section: &mut Xref, start: Option<Object>, already_seen: &mut HashSet<i64>,
-    ) -> Result<()> {
+    ///
+    /// A supplement that cannot be read is **skipped**, not fatal. The classic
+    /// section is a complete cross-reference table on its own — that is the
+    /// whole point of a hybrid file, which stays loadable by readers that
+    /// ignore `/XRefStm` entirely — so a damaged supplement costs the document
+    /// its compressed objects and nothing else. Failing the load instead would
+    /// refuse files that opened before every section's supplement was read, for
+    /// bytes no reader is required to look at.
+    fn apply_hybrid_supplement(&self, section: &mut Xref, start: Option<Object>, already_seen: &mut HashSet<i64>) {
         let Some(start) = start.and_then(|offset| offset.as_i64().ok()) else {
-            return Ok(());
+            return;
         };
         if start < 0 || start as usize > self.buffer.len() {
-            return Err(Error::Xref(XrefError::StreamStart));
+            warn!("XRefStm {start} is outside the file; the hybrid-reference supplement is ignored.");
+            return;
         }
         if !already_seen.insert(start) {
-            return Ok(());
+            return;
         }
 
-        let (supplement, _) = parser::xref_and_trailer(&self.buffer[start as usize..], self)?;
-        section.supersede(supplement);
-        Ok(())
+        match parser::xref_and_trailer(&self.buffer[start as usize..], self) {
+            Ok((supplement, _)) => section.supersede(supplement),
+            Err(error) => {
+                warn!("XRefStm {start} could not be read ({error}); the hybrid-reference supplement is ignored.")
+            }
+        }
     }
 
     /// Read metadata (title and page count) without loading the entire document.
@@ -868,7 +901,12 @@ impl Reader<'_> {
         }
 
         self.document.version = bootstrap.version;
-        self.document.max_id = bootstrap.reference_table.size - 1;
+        // The id a later `save` numbers from is the highest object the file
+        // *defines*, not the highest slot its table mentions: a revision that
+        // deletes its top object leaves `/Size` where it was (see
+        // `normalize_declared_size`), and stepping over the emptied slot would
+        // renumber saved output purely because something was deleted.
+        self.document.max_id = bootstrap.reference_table.max_id();
         self.document.xref_start = bootstrap.xref_start;
         self.document.trailer = bootstrap.trailer;
         self.document.reference_table = bootstrap.reference_table;

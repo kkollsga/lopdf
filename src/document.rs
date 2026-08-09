@@ -57,6 +57,11 @@ pub struct Document {
     pub encryption_state: Option<EncryptionState>,
 }
 
+/// What a reference into a freed slot resolves to (ISO 32000-1, 7.3.10). A
+/// `static` rather than a temporary so the borrow can outlive the call that
+/// produces it.
+static FREED_OBJECT: Object = Object::Null;
+
 impl Document {
     /// Create new PDF document.
     pub fn new() -> Self {
@@ -134,19 +139,43 @@ impl Document {
         self.recursive_fix_pages(&self.bookmarks.clone(), true);
     }
 
+    /// Whether the cross-reference table says this object's slot was **freed**.
+    ///
+    /// A freed slot is a deletion the file recorded on purpose, which is a
+    /// different thing from an object id nothing in the file ever mentions.
+    /// Only the former resolves to null (see [`Document::dereference`]); the
+    /// latter stays [`Error::ObjectNotFound`], so a truncated or mis-parsed
+    /// file still reports what it is instead of quietly reading as a document
+    /// full of nulls.
+    fn is_freed(&self, id: ObjectId) -> bool {
+        self.reference_table.get(id.0).is_some_and(|entry| entry.is_free())
+    }
+
     /// Follow references if the supplied object is a reference.
     ///
     /// Returns a tuple of an optional object id and final object.
     /// The object id will be None if the object was not a
     /// reference. Otherwise, it will be the last object id in the
     /// reference chain.
+    ///
+    /// A reference into a slot the cross-reference table marks free resolves to
+    /// [`Object::Null`]. ISO 32000-1, 7.3.10: "An indirect reference to an
+    /// undefined object shall not be considered an error by a conforming
+    /// reader; it shall be treated as a reference to the null object." Deleting
+    /// an object without rewriting every dictionary that pointed at it is
+    /// ordinary incremental-writer behaviour, and a page whose `/Annots` names
+    /// a freed annotation must still extract.
     pub fn dereference<'a>(&'a self, mut object: &'a Object) -> Result<(Option<ObjectId>, &'a Object)> {
         let mut nb_deref = 0;
         let mut id = None;
 
         while let Ok(ref_id) = object.as_reference() {
             id = Some(ref_id);
-            object = self.objects.get(&ref_id).ok_or(Error::ObjectNotFound(ref_id))?;
+            object = match self.objects.get(&ref_id) {
+                Some(object) => object,
+                None if self.is_freed(ref_id) => return Ok((id, &FREED_OBJECT)),
+                None => return Err(Error::ObjectNotFound(ref_id)),
+            };
 
             nb_deref += 1;
             if nb_deref > Self::DEREF_LIMIT {
@@ -158,9 +187,15 @@ impl Document {
     }
 
     /// Get object by object id, will iteratively dereference a referenced object.
+    ///
+    /// A freed object id reads as [`Object::Null`], on the same 7.3.10 rule
+    /// [`Document::dereference`] states.
     pub fn get_object(&self, id: ObjectId) -> Result<&Object> {
-        let object = self.objects.get(&id).ok_or(Error::ObjectNotFound(id))?;
-        self.dereference(object).map(|(_, object)| object)
+        match self.objects.get(&id) {
+            Some(object) => self.dereference(object).map(|(_, object)| object),
+            None if self.is_freed(id) => Ok(&FREED_OBJECT),
+            None => Err(Error::ObjectNotFound(id)),
+        }
     }
 
     /// Determines if an object exists in the current document (or incremental update.)
@@ -552,7 +587,10 @@ impl Document {
         let content_streams = self.get_page_contents(page_id);
         for object_id in content_streams {
             if let Ok(content_stream) = self.get_object(object_id).and_then(Object::as_stream) {
-                match content_stream.decompressed_content() {
+                // Decoded through `self`, so a content stream whose
+                // `/DecodeParms` names an indirect predictor dictionary gets
+                // that reference resolved instead of decoding on defaults.
+                match content_stream.decompressed_content_with_document(self) {
                     Ok(data) => content.extend_from_slice(&data),
                     Err(_) => content.extend_from_slice(&content_stream.content),
                 };
@@ -586,7 +624,7 @@ impl Document {
         for object_id in content_streams {
             if let Ok(content_stream) = self.get_object(object_id).and_then(Object::as_stream) {
                 let remaining = max_decompressed_size.saturating_sub(content.len());
-                match content_stream.decompressed_content_with_limit(remaining) {
+                match content_stream.decompressed_content_with_document_and_limit(self, remaining) {
                     Ok(data) => content.extend_from_slice(&data),
                     Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
                         return Err(DecompressError::MemoryLimitExceeded {
@@ -816,19 +854,24 @@ impl Default for Document {
 ///
 ///   * `ancestors` is the set of `/Pages` nodes on the path to the current one. A `/Kids` entry naming one of them is a
 ///     cycle rather than a subtree, and is skipped — so a self-referencing node no longer re-enters itself forever, and
-///     the real pages beside it are still reached.
-///   * `iter_limit` starts at the document's object count and is spent one unit per visited kid, so the walk — and
-///     `stack`, which grows by at most one frame per visit — stays proportional to a document that is already fully in
-///     memory.
+///     the real pages beside it are still reached. It is the *path*, not a visited set: a node reached twice as a
+///     sibling is duplication, and both visits count.
+///   * `iter_limit` starts at the document's object count and is spent one unit per visited kid, so the walk stays
+///     proportional to a document that is already fully in memory.
+///
+/// Retained memory: one `stack` frame per level that still has siblings **pending** — a single-kid chain leaves none,
+/// which is what lets a chain nested a million deep walk in the memory a shallow one uses — plus one `path` entry and
+/// one `ancestors` entry per level currently open, which is the price of testing the path exactly rather than
+/// approximating it with a visited set.
 struct PageTreeIter<'a> {
     doc: &'a Document,
-    /// The pending siblings of each ancestor, innermost last, each paired with the node whose
-    /// `/Kids` they are.
-    stack: Vec<(&'a [Object], ObjectId)>,
+    /// The pending siblings of the levels that still have any, outermost first, each paired with
+    /// the length `path` had when that level was entered.
+    stack: Vec<(&'a [Object], usize)>,
     kids: Option<&'a [Object]>,
-    /// The `/Pages` node whose `/Kids` are in `kids`.
-    node: ObjectId,
-    /// `node` and every `/Pages` node above it.
+    /// The `/Pages` nodes from the tree root down to the one whose `/Kids` are in `kids`.
+    path: Vec<ObjectId>,
+    /// The contents of `path`, for membership tests in constant time.
     ancestors: HashSet<ObjectId>,
     iter_limit: usize,
 }
@@ -844,7 +887,7 @@ impl<'a> PageTreeIter<'a> {
                 doc,
                 kids: Self::kids(doc, page_tree_id),
                 stack: Vec::with_capacity(32),
-                node: page_tree_id,
+                path: vec![page_tree_id],
                 ancestors: HashSet::from([page_tree_id]),
                 iter_limit: doc.objects.len(),
             }
@@ -853,7 +896,7 @@ impl<'a> PageTreeIter<'a> {
                 doc,
                 kids: None,
                 stack: Vec::new(),
-                node: (0, 0),
+                path: Vec::new(),
                 ancestors: HashSet::new(),
                 iter_limit: doc.objects.len(),
             }
@@ -893,11 +936,19 @@ impl Iterator for PageTreeIter<'_> {
                         // `/Pages` node reachable from its own subtree is a cycle, and
                         // following it would re-enter one level deeper forever. Skipping the
                         // edge — rather than capping the nesting — keeps the pages that sit
-                        // beside it reachable. Every level is pushed, so `stack` is the
-                        // ancestor chain and popping it is what retires an ancestor.
+                        // beside it reachable.
+                        //
+                        // Only a level with siblings still pending needs a frame; descending
+                        // through a node whose `/Kids` this exhausts is a tail call, and
+                        // retaining an empty remainder for it would spend a frame per level
+                        // on the single-kid chains that used to cost nothing. The frame
+                        // carries the path length to unwind to instead of one node id, so
+                        // every level skipped this way is still retired on the way back up.
                         b"Pages" if self.ancestors.insert(kid_id) => {
-                            self.stack.push((self.kids.unwrap(), self.node));
-                            self.node = kid_id;
+                            if !new_kids.is_empty() {
+                                self.stack.push((new_kids, self.path.len()));
+                            }
+                            self.path.push(kid_id);
                             self.kids = Self::kids(self.doc, kid_id);
                         }
                         _ => {}
@@ -906,9 +957,10 @@ impl Iterator for PageTreeIter<'_> {
             }
 
             // Current level exhausted, try to pop.
-            if let Some((kids, node)) = self.stack.pop() {
-                self.ancestors.remove(&self.node);
-                self.node = node;
+            if let Some((kids, path_len)) = self.stack.pop() {
+                for node in self.path.drain(path_len..) {
+                    self.ancestors.remove(&node);
+                }
                 self.kids = Some(kids);
             } else {
                 return None;
@@ -916,6 +968,18 @@ impl Iterator for PageTreeIter<'_> {
         }
     }
 
+    /// The pages still pending, as the document's own `/Count` entries claim them.
+    ///
+    /// The lower bound is **zero**, not that sum. A `/Kids` entry that closes a cycle is
+    /// skipped by [`Iterator::next`] but still contributes its `/Count` here, so on the
+    /// self-referencing trees this walk supports the sum exceeds what the iterator yields —
+    /// and a lower bound that is not actually reached is a contract violation, not a rounding
+    /// error. Nothing cheap distinguishes those trees from ordinary ones (finding it out is
+    /// the walk), so the honest claim is the one that holds for both.
+    ///
+    /// The upper bound is the sum, which is what `collect` reserves against. Like every
+    /// `/Count`, it is the document's assertion rather than a fact: a node under-declaring
+    /// its subtree can be walked past it, so no caller may treat it as a bound on the yields.
     fn size_hint(&self) -> (usize, Option<usize>) {
         let kids = self.kids.unwrap_or(&[]);
 
@@ -937,7 +1001,7 @@ impl Iterator for PageTreeIter<'_> {
             })
             .sum();
 
-        (nb_pages, Some(nb_pages))
+        (0, Some(nb_pages))
     }
 }
 
@@ -1009,17 +1073,17 @@ mod page_tree_tests {
         assert_eq!(document.get_pages().get(&1), Some(&(3 + 2 * (LEVELS - 1), 0)));
     }
 
-    /// The single-kid chain never retained a sibling, so it always walked to any depth. It
-    /// still must.
-    #[test]
-    fn a_deep_single_kid_chain_still_reads() {
-        const LEVELS: u32 = 300;
+    /// A `/Pages` chain with exactly one kid at every level, ending in a single `/Page`.
+    ///
+    /// The shape that costs nothing to walk: descending it never leaves a sibling behind, so
+    /// no level has anything to come back to.
+    fn single_kid_chain(levels: u32) -> Document {
         let mut document = Document::with_version("1.7");
         document.objects.insert(
             (1, 0),
             Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
         );
-        for level in 0..LEVELS {
+        for level in 0..levels {
             let node = 2 + level;
             document.objects.insert(
                 (node, 0),
@@ -1030,11 +1094,77 @@ mod page_tree_tests {
         }
         document
             .objects
-            .insert((2 + LEVELS, 0), Object::Dictionary(dictionary! { "Type" => "Page" }));
-        document.max_id = 2 + LEVELS;
+            .insert((2 + levels, 0), Object::Dictionary(dictionary! { "Type" => "Page" }));
+        document.max_id = 2 + levels;
         document.trailer.set("Root", Object::Reference((1, 0)));
+        document
+    }
+
+    /// The single-kid chain never retained a sibling, so it always walked to any depth. It
+    /// still must.
+    #[test]
+    fn a_deep_single_kid_chain_still_reads() {
+        const LEVELS: u32 = 300;
+        let document = single_kid_chain(LEVELS);
 
         assert_eq!(document.page_iter().collect::<Vec<_>>(), vec![(2 + LEVELS, 0)]);
+    }
+
+    /// …and still walks it in the frames a shallow tree uses: none. Descending through a level
+    /// whose `/Kids` the descent exhausts is a tail call, so retaining a frame for it buys
+    /// nothing and costs one per level on the very shape that used to cost nothing — tens of
+    /// megabytes on a crafted million-deep chain. What is retained instead is the ancestor
+    /// path, which is the price of testing "is this kid one of my ancestors" exactly rather
+    /// than approximating it with a visited set.
+    #[test]
+    fn a_single_kid_chain_retains_no_stack_frames() {
+        const LEVELS: u32 = 300;
+        let document = single_kid_chain(LEVELS);
+
+        let mut iter = PageTreeIter::new(&document);
+        assert_eq!(iter.next(), Some((2 + LEVELS, 0)));
+        assert!(
+            iter.stack.is_empty(),
+            "a chain with nothing pending retained {} frames",
+            iter.stack.len()
+        );
+        assert_eq!(iter.path.len(), LEVELS as usize);
+        assert_eq!(iter.ancestors.len(), LEVELS as usize);
+        assert_eq!(iter.next(), None);
+
+        // The contrast, and what frames are actually for: a level that still has a sibling
+        // waiting has to be come back to, so it keeps one.
+        const BROAD: u32 = 8;
+        let broad_document = deep_and_broad_page_tree(BROAD);
+        let mut broad = PageTreeIter::new(&broad_document);
+        broad.next();
+        assert_eq!(broad.stack.len() as u32, BROAD - 1);
+    }
+
+    /// A `/Pages` node whose `/Kids` name the node itself, beside `pages` real pages. Its
+    /// `/Count` counts the pages, so the self-edge is `/Count` worth of pages the tree claims
+    /// twice.
+    fn self_referencing_page_tree(pages: u32) -> Document {
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (1, 0),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+        );
+        let mut kids = vec![Object::Reference((2, 0))];
+        for page in 0..pages {
+            let id = 3 + page;
+            kids.push(Object::Reference((id, 0)));
+            document
+                .objects
+                .insert((id, 0), Object::Dictionary(dictionary! { "Type" => "Page" }));
+        }
+        document.objects.insert(
+            (2, 0),
+            Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => i64::from(pages) }),
+        );
+        document.max_id = 2 + pages;
+        document.trailer.set("Root", Object::Reference((1, 0)));
+        document
     }
 
     /// A `/Pages` node that names itself is the shape the removed frame cap was read as
@@ -1045,30 +1175,39 @@ mod page_tree_tests {
     #[test]
     fn a_self_referencing_page_tree_skips_the_cycle_and_keeps_its_pages() {
         const PAGES: u32 = 1_000;
-        let mut document = Document::with_version("1.7");
-        document.objects.insert(
-            (1, 0),
-            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
-        );
-        let mut kids = vec![Object::Reference((2, 0))];
-        for page in 0..PAGES {
-            let id = 3 + page;
-            kids.push(Object::Reference((id, 0)));
-            document
-                .objects
-                .insert((id, 0), Object::Dictionary(dictionary! { "Type" => "Page" }));
-        }
-        document.objects.insert(
-            (2, 0),
-            Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => i64::from(PAGES) }),
-        );
-        document.max_id = 2 + PAGES;
-        document.trailer.set("Root", Object::Reference((1, 0)));
+        let document = self_referencing_page_tree(PAGES);
 
         let walked: Vec<ObjectId> = document.page_iter().collect();
         assert_eq!(walked.len() as u32, PAGES);
         assert_eq!(walked, (0..PAGES).map(|page| (3 + page, 0)).collect::<Vec<_>>());
         assert!(walked.len() <= document.objects.len());
+    }
+
+    /// On that same tree the hint used to claim `(2000, Some(2000))` for a walk that yields
+    /// 1000: the skipped self-edge still contributes its `/Count`. A lower bound that is never
+    /// reached breaks the `Iterator::size_hint` contract — `(n, Some(n))` means *exactly* n —
+    /// and a caller using the hint as a fast page count reported double. Nothing cheap tells a
+    /// cyclic tree from an ordinary one, so the lower bound claims nothing.
+    #[test]
+    fn size_hint_claims_no_lower_bound_a_cyclic_tree_could_miss() {
+        const PAGES: u32 = 1_000;
+        let document = self_referencing_page_tree(PAGES);
+
+        let (lower, upper) = document.page_iter().size_hint();
+        let yielded = document.page_iter().count();
+        assert_eq!(yielded as u32, PAGES);
+        assert_eq!(lower, 0);
+        assert!(lower <= yielded, "a lower bound the walk does not reach");
+        // The upper bound stays the sum of the `/Count`s pending, which is what `collect`
+        // reserves against — here the doubled figure, because that is what the tree asserts
+        // about itself.
+        assert_eq!(upper, Some(2 * PAGES as usize));
+        assert!(upper.unwrap() >= yielded);
+
+        // An ordinary tree is bounded the same way, and its bound is tight.
+        let plain = deep_and_broad_page_tree(8);
+        assert_eq!(plain.page_iter().size_hint(), (0, Some(8)));
+        assert_eq!(plain.page_iter().count(), 8);
     }
 
     /// A `/Pages` node reached twice as a *sibling* is duplication, not a cycle, and both

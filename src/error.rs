@@ -140,6 +140,17 @@ pub enum DecompressError {
     /// maximum number of output bytes that were permitted.
     #[error("decompressed output exceeded the {limit}-byte limit (possible decompression bomb)")]
     MemoryLimitExceeded { limit: usize },
+    /// A `/DecodeParms` entry is an indirect reference, and the decode was
+    /// asked for without the document that could resolve it.
+    ///
+    /// Indirect decode parameters are legal (ISO 32000-1, 7.4.1), and the
+    /// dictionary they name usually carries a predictor. Decoding the layer on
+    /// its defaults instead would return plausible, silently wrong bytes, so
+    /// the bare [`Stream`](crate::Stream) route says so rather than guessing;
+    /// decode through the document (e.g. [`Document::get_page_content`](crate::Document::get_page_content))
+    /// to have the reference resolved.
+    #[error("/DecodeParms entry {index} is an indirect reference and no document was available to resolve it")]
+    UnresolvedDecodeParms { index: usize },
 }
 
 #[derive(Error, Debug)]

@@ -7,7 +7,7 @@
 //! parameter is live — the same stream with `/DecodeParms` dropped decodes to
 //! something else.
 
-use lopdf::{Dictionary, Object, Stream, dictionary};
+use lopdf::{DecompressError, Dictionary, Document, Error, Object, Stream, dictionary};
 
 const ROW: usize = 8;
 
@@ -186,12 +186,14 @@ fn entries_that_are_not_dictionaries_leave_their_layer_on_its_defaults() {
     let encoded = ascii_hex_encode(&flate_encode(&expected));
 
     // A short array, a `null` opposite the layer that would read it, and an
-    // unresolvable reference all mean "this layer decodes with its defaults" —
-    // which for an unpredicted stream is the right answer.
+    // empty array all mean "this layer decodes with its defaults" — which for
+    // an unpredicted stream is the right answer. An indirect reference does
+    // *not* belong in this list: it names parameters that exist, so guessing
+    // defaults for it is a wrong answer, not a lenient one (see
+    // `an_indirect_entry_is_refused_rather_than_decoded_on_defaults`).
     for parms in [
         Object::Array(vec![Object::Null]),
         Object::Array(vec![Object::Null, Object::Null]),
-        Object::Array(vec![Object::Null, Object::Reference((9, 0))]),
         Object::Array(vec![]),
         Object::Null,
     ] {
@@ -204,6 +206,98 @@ fn entries_that_are_not_dictionaries_leave_their_layer_on_its_defaults() {
         );
         assert_eq!(decoded(&stream), expected, "{parms:?}");
     }
+}
+
+/// An indirect `/DecodeParms` entry is legal (7.4.1) and names parameters that exist. A bare
+/// `Stream` has nothing to resolve it against, and the two things it could do instead are not
+/// equal: decoding the layer on its defaults returns bytes that look fine and are wrong, which
+/// is the exact failure mode the array form was taught to avoid. So it says so.
+#[test]
+fn an_indirect_entry_is_refused_rather_than_decoded_on_defaults() {
+    let expected = payload();
+    let predicted = ascii_hex_encode(&flate_encode(&png_up_predict(&expected, ROW)));
+
+    let array_form = Stream::new(
+        dictionary! {
+            "Filter" => vec!["ASCIIHexDecode".into(), Object::Name(b"FlateDecode".to_vec())],
+            "DecodeParms" => vec![Object::Null, Object::Reference((9, 0))],
+        },
+        predicted.clone(),
+    );
+    assert!(matches!(
+        array_form.decompressed_content(),
+        Err(Error::Decompress(DecompressError::UnresolvedDecodeParms { index: 1 }))
+    ));
+    assert!(matches!(
+        array_form.decompressed_content_with_limit(1 << 20),
+        Err(Error::Decompress(DecompressError::UnresolvedDecodeParms { index: 1 }))
+    ));
+
+    // The whole value as a reference is the same question with one filter's worth of context.
+    let whole_value = Stream::new(
+        dictionary! {
+            "Filter" => "FlateDecode",
+            "DecodeParms" => Object::Reference((9, 0)),
+        },
+        flate_encode(&png_up_predict(&expected, ROW)),
+    );
+    assert!(matches!(
+        whole_value.decompressed_content(),
+        Err(Error::Decompress(DecompressError::UnresolvedDecodeParms { index: 0 }))
+    ));
+}
+
+/// The same two streams, decoded through the document that holds the parameters: the reference
+/// resolves, the predictor runs, and the bytes are the ones the file encoded.
+#[test]
+fn a_document_resolves_an_indirect_decode_parms_entry() {
+    let expected = payload();
+    let mut document = Document::with_version("1.7");
+    let parms = document.add_object(Object::Dictionary(png_predictor_parms()));
+    let content = document.add_object(Object::Stream(Stream::new(
+        dictionary! {
+            "Filter" => vec!["ASCIIHexDecode".into(), Object::Name(b"FlateDecode".to_vec())],
+            "DecodeParms" => vec![Object::Null, Object::Reference(parms)],
+        },
+        ascii_hex_encode(&flate_encode(&png_up_predict(&expected, ROW))),
+    )));
+    let pages_id = document.new_object_id();
+    let page = document.add_object(Object::Dictionary(dictionary! {
+        "Type" => "Page",
+        "Parent" => Object::Reference(pages_id),
+        "Contents" => Object::Reference(content),
+    }));
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1_i64,
+        }),
+    );
+    let catalog = document.add_object(Object::Dictionary(dictionary! {
+        "Type" => "Catalog", "Pages" => Object::Reference(pages_id),
+    }));
+    document.trailer.set("Root", Object::Reference(catalog));
+
+    // The route a caller takes: page content, bounded and unbounded.
+    let mut with_newline = expected.clone();
+    with_newline.push(b'\n');
+    assert_eq!(document.get_page_content(page), with_newline);
+    assert_eq!(
+        document.get_page_content_with_limit(page, 1 << 20).unwrap(),
+        with_newline
+    );
+
+    // And the stream route the document lends its resolver to.
+    let stream = document.get_object(content).unwrap().as_stream().unwrap();
+    assert_eq!(stream.decompressed_content_with_document(&document).unwrap(), expected);
+    assert_eq!(
+        stream
+            .decompressed_content_with_document_and_limit(&document, 1 << 20)
+            .unwrap(),
+        expected
+    );
+    // The premise: without the reference resolved these bytes are not obtainable at all.
+    assert!(stream.decompressed_content().is_err());
 }
 
 #[test]

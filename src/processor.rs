@@ -294,7 +294,7 @@ impl Document {
         let mut file = File::create(format!("{stream_id:?}.bin"))?;
         if let Ok(Object::Stream(stream)) = self.get_object(stream_id) {
             if decompress {
-                if let Ok(data) = stream.decompressed_content() {
+                if let Ok(data) = stream.decompressed_content_with_document(self) {
                     file.write_all(&data)?;
                 } else {
                     file.write_all(&stream.content)?;
