@@ -1,4 +1,5 @@
-use lopdf::{Document, LoadOptions, Object, ObjectId};
+use lopdf::xref::XrefEntry;
+use lopdf::{BytesSource, Document, IndexedReader, LoadOptions, Object, ObjectId};
 use std::collections::BTreeMap;
 use std::thread;
 use std::time::Duration;
@@ -10,10 +11,10 @@ struct ObjectStreamSpec {
     winner: &'static str,
 }
 
-/// Build a PDF whose xref leaves object 5 untracked while two normal ObjStm
-/// entries both define it. `xref_key` deliberately remains separate from the
-/// parsed indirect-object header so malformed key/header mismatches can verify
-/// that eager loading preserves outer xref traversal order.
+/// Build a PDF whose xref marks object 5 as an unused hole (`0000000000 65535 f`) while two
+/// normal ObjStm entries both define it. `xref_key` deliberately remains separate from the
+/// parsed indirect-object header, so a malformed key/header mismatch exercises the same path
+/// under a container the outer table and the inner header disagree about.
 fn duplicate_unindexed_object_streams(first: ObjectStreamSpec, second: ObjectStreamSpec) -> Vec<u8> {
     const MAX_XREF_ID: u32 = 800;
 
@@ -85,17 +86,57 @@ fn delay_mismatched_container_700(id: ObjectId, object: &mut Object) -> Option<(
     Some((id, object.clone()))
 }
 
-fn winner(document: &Document) -> &[u8] {
-    document
-        .get_object((5, 0))
-        .and_then(Object::as_dict)
-        .and_then(|dictionary| dictionary.get(b"Winner"))
-        .and_then(Object::as_name)
-        .expect("duplicate unindexed member is retained")
+/// The two engines' answer for object 5, which the fixture leaves outside the cross-reference
+/// table. Both must refuse it: the eager loader by never expanding the member, the indexed reader
+/// by having nothing to resolve.
+fn assert_member_5_is_refused(document: &Document, pdf: &[u8], context: &str) {
+    assert!(
+        matches!(document.reference_table.get(5), Some(XrefEntry::UnusableFree) | None),
+        "{context}: the fixture's premise is that the table does not place object 5"
+    );
+    assert!(
+        !document.objects.contains_key(&(5, 0)),
+        "{context}: an unindexed member must not be expanded into the object map"
+    );
+    assert!(
+        matches!(
+            document.get_object((5, 0)).map(|object| matches!(object, Object::Null)),
+            Ok(true) | Err(_)
+        ),
+        "{context}: an unindexed member must not read back as a live object"
+    );
+    let lazy = IndexedReader::open(BytesSource::from(pdf.to_vec()))
+        .expect("the indexed reader opens the fixture")
+        .resolve_object((5, 0))
+        .expect("resolving an unplaced id is not an error");
+    assert!(
+        matches!(lazy, Object::Null),
+        "{context}: the indexed reader must agree that object 5 is not there"
+    );
+    assert_eq!(
+        document.get_pages().len(),
+        1,
+        "{context}: the rest of the file is intact"
+    );
 }
 
+/// Two `/ObjStm` containers both define object 5, which the cross-reference table places nowhere.
+/// Neither copy may be loaded: the table is the sole authority on where an object lives, and it
+/// does not say object 5 lives in either container (see `objstm_member_xref_authority_test`).
+///
+/// This test previously asserted the opposite — that the copy from the lower xref key was
+/// *retained*, with the point being that duplicate members resolve in outer-xref order rather
+/// than worker-completion order. That expectation pinned a defect: the same leniency resurrected
+/// members a later revision had freed, and the indexed reader already answered `Null` here, so
+/// the two engines disagreed on this very fixture. With unindexed members refused outright,
+/// duplicates are structurally impossible and the ordering question it asked no longer exists;
+/// `merge_object_stream_batches`'s xref-key sort survives as belt-and-braces.
+///
+/// What is still worth pinning, and is what this test now checks, is the other half of that
+/// subject: the outcome does not depend on which worker finishes first. The filter still delays
+/// container 100 past container 600, and the answer is the same on every run.
 #[test]
-fn duplicate_unindexed_members_follow_xref_order_not_worker_completion() {
+fn duplicate_unindexed_members_are_refused_whichever_worker_finishes_first() {
     let pdf = duplicate_unindexed_object_streams(
         ObjectStreamSpec {
             xref_key: 100,
@@ -112,16 +153,20 @@ fn duplicate_unindexed_members_follow_xref_order_not_worker_completion() {
     for run in 0..4 {
         let document = Document::load_mem_with_options(&pdf, LoadOptions::with_filter(delay_container_100))
             .expect("generated PDF loads");
-        assert_eq!(
-            winner(&document),
-            b"First",
-            "wrong winner on completion-inverted load {run}"
-        );
+        assert_member_5_is_refused(&document, &pdf, &format!("completion-inverted load {run}"));
     }
 }
 
+/// The same refusal when the outer xref key and the indirect-object header disagree about a
+/// container's id. The reader stays lenient about the mismatch — the file still loads — but the
+/// leniency does not extend to the member: object 5 is unplaced either way.
+///
+/// Before the strict rule this test asserted that the copy keyed by the *outer* xref entry won
+/// over the one whose parsed header claimed a lower id, i.e. which of the two duplicates was
+/// retained. That tie-break no longer has a case to decide, so what remains expressible is that
+/// a mismatched container does not become a back door for an unindexed member.
 #[test]
-fn duplicate_priority_uses_the_outer_xref_key_when_the_object_header_disagrees() {
+fn a_mismatched_xref_key_and_object_header_still_refuses_the_member() {
     let pdf = duplicate_unindexed_object_streams(
         ObjectStreamSpec {
             xref_key: 100,
@@ -137,5 +182,5 @@ fn duplicate_priority_uses_the_outer_xref_key_when_the_object_header_disagrees()
 
     let document = Document::load_mem_with_options(&pdf, LoadOptions::with_filter(delay_mismatched_container_700))
         .expect("lenient reader accepts mismatched xref key and indirect-object header");
-    assert_eq!(winner(&document), b"FirstXrefEntry");
+    assert_member_5_is_refused(&document, &pdf, "mismatched key and header");
 }

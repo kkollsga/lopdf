@@ -521,10 +521,12 @@ fn a_hybrid_revision_still_deletes_through_its_classic_section() {
     let document = Document::load_mem(&pdf).unwrap();
     assert!(matches!(document.reference_table.get(7), Some(XrefEntry::Free)));
     assert_eq!(document.get_pages().len(), 1);
-    // Read the way the table says: the slot is free, so the reference into it is null.
-    // (The eager loader additionally keeps whatever it expanded out of the object stream it
-    // could still see, which is why this reads the xref rather than `Document::objects`.)
+    // Read the way the table says: the slot is free, so the reference into it is null — and both
+    // engines say so. The object stream that still carries object 7 is readable at its old
+    // offset, but the merged table no longer places 7 in it, so the member is never expanded.
     assert!(matches!(indexed_object(&pdf, 7), Object::Null));
+    assert!(!document.objects.contains_key(&(7, 0)));
+    assert!(matches!(document.get_object((7, 0)), Ok(Object::Null) | Err(_)));
 }
 
 #[test]

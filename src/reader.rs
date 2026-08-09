@@ -1034,9 +1034,13 @@ impl Reader<'_> {
         let zero_length_streams = Mutex::new(vec![]);
         let object_streams = Mutex::new(vec![]);
 
-        // Build a map of which container each compressed object belongs to
-        // according to the xref. This prevents stale ObjStm copies (e.g., from
-        // linearization first-page sections) from overriding the correct version.
+        // Build a map of which container each compressed object belongs to according to the
+        // xref. The merged table is the sole authority on where an object lives: a member is
+        // expanded only when the table says that id is compressed *in the container being
+        // read*. That rejects stale `/ObjStm` copies (linearisation first-page sections), ids
+        // a later revision freed or reused as a normal object, and ids the table never
+        // mentions — all shapes where a still-readable container would otherwise resurrect an
+        // object the file no longer defines (ISO 32000-1, 7.5.4/7.5.8).
         let compressed_obj_containers: BTreeMap<u32, u32> = self
             .document
             .reference_table
@@ -1081,9 +1085,7 @@ impl Reader<'_> {
                                 .objects
                                 .into_iter()
                                 .filter(|((obj_num, _), _)| {
-                                    compressed_obj_containers
-                                        .get(obj_num)
-                                        .is_none_or(|&c| c == container_id)
+                                    compressed_obj_containers.get(obj_num) == Some(&container_id)
                                 })
                                 .filter_map(|(object_id, mut object)| filter_func(object_id, &mut object))
                                 .collect();
@@ -1093,9 +1095,7 @@ impl Reader<'_> {
                                 .objects
                                 .into_iter()
                                 .filter(|((obj_num, _), _)| {
-                                    compressed_obj_containers
-                                        .get(obj_num)
-                                        .is_none_or(|&c| c == container_id)
+                                    compressed_obj_containers.get(obj_num) == Some(&container_id)
                                 })
                                 .collect()
                         };
