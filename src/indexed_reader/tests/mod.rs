@@ -626,6 +626,54 @@ fn generated_page_tree_pdf(page_count: u32, declared_count: i64) -> Vec<u8> {
     pdf
 }
 
+/// A flat `page_count`-leaf page tree whose leaves each reference their own
+/// content stream, which is the shape a page walk followed by a per-page
+/// `/Contents` read actually traverses.
+fn page_tree_with_contents_pdf(page_count: u32) -> Vec<u8> {
+    let mut document = Document::with_version("1.7");
+    let kids: Vec<_> = (0..page_count)
+        .map(|index| {
+            let page_id = (index * 2 + 3, 0);
+            let content_id = (index * 2 + 4, 0);
+            document.objects.insert(
+                content_id,
+                Object::Stream(Stream::new(
+                    Dictionary::new(),
+                    format!("BT ({index}) Tj ET").into_bytes(),
+                )),
+            );
+            document.objects.insert(
+                page_id,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => Object::Reference((2, 0)),
+                    "Contents" => Object::Reference(content_id),
+                }),
+            );
+            Object::Reference(page_id)
+        })
+        .collect();
+    document.objects.insert(
+        (2, 0),
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => i64::from(page_count),
+            "Resources" => Object::Dictionary(dictionary! { "Marker" => "root" }),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        }),
+    );
+    document.objects.insert(
+        (1, 0),
+        Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) }),
+    );
+    document.max_id = page_count * 2 + 2;
+    document.trailer.set("Root", Object::Reference((1, 0)));
+    let mut pdf = Vec::new();
+    document.save_to(&mut pdf).unwrap();
+    pdf
+}
+
 fn encrypted_page_tree_pdf() -> Vec<u8> {
     let mut document = Document::with_version("1.7");
     document.objects.insert(

@@ -636,3 +636,41 @@ fn page_map_walk_is_bounded_on_a_sparse_hundred_megabyte_source() {
     let total: usize = requests.iter().map(|(_, length)| *length).sum();
     assert!(u64::try_from(total).unwrap() < 1_024 * 1_024);
 }
+
+/// The walk must read every key it needs out of one parse per node.
+///
+/// The bounded walk resolves each `/Kids` entry once and reads `/Type`,
+/// `/Kids` and the four inheritable keys off that single parsed body. This
+/// pins that, and pins the one remaining duplicate: a caller that wants a key
+/// the page map does not carry — `/Contents` is the usual one — parses the
+/// page dictionary a second time through `resolve_object`. On a page-dense
+/// document with fat page dictionaries that second parse is the larger half of
+/// the indexed wall, and collapsing it means either retaining the parsed body
+/// (measured at roughly 20x its source bytes, so a non-starter for a reader
+/// whose point is bounded residency) or materialising only the keys a caller
+/// asked for. Whichever lands, this assertion is the one that has to change.
+#[test]
+fn page_tree_walk_parses_each_node_once_and_content_lookup_parses_again() {
+    const PAGES: u32 = 8;
+    let pdf = page_tree_with_contents_pdf(PAGES);
+    let reader = open_reader(&pdf, ResolverLimits::default());
+
+    OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
+    let page_map = reader.page_map().unwrap();
+    let walk_parses = OBJECT_BODY_PARSE_CALLS.with(Cell::get);
+    assert_eq!(page_map.len(), usize::try_from(PAGES).unwrap());
+    // Catalog, the `/Pages` node, and one body per leaf. Nothing is re-read:
+    // no node is framed or parsed twice, and no content stream is touched.
+    assert_eq!(walk_parses, usize::try_from(PAGES).unwrap() + 2);
+
+    OBJECT_BODY_PARSE_CALLS.with(|calls| calls.set(0));
+    for entry in page_map.iter() {
+        let page = reader.resolve_object(entry.id()).unwrap();
+        assert!(page.as_dict().unwrap().has(b"Contents"));
+    }
+    assert_eq!(
+        OBJECT_BODY_PARSE_CALLS.with(Cell::get),
+        usize::try_from(PAGES).unwrap(),
+        "one extra parse per page, not two"
+    );
+}
