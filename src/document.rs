@@ -814,13 +814,12 @@ impl Default for Document {
 /// marker, just a short page list. Two bounds replace it, and each answers the shape the old
 /// one was really guarding:
 ///
-///   * `ancestors` is the set of `/Pages` nodes on the path to the current one. A `/Kids`
-///     entry naming one of them is a cycle rather than a subtree, and is skipped — so a
-///     self-referencing node no longer re-enters itself forever, and the real pages beside it
-///     are still reached.
-///   * `iter_limit` starts at the document's object count and is spent one unit per visited
-///     kid, so the walk — and `stack`, which grows by at most one frame per visit — stays
-///     proportional to a document that is already fully in memory.
+///   * `ancestors` is the set of `/Pages` nodes on the path to the current one. A `/Kids` entry naming one of them is a
+///     cycle rather than a subtree, and is skipped — so a self-referencing node no longer re-enters itself forever, and
+///     the real pages beside it are still reached.
+///   * `iter_limit` starts at the document's object count and is spent one unit per visited kid, so the walk — and
+///     `stack`, which grows by at most one frame per visit — stays proportional to a document that is already fully in
+///     memory.
 struct PageTreeIter<'a> {
     doc: &'a Document,
     /// The pending siblings of each ancestor, innermost last, each paired with the node whose

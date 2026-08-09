@@ -20,7 +20,9 @@ fn flate_encode(data: &[u8]) -> Vec<u8> {
 }
 
 fn lzw_encode_late_change(data: &[u8]) -> Vec<u8> {
-    weezl::encode::Encoder::new(weezl::BitOrder::Msb, 8).encode(data).unwrap()
+    weezl::encode::Encoder::new(weezl::BitOrder::Msb, 8)
+        .encode(data)
+        .unwrap()
 }
 
 fn ascii_hex_encode(data: &[u8]) -> Vec<u8> {
