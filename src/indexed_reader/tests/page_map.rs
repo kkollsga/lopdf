@@ -24,13 +24,6 @@ fn page_map_propagates_a_direct_malformed_root_object() {
             body: b"<< /Type /Page >>",
         },
     ]);
-    let eager = Document::load_mem(&pdf).unwrap();
-    assert!(matches!(
-        eager.get_object((1, 0)),
-        Err(crate::Error::ObjectNotFound((1, 0)))
-    ));
-    assert!(eager.page_iter().next().is_none());
-
     let reader = open_reader(&pdf, ResolverLimits::default());
     let direct = reader.resolve_object((1, 0)).unwrap_err();
     assert!(matches!(
@@ -103,10 +96,10 @@ fn page_map_uses_physical_kids_order_ignores_count_and_tracks_inheritance() {
     ]);
     let reader = open_reader(&pdf, ResolverLimits::default());
     let page_map = PageMap::from_reader(&reader).unwrap();
-    let eager: Vec<_> = Document::load_mem(&pdf).unwrap().page_iter().collect();
-
-    assert_eq!(page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(), eager);
-    assert_eq!(eager, vec![(3, 0), (7, 0), (3, 0)]);
+    assert_eq!(
+        page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+        vec![(3, 0), (7, 0), (3, 0)]
+    );
     assert_eq!(
         page_map.pages[0].inherited,
         InheritedPageAttributeOwners {
@@ -132,7 +125,6 @@ fn page_map_uses_physical_kids_order_ignores_count_and_tracks_inheritance() {
 fn page_map_bounds_cycles_depth_and_page_count_without_trusting_count() {
     let cyclic = cyclic_page_tree_pdf();
     let reader = open_reader(&cyclic, ResolverLimits::default());
-    let eager = Document::load_mem(&cyclic).unwrap();
     let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
 
     // The fixture's `/Pages` nodes 2 and 3 name each other, and the two walks bound that
@@ -142,9 +134,8 @@ fn page_map_bounds_cycles_depth_and_page_count_without_trusting_count() {
     // indexed walk streams the tree with no ancestor state and only its work budget,
     // which the cycle consumes before either page is reached. Neither loops; neither
     // trusts `/Count` (which claims 999999).
-    assert_eq!(eager.page_iter().collect::<Vec<_>>(), vec![(5, 0), (4, 0)]);
     assert!(page_map.pages.is_empty());
-    assert_eq!(work, eager.objects.len());
+    assert_eq!(work, 5);
 
     assert!(matches!(
         PageMap::from_reader_with_limits(
@@ -191,10 +182,6 @@ fn page_map_depth_limit_is_inclusive_and_reported() {
             limit: DEFAULT_PAGE_TREE_DEPTH_LIMIT
         })
     ));
-    // The eager walk reads the same file without complaint, so the refusal is the indexed
-    // reader's bound and not a property of the document.
-    let eager = Document::load_mem(&over_limit).unwrap();
-    assert_eq!(eager.page_iter().count(), 1);
 }
 
 /// The public `page_tree_depth` option carries the same refusal through
@@ -224,10 +211,8 @@ fn public_page_tree_depth_option_reports_an_over_deep_tree() {
 }
 
 #[test]
-fn repeated_page_dag_uses_eager_global_work_budget() {
+fn repeated_page_dag_uses_the_fixture_global_work_budget() {
     let pdf = repeated_page_dag_pdf(15);
-    let eager = Document::load_mem(&pdf).unwrap();
-    let eager_pages: Vec<_> = eager.page_iter().collect();
     let source = Arc::new(TracingBytesSource {
         bytes: pdf,
         requests: Mutex::new(Vec::new()),
@@ -238,10 +223,9 @@ fn repeated_page_dag_uses_eager_global_work_budget() {
     let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
     assert_eq!(
         page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
-        eager_pages
+        vec![(17, 0), (17, 0), (17, 0)]
     );
-    assert_eq!(eager_pages.len(), 3);
-    assert_eq!(work, eager.objects.len());
+    assert_eq!(work, 18);
     assert!(source.requests.lock().unwrap().len() <= (work + 2) * 4);
 }
 
@@ -298,16 +282,14 @@ fn repeated_distinct_wide_nodes_keep_only_compact_reachable_work() {
     const NON_REFERENCE_KIDS: usize = 14_000;
     let pdf = wide_page_tree_pdf(DISTINCT_NODES, NON_REFERENCE_KIDS, false);
     assert!(pdf.len() > usize::try_from(DISTINCT_NODES).unwrap() * 64 * 1_024);
-    let eager = Document::load_mem(&pdf).unwrap();
-    let eager_pages: Vec<_> = eager.page_iter().collect();
     let reader = open_reader(&pdf, ResolverLimits::default());
     let (page_map, work) = PageMap::from_reader_with_limits_and_stats(&reader, PageMapLimits::default()).unwrap();
 
     assert_eq!(
         page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
-        eager_pages
+        Vec::<(u32, u16)>::new()
     );
-    assert_eq!(work.consumed, eager.objects.len());
+    assert_eq!(work.consumed, usize::try_from(DISTINCT_NODES + 2).unwrap());
     assert!(work.peak_pending_items <= work.consumed);
     assert!(work.peak_pending_bytes < 64 * 1_024);
     assert_eq!(
@@ -317,7 +299,7 @@ fn repeated_distinct_wide_nodes_keep_only_compact_reachable_work() {
 }
 
 #[test]
-fn page_map_work_budget_counts_non_reference_kids_like_eager() {
+fn page_map_work_budget_counts_non_reference_kids_from_the_fixture() {
     let pdf = object_pdf(&[
         ObjectDef {
             id: 1,
@@ -338,17 +320,14 @@ fn page_map_work_budget_counts_non_reference_kids_like_eager() {
             body: b"<< /Type /Page >>",
         },
     ]);
-    let eager = Document::load_mem(&pdf).unwrap();
-    let eager_pages: Vec<_> = eager.page_iter().collect();
     let reader = open_reader(&pdf, ResolverLimits::default());
     let (page_map, work) = PageMap::from_reader_with_limits_and_work(&reader, PageMapLimits::default()).unwrap();
 
     assert_eq!(
         page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
-        eager_pages
+        vec![(3, 0)]
     );
-    assert_eq!(eager_pages, vec![(3, 0)]);
-    assert_eq!(work, eager.objects.len());
+    assert_eq!(work, 3);
 }
 
 #[test]
@@ -364,10 +343,7 @@ fn page_map_propagates_malformed_and_decompression_object_stream_failures() {
         &malformed_content,
         &[(10, 0), (11, 1), (12, 2)],
     );
-    let eager = Document::load_mem(&malformed.pdf).unwrap();
-    let eager_pages: Vec<_> = eager.page_iter().collect();
     let reader = open_reader(&malformed.pdf, ResolverLimits::default());
-    assert!(eager_pages.is_empty());
     assert!(matches!(
         reader.resolve_object((11, 0)),
         Err(IndexedReaderError::ObjectStreamMember { .. })
@@ -382,8 +358,6 @@ fn page_map_propagates_malformed_and_decompression_object_stream_failures() {
         b"uuuuu",
         &[(10, 0)],
     );
-    let eager = Document::load_mem(&invalid_filter.pdf).unwrap();
-    assert!(eager.page_iter().next().is_none());
     let reader = open_reader(&invalid_filter.pdf, ResolverLimits::default());
     let direct_error = reader.resolve_object((10, 0)).unwrap_err();
     assert!(
@@ -483,9 +457,7 @@ fn page_tree_inside_one_object_stream_decodes_the_container_once() {
         &entries,
     );
 
-    let eager = Document::load_mem(&fixture.pdf).unwrap();
-    let eager_pages: Vec<_> = eager.page_iter().collect();
-    assert_eq!(eager_pages.len(), usize::try_from(PAGES).unwrap());
+    let expected_pages: Vec<_> = (0..PAGES).map(|page| (12 + page, 0)).collect();
 
     let source = Arc::new(TracingBytesSource {
         bytes: fixture.pdf.clone(),
@@ -497,7 +469,7 @@ fn page_tree_inside_one_object_stream_decodes_the_container_once() {
     let (page_map, work) = PageMap::from_reader_with_limits_and_stats(&reader, PageMapLimits::default()).unwrap();
     assert_eq!(
         page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
-        eager_pages
+        expected_pages
     );
     // Every page inherits `/Resources` from the one `/Pages` node and owns its
     // own `/MediaBox`, so the projection is not vacuously equal either.
@@ -531,7 +503,7 @@ fn page_tree_inside_one_object_stream_decodes_the_container_once() {
 }
 
 #[test]
-fn encrypted_page_map_matches_authenticated_eager_order() {
+fn encrypted_page_map_matches_the_authenticated_fixture_order() {
     let pdf = encrypted_page_tree_pdf();
     assert!(matches!(
         open_encrypted(&pdf, None),
@@ -539,13 +511,10 @@ fn encrypted_page_map_matches_authenticated_eager_order() {
     ));
     let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
     let page_map = PageMap::from_reader(&reader).unwrap();
-    let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
-    let eager_pages: Vec<_> = eager.page_iter().collect();
     assert_eq!(
         page_map.pages.iter().map(|page| page.id).collect::<Vec<_>>(),
-        eager_pages
+        vec![(3, 0), (4, 0)]
     );
-    assert_eq!(eager_pages, vec![(3, 0), (4, 0)]);
     assert_eq!(page_map.pages[0].inherited.rotate, Some((2, 0)));
 }
 

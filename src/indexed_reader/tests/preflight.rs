@@ -23,7 +23,7 @@ fn bounded_scalar_holds_one_allowance_through_parse_and_measurement() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn bounded_scalar_classifies_stream_framing_like_eager_without_reading_payloads() {
+fn bounded_scalar_classifies_stream_framing_from_complete_fixture_dictionaries_without_reading_payloads() {
     let pdf = object_pdf(&[
         ObjectDef {
             id: 1,
@@ -75,16 +75,19 @@ fn bounded_scalar_classifies_stream_framing_like_eager_without_reading_payloads(
     let erased: Arc<dyn RandomAccessSource> = source.clone();
     let reader = IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
 
-    for id in [(1, 0), (2, 0), (4, 0)] {
+    for (id, expected) in [
+        ((1, 0), dictionary! { "Length" => 4, "Kind" => "DirectBad" }),
+        ((2, 0), dictionary! { "Length" => (3, 0), "Kind" => "IndirectBad" }),
+        ((4, 0), dictionary! { "Length" => 1_000_000, "Kind" => "PastSource" }),
+    ] {
         source.requests.lock().unwrap().clear();
         let permit = crate::ScalarResolutionPermit::new(4 * 1024 * 1024);
         let scalar = reader.resolve_scalar_with_permit(id, &permit).unwrap();
-        assert!(matches!(scalar.as_object(), Object::Dictionary(_)));
         // Upstream #568 now rejects these malformed eager objects while the
         // indexed scalar route retains its pre-existing dictionary fallback.
         // Keep this fixture contract explicit instead of following a moving
         // eager baseline.
-        assert!(scalar.as_object().as_dict().unwrap().get(b"Kind").is_ok());
+        assert_eq!(scalar.as_object(), &Object::Dictionary(expected));
         assert!(
             source
                 .requests

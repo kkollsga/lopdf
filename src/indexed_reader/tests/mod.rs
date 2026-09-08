@@ -1078,23 +1078,88 @@ fn open_without_recovery(source: Arc<dyn RandomAccessSource>) -> IndexedReaderRe
     PdfIndex::open_from_xref(&source, source_len, source_origin, &version)
 }
 
-fn assert_eager_normal_fingerprint(pdf: &[u8], index: &PdfIndex) {
-    let eager = Document::load_mem(pdf).unwrap();
-    assert_eq!(index.version, eager.version);
-    assert_eq!(index.xref_start, u64::try_from(eager.xref_start).unwrap());
-    assert_eq!(index.declared_size, u64::from(eager.reference_table.size));
-    for (&id, eager_entry) in &eager.reference_table.entries {
-        // Normal entries are the shared behavioral surface. The one
-        // deliberate divergence is documented on ObjectLocation64::Free.
-        if let XrefEntry::Normal { offset, generation } = eager_entry {
-            assert_eq!(
-                index.locations.get(&id),
-                Some(&ObjectLocation64::Normal {
-                    offset: u64::from(*offset),
-                    generation: *generation
-                })
-            );
+fn fixture_startxref(pdf: &[u8]) -> u64 {
+    let marker = b"startxref\n";
+    let start = pdf.windows(marker.len()).rposition(|bytes| bytes == marker).unwrap() + marker.len();
+    let end = start + pdf[start..].iter().position(|byte| *byte == b'\n').unwrap();
+    std::str::from_utf8(&pdf[start..end]).unwrap().parse().unwrap()
+}
+
+fn fixture_declared_size(pdf: &[u8]) -> u64 {
+    let marker = b"/Size ";
+    let start = pdf.windows(marker.len()).rposition(|bytes| bytes == marker).unwrap() + marker.len();
+    let end = start + pdf[start..].iter().position(|byte| !byte.is_ascii_digit()).unwrap();
+    std::str::from_utf8(&pdf[start..end]).unwrap().parse().unwrap()
+}
+
+fn fixture_normal_locations(pdf: &[u8]) -> BTreeMap<u32, ObjectLocation64> {
+    let mut locations = BTreeMap::new();
+    let mut offset = 0usize;
+    for line in pdf.split_inclusive(|byte| *byte == b'\n') {
+        let fields: Vec<_> = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect();
+        if fields.len() == 3 && fields[2] == b"obj" {
+            if let (Ok(object), Ok(generation)) = (
+                std::str::from_utf8(fields[0]).unwrap().parse::<u32>(),
+                std::str::from_utf8(fields[1]).unwrap().parse::<u16>(),
+            ) {
+                locations.insert(
+                    object,
+                    ObjectLocation64::Normal {
+                        offset: offset as u64,
+                        generation,
+                    },
+                );
+            }
         }
+        offset += line.len();
+    }
+    locations
+}
+
+/// Fingerprint controlled test PDFs by their emitted object-header lines. This deliberately is
+/// not a general PDF parser: callers name the normal ids declared by the fixture's final xref.
+fn assert_fixture_fingerprint_and_eager_agreement(pdf: &[u8], index: &PdfIndex, normal_ids: &[u32]) {
+    let expected_origin = u64::try_from(pdf.windows(5).position(|bytes| bytes == b"%PDF-").unwrap()).unwrap();
+    let expected_startxref = fixture_startxref(pdf);
+    let expected_size = fixture_declared_size(pdf);
+    let mut expected_normals = fixture_normal_locations(pdf);
+    expected_normals.retain(|id, _| normal_ids.contains(id));
+    assert_eq!(expected_normals.len(), normal_ids.len());
+    for location in expected_normals.values_mut() {
+        if let ObjectLocation64::Normal { offset, .. } = location {
+            *offset -= expected_origin;
+        }
+    }
+    assert_eq!(index.version, "1.7");
+    assert_eq!(index.source_origin, expected_origin);
+    assert_eq!(index.xref_start, expected_startxref);
+    assert_eq!(index.declared_size, expected_size);
+    assert_eq!(index.trailer.get(b"Root").unwrap().as_reference().unwrap(), (1, 0));
+    for (&id, expected) in &expected_normals {
+        assert_eq!(index.locations.get(&id), Some(expected), "fixture object {id}");
+    }
+
+    // This is secondary compatibility coverage. Fixture facts above own the indexed contract;
+    // eager loading may change without manufacturing the indexed reader's expected values.
+    let eager = Document::load_mem(pdf).unwrap();
+    assert_eq!(eager.version, "1.7");
+    assert_eq!(u64::try_from(eager.xref_start).unwrap(), expected_startxref);
+    assert_eq!(u64::from(eager.reference_table.size), expected_size);
+    for (&id, expected) in &expected_normals {
+        let ObjectLocation64::Normal { offset, generation } = expected else {
+            unreachable!()
+        };
+        assert!(
+            matches!(
+                eager.reference_table.get(id),
+                Some(XrefEntry::Normal { offset: eager_offset, generation: eager_generation })
+                    if u64::from(*eager_offset) == *offset && *eager_generation == *generation
+            ),
+            "eager fixture object {id}"
+        );
     }
     assert_eq!(
         index.trailer.get(b"Root").unwrap().as_reference().unwrap(),

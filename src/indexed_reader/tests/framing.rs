@@ -3,7 +3,7 @@
 use super::*;
 
 #[test]
-fn malformed_stream_syntax_backtracks_to_dictionary_like_eager() {
+fn malformed_stream_syntax_backtracks_to_the_complete_fixture_dictionary() {
     let pdf = object_pdf(&[
         ObjectDef {
             id: 1,
@@ -31,26 +31,20 @@ fn malformed_stream_syntax_backtracks_to_dictionary_like_eager() {
         },
     ]);
     let reader = open_reader(&pdf, ResolverLimits::default());
-    for id in [(1, 0), (2, 0), (3, 0), (4, 0)] {
+    for (id, expected) in [
+        ((1, 0), dictionary! { "Length" => 5, "Case" => "BadHeader" }),
+        ((2, 0), dictionary! { "Length" => 5, "Case" => "BadEnd" }),
+        ((3, 0), dictionary! { "Length" => 5, "Case" => "MissingEnd" }),
+        ((4, 0), dictionary! { "Length" => 1_000_000, "Case" => "PastSource" }),
+    ] {
         let resolved = reader.resolve_object(id).unwrap();
-        assert!(matches!(resolved, Object::Dictionary(_)));
         // This fixture pins the indexed reader's established malformed-object
         // contract. Upstream #568 made eager parsing reject these objects while
         // adding bounded recovery for a different shape: an unambiguous,
         // EOL-framed `endstream` followed by `endobj`. Porting that recovery
         // into the random-access framer is separate work; it must not silently
         // remove the indexed reader's conservative dictionary fallback.
-        let expected: &[u8] = match id.0 {
-            1 => b"BadHeader",
-            2 => b"BadEnd",
-            3 => b"MissingEnd",
-            4 => b"PastSource",
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            resolved.as_dict().unwrap().get(b"Case").unwrap().as_name().unwrap(),
-            expected
-        );
+        assert_eq!(resolved, Object::Dictionary(expected));
     }
 }
 
@@ -198,7 +192,7 @@ fn direct_object_framer_rejects_invalid_tokens_without_parsing() {
 }
 
 #[test]
-fn malformed_top_level_tokens_match_eager_prefix_objects_and_consumption() {
+fn malformed_top_level_tokens_keep_the_fixture_prefix_objects_and_consumption() {
     let cases = [
         (b"trueX".as_slice(), Object::Boolean(true), 4),
         (b"1x".as_slice(), Object::Integer(1), 1),
@@ -227,11 +221,9 @@ fn malformed_top_level_tokens_match_eager_prefix_objects_and_consumption() {
             xref_generation: 0,
             body,
         }]);
-        let eager = Document::load_mem(&pdf).unwrap();
         let indexed = open_reader(&pdf, ResolverLimits::default())
             .resolve_object((1, 0))
             .unwrap();
-        assert_eq!(eager.objects.get(&(1, 0)).unwrap(), &expected, "{body:?}");
         assert_eq!(indexed, expected, "{body:?}");
     }
 }
@@ -258,7 +250,7 @@ fn malformed_prefixes_remain_parser_compatible_when_nested() {
 }
 
 #[test]
-fn literal_nesting_limit_matches_eager_at_exact_boundary_and_one_beyond() {
+fn literal_nesting_limit_accepts_the_exact_boundary_and_rejects_one_beyond() {
     let literal = |levels: usize| {
         let mut body = Vec::with_capacity(levels * 2 + 1);
         body.extend(std::iter::repeat_n(b'(', levels));
@@ -277,12 +269,14 @@ fn literal_nesting_limit_matches_eager_at_exact_boundary_and_one_beyond() {
         xref_generation: 0,
         body: &accepted,
     }]);
-    let eager = Document::load_mem(&accepted_pdf).unwrap();
+    let mut expected_literal = Vec::with_capacity(crate::reader::MAX_BRACKET * 2);
+    expected_literal.extend(std::iter::repeat_n(b'(', crate::reader::MAX_BRACKET));
+    expected_literal.extend(std::iter::repeat_n(b')', crate::reader::MAX_BRACKET));
     assert_eq!(
         open_reader(&accepted_pdf, ResolverLimits::default())
             .resolve_object((1, 0))
             .unwrap(),
-        eager.objects.get(&(1, 0)).unwrap().clone()
+        Object::String(expected_literal, StringFormat::Literal)
     );
 
     let rejected = literal(crate::reader::MAX_BRACKET + 2);
@@ -296,8 +290,6 @@ fn literal_nesting_limit_matches_eager_at_exact_boundary_and_one_beyond() {
         xref_generation: 0,
         body: &rejected,
     }]);
-    let eager = Document::load_mem(&pdf).unwrap();
-    assert!(!eager.objects.contains_key(&(1, 0)));
     assert!(matches!(
         open_reader(&pdf, ResolverLimits::default()).resolve_object((1, 0)),
         Err(IndexedReaderError::InvalidIndirectObject { .. })

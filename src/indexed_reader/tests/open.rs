@@ -3,13 +3,13 @@
 use super::*;
 
 #[test]
-fn classic_bootstrap_matches_eager_fingerprint() {
+fn classic_bootstrap_matches_fixture_fingerprint_and_eager() {
     let pdf = classic_pdf();
     let index = open_bytes(&pdf);
 
     assert_eq!(index.xref_type, IndexXrefType::Table);
     assert_eq!(index.source_origin, 0);
-    assert_eager_normal_fingerprint(&pdf, &index);
+    assert_fixture_fingerprint_and_eager_agreement(&pdf, &index, &[1, 2, 3, 4]);
 }
 
 #[test]
@@ -28,10 +28,21 @@ fn encrypted_revisions_accept_user_and_owner_passwords_and_reject_missing_or_wro
 
         let user = open_encrypted(&pdf, Some(b"user")).unwrap();
         assert_encrypted_fixture_plaintext(&user);
-        let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
-        for id in [(1, 0), (2, 0), (3, 0)] {
-            assert_eq!(user.resolve_object(id).unwrap(), eager.get_object(id).unwrap().clone());
-        }
+        assert_eq!(
+            user.resolve_object((1, 0)).unwrap(),
+            Object::string_literal("encrypted string")
+        );
+        assert_eq!(
+            user.resolve_object((2, 0)).unwrap(),
+            Object::Stream(Stream::new(
+                dictionary! { "Type" => "Metadata" },
+                b"encrypted stream".to_vec()
+            ))
+        );
+        assert_eq!(
+            user.resolve_object((3, 0)).unwrap(),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Sentinel" => (1, 0) })
+        );
 
         let encrypt_id = user.index.encrypt_object_id.unwrap();
         assert_eq!(
@@ -108,12 +119,12 @@ fn encrypted_object_stream_container_is_decrypted_once_and_xref_stays_plain() {
 }
 
 #[test]
-fn plain_and_compressed_xref_streams_match_eager() {
+fn plain_and_compressed_xref_streams_match_fixture_and_eager() {
     for compressed in [false, true] {
         let pdf = xref_stream_pdf(compressed);
         let index = open_bytes(&pdf);
         assert_eq!(index.xref_type, IndexXrefType::Stream);
-        assert_eager_normal_fingerprint(&pdf, &index);
+        assert_fixture_fingerprint_and_eager_agreement(&pdf, &index, &[1, 2, 3, 4, 5]);
     }
 }
 
@@ -165,7 +176,7 @@ fn incremental_hybrid_merge_keeps_newest_and_supplement() {
             generation: 0
         })
     );
-    assert_eager_normal_fingerprint(&pdf, &index);
+    assert_fixture_fingerprint_and_eager_agreement(&pdf, &index, &[1, 2, 3, 4, 6, 7]);
 }
 
 #[test]
@@ -195,7 +206,7 @@ fn hybrid_supplement_of_an_inner_section_supersedes_older_object_streams() {
 
     // The newest section still wins for everything it does declare.
     assert_eq!(eager.trailer.get(b"Info").unwrap().as_reference().unwrap(), (10, 0));
-    assert_eager_normal_fingerprint(&pdf, &index);
+    assert_fixture_fingerprint_and_eager_agreement(&pdf, &index, &[1, 2, 3, 4, 5, 8, 9, 10]);
 }
 
 #[test]
@@ -207,7 +218,7 @@ fn leading_junk_is_rebased_like_the_eager_reader() {
     let index = open_bytes(&prefixed);
 
     assert_eq!(index.source_origin, u64::try_from(prefix.len()).unwrap());
-    assert_eager_normal_fingerprint(&prefixed, &index);
+    assert_fixture_fingerprint_and_eager_agreement(&prefixed, &index, &[1, 2, 3, 4]);
 }
 
 #[test]
@@ -380,7 +391,7 @@ fn rescan_is_one_forward_pass_of_bounded_chunks_over_a_multi_megabyte_body() {
 }
 
 #[test]
-fn initial_startxref_out_of_bounds_matches_eager_and_retains_u64_fields() {
+fn initial_startxref_out_of_bounds_matches_the_fixture_and_retains_u64_fields() {
     let cases = [
         ("18446744073709551615", u64::MAX),
         ("999999999", 999_999_999),
@@ -391,11 +402,9 @@ fn initial_startxref_out_of_bounds_matches_eager_and_retains_u64_fields() {
     for (text, expected_offset) in cases {
         let pdf = malformed_startxref_pdf(text);
         let logical_len = u64::try_from(pdf.len()).unwrap();
-        let eager = Document::load_mem(&pdf).unwrap_err();
         let lazy = PdfIndex::open(Arc::new(BytesSource::from(pdf))).err().unwrap();
 
-        assert_eq!(eager.to_string(), "failed parsing cross reference table");
-        assert_eq!(lazy.to_string(), eager.to_string());
+        assert_eq!(lazy.to_string(), "failed parsing cross reference table");
         assert!(matches!(
             lazy,
             IndexedReaderError::StartXrefOutOfBounds { offset, logical_len: actual_len }
@@ -407,14 +416,12 @@ fn initial_startxref_out_of_bounds_matches_eager_and_retains_u64_fields() {
 }
 
 #[test]
-fn invalid_textual_startxref_matches_eager_without_losing_parse_classification() {
+fn invalid_textual_startxref_matches_the_fixture_without_losing_parse_classification() {
     for text in ["-1", "18446744073709551616"] {
         let pdf = malformed_startxref_pdf(text);
-        let eager = Document::load_mem(&pdf).unwrap_err();
         let lazy = PdfIndex::open(Arc::new(BytesSource::from(pdf))).err().unwrap();
 
-        assert_eq!(eager.to_string(), "failed parsing cross reference table");
-        assert_eq!(lazy.to_string(), eager.to_string());
+        assert_eq!(lazy.to_string(), "failed parsing cross reference table");
         assert!(matches!(lazy, IndexedReaderError::InvalidStartXref { .. }));
     }
 }
@@ -426,9 +433,8 @@ fn prefixed_max_startxref_is_checked_in_logical_coordinates() {
     pdf.extend_from_slice(&malformed_startxref_pdf("18446744073709551615"));
     let logical_len = u64::try_from(pdf.len() - prefix.len()).unwrap();
 
-    let eager = Document::load_mem(&pdf).unwrap_err();
     let lazy = PdfIndex::open(Arc::new(BytesSource::from(pdf))).err().unwrap();
-    assert_eq!(lazy.to_string(), eager.to_string());
+    assert_eq!(lazy.to_string(), "failed parsing cross reference table");
     assert!(matches!(
         lazy,
         IndexedReaderError::StartXrefOutOfBounds { offset: u64::MAX, logical_len: actual_len }

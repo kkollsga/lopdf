@@ -756,43 +756,36 @@ mod selected_member_tests {
         Error,
     }
 
-    fn eager_fingerprint(mut stream: Stream, id: ObjectId) -> MemberFingerprint {
-        match ObjectStream::new(&mut stream) {
-            Ok(parsed) => parsed
-                .objects
-                .get(&id)
-                .cloned()
-                .map(MemberFingerprint::Value)
-                .unwrap_or(MemberFingerprint::Error),
-            Err(_) => MemberFingerprint::Error,
-        }
-    }
-
     fn selected_fingerprint(stream: &Stream, id: ObjectId, index: u32) -> MemberFingerprint {
         ObjectStream::parse_selected_member(stream, id, index)
             .map(MemberFingerprint::Value)
             .unwrap_or(MemberFingerprint::Error)
     }
 
-    fn assert_eager_selected_fingerprint(stream: Stream, id: ObjectId, index: u32, expected: MemberFingerprint) {
-        assert_eq!(eager_fingerprint(stream.clone(), id), expected);
+    fn assert_selected_fingerprint(stream: Stream, id: ObjectId, index: u32, expected: MemberFingerprint) {
         assert_eq!(selected_fingerprint(&stream, id, index), expected);
     }
 
     #[test]
-    fn selected_members_match_the_existing_eager_parser() {
+    fn selected_members_match_the_complete_fixture_values() {
         let members: &[(u32, &[u8])] = &[
             (7, b"42"),
             (11, b"<< /Type /Example /Enabled true >>"),
             (19, b"[1 2 /Three]"),
         ];
-        let mut eager_stream = generated_stream(members);
-        let eager = ObjectStream::new(&mut eager_stream).unwrap();
-
-        for (index, (id, _)) in members.iter().enumerate() {
+        let expected = [
+            Object::Integer(42),
+            Object::Dictionary(dictionary! { "Type" => "Example", "Enabled" => true }),
+            Object::Array(vec![
+                Object::Integer(1),
+                Object::Integer(2),
+                Object::Name(b"Three".to_vec()),
+            ]),
+        ];
+        for (index, ((id, _), expected)) in members.iter().zip(expected).enumerate() {
             let selected_stream = generated_stream(members);
             let selected = ObjectStream::parse_selected_member(&selected_stream, (*id, 0), index as u32).unwrap();
-            assert_eq!(&selected, eager.objects.get(&(*id, 0)).unwrap());
+            assert_eq!(selected, expected);
         }
     }
 
@@ -829,22 +822,22 @@ mod selected_member_tests {
     }
 
     #[test]
-    fn malformed_header_counts_and_odd_tokens_match_eager_fingerprints() {
+    fn malformed_header_counts_and_odd_tokens_match_pinned_fingerprints() {
         let header = b"10 0 11 5 ";
         let body = b"(ten)(eleven)";
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             raw_stream(header, body, 1),
             (11, 0),
             1,
             MemberFingerprint::Value(Object::string_literal("eleven")),
         );
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             raw_stream(header, body, 3),
             (10, 0),
             0,
             MemberFingerprint::Value(Object::string_literal("ten")),
         );
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             raw_stream(header, body, -1),
             (11, 0),
             1,
@@ -852,17 +845,17 @@ mod selected_member_tests {
         );
 
         let odd = raw_stream(b"10 0 dangling", b"(ten)", 1);
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             odd.clone(),
             (10, 0),
             0,
             MemberFingerprint::Value(Object::string_literal("ten")),
         );
-        assert_eager_selected_fingerprint(odd, (11, 0), 1, MemberFingerprint::Error);
+        assert_selected_fingerprint(odd, (11, 0), 1, MemberFingerprint::Error);
 
         let mut invalid_n = raw_stream(b"10 0 ", b"(ten)", 1);
         invalid_n.dict.set("N", "invalid");
-        assert_eager_selected_fingerprint(invalid_n, (10, 0), 0, MemberFingerprint::Error);
+        assert_selected_fingerprint(invalid_n, (10, 0), 0, MemberFingerprint::Error);
     }
 
     #[test]
@@ -905,16 +898,8 @@ mod selected_member_tests {
     }
 
     #[test]
-    fn duplicate_ids_preserve_eager_acceptance_and_exact_index_selection() {
+    fn duplicate_ids_preserve_exact_index_selection() {
         let members: &[(u32, &[u8])] = &[(1, b"42"), (1, b"true"), (2, b"false"), (2, b"null"), (3, b"[7]")];
-        let mut eager_stream = generated_stream(members);
-        let eager = ObjectStream::new(&mut eager_stream).unwrap();
-
-        // Eager collection accepts duplicate declarations and retains the last
-        // value for each repeated id.
-        assert_eq!(eager.objects.get(&(1, 0)), Some(&Object::Boolean(true)));
-        assert_eq!(eager.objects.get(&(2, 0)), Some(&Object::Null));
-
         let selected_stream = generated_stream(members);
         assert_eq!(
             ObjectStream::parse_selected_member(&selected_stream, (1, 0), 0).unwrap(),
@@ -934,15 +919,24 @@ mod selected_member_tests {
         );
         assert_eq!(
             ObjectStream::parse_selected_member(&selected_stream, (3, 0), 4).unwrap(),
-            eager.objects.get(&(3, 0)).unwrap().clone()
+            Object::Array(vec![Object::Integer(7)])
         );
     }
 
     #[test]
-    fn malformed_offsets_and_tokens_match_eager_fingerprints() {
+    fn eager_duplicate_ids_keep_the_last_declared_value() {
+        let members: &[(u32, &[u8])] = &[(1, b"42"), (1, b"true"), (2, b"false"), (2, b"null")];
+        let mut stream = generated_stream(members);
+        let eager = ObjectStream::new(&mut stream).unwrap();
+        assert_eq!(eager.objects.get(&(1, 0)), Some(&Object::Boolean(true)));
+        assert_eq!(eager.objects.get(&(2, 0)), Some(&Object::Null));
+    }
+
+    #[test]
+    fn malformed_offsets_and_tokens_match_pinned_fingerprints() {
         let equal = raw_stream(b"10 0 11 0 ", b"(shared)", 2);
         for (id, index) in [((10, 0), 0), ((11, 0), 1)] {
-            assert_eager_selected_fingerprint(
+            assert_selected_fingerprint(
                 equal.clone(),
                 id,
                 index,
@@ -951,13 +945,13 @@ mod selected_member_tests {
         }
 
         let decreasing = raw_stream(b"10 8 11 0 ", b"(eleven)(ten)", 2);
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             decreasing.clone(),
             (10, 0),
             0,
             MemberFingerprint::Value(Object::string_literal("ten")),
         );
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             decreasing,
             (11, 0),
             1,
@@ -965,16 +959,16 @@ mod selected_member_tests {
         );
 
         let unrelated_out_of_bounds = raw_stream(b"10 0 11 99 ", b"(ten)", 2);
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             unrelated_out_of_bounds.clone(),
             (10, 0),
             0,
             MemberFingerprint::Value(Object::string_literal("ten")),
         );
-        assert_eager_selected_fingerprint(unrelated_out_of_bounds, (11, 0), 1, MemberFingerprint::Error);
+        assert_selected_fingerprint(unrelated_out_of_bounds, (11, 0), 1, MemberFingerprint::Error);
 
         let unrelated_invalid = raw_stream(b"10 0 invalid offset ", b"(ten)", 2);
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             unrelated_invalid,
             (10, 0),
             0,
@@ -982,8 +976,8 @@ mod selected_member_tests {
         );
 
         let target_invalid = raw_stream(b"10 invalid 11 0 ", b"(eleven)", 2);
-        assert_eager_selected_fingerprint(target_invalid.clone(), (10, 0), 0, MemberFingerprint::Error);
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(target_invalid.clone(), (10, 0), 0, MemberFingerprint::Error);
+        assert_selected_fingerprint(
             target_invalid,
             (11, 0),
             1,
@@ -992,7 +986,7 @@ mod selected_member_tests {
     }
 
     #[test]
-    fn selected_member_uses_eager_prefix_parse_policy() {
+    fn selected_member_uses_the_pinned_prefix_parse_policy() {
         let valid_comment = generated_stream(&[(1, b"42 % trailing comment")]);
         assert_eq!(
             ObjectStream::parse_selected_member(&valid_comment, (1, 0), 0).unwrap(),
@@ -1000,7 +994,7 @@ mod selected_member_tests {
         );
 
         let trailing_object = generated_stream(&[(1, b"42 true"), (2, b"false")]);
-        assert_eager_selected_fingerprint(
+        assert_selected_fingerprint(
             trailing_object,
             (1, 0),
             0,
@@ -1022,7 +1016,8 @@ mod selected_member_tests {
         // allocation-compatible raw-byte fallback: indexed resolution used
         // this behavior before the merge and malformed unrelated filters must
         // not make a declared raw member disappear.
-        assert_eq!(eager_fingerprint(stream.clone(), (1, 0)), MemberFingerprint::Error);
+        let mut eager_stream = stream.clone();
+        assert!(ObjectStream::new(&mut eager_stream).is_err());
         assert_eq!(
             selected_fingerprint(&stream, (1, 0), 0),
             MemberFingerprint::Value(Object::Integer(42))

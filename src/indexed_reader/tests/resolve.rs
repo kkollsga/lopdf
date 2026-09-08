@@ -3,7 +3,7 @@
 use super::*;
 
 #[test]
-fn normal_and_nested_objects_are_owned_and_match_eager() {
+fn normal_and_nested_objects_match_complete_fixture_values() {
     let pdf = object_pdf(&[
         ObjectDef {
             id: 1,
@@ -19,14 +19,21 @@ fn normal_and_nested_objects_are_owned_and_match_eager() {
         },
     ]);
     let reader = open_reader(&pdf, ResolverLimits::default());
-    let eager = Document::load_mem(&pdf).unwrap();
-
-    for id in [(1, 0), (2, 0)] {
-        assert_eq!(
-            format!("{:?}", reader.resolve_object(id).unwrap()),
-            format!("{:?}", eager.get_object(id).unwrap())
-        );
-    }
+    assert_eq!(
+        reader.resolve_object((1, 0)).unwrap(),
+        Object::Dictionary(dictionary! {
+            "Nested" => Object::Dictionary(dictionary! { "Values" => vec![Object::Integer(1), Object::string_literal("two"), Object::Dictionary(dictionary! { "Flag" => true })] })
+        })
+    );
+    assert_eq!(
+        reader.resolve_object((2, 0)).unwrap(),
+        Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(2),
+            Object::string_literal("three"),
+            Object::Dictionary(dictionary! { "Name" => "owned" }),
+        ])
+    );
 }
 
 #[test]
@@ -258,7 +265,7 @@ fn shared_batch_limit_errors_match_scalar_and_types_are_send_sync() {
 }
 
 #[test]
-fn declared_compressed_objects_match_eager_values() {
+fn declared_compressed_objects_match_complete_fixture_values() {
     let members = [
         (10, b"<< /Type /Catalog /Pages 11 0 R >>".as_slice()),
         (11, b"<< /Type /Pages /Count 0 /Kids [] >>".as_slice()),
@@ -279,18 +286,23 @@ fn declared_compressed_objects_match_eager_values() {
             &[(10, 0), (11, 1), (12, 2)],
         );
         let reader = open_reader(&fixture.pdf, ResolverLimits::default());
-        let eager = Document::load_mem(&fixture.pdf).unwrap();
-
-        for id in [(10, 0), (11, 0), (12, 0)] {
-            assert_eq!(
-                reader.resolve_object(id).unwrap(),
-                eager.get_object(id).unwrap().clone()
-            );
-        }
         assert_eq!(
-            reader.resolve_object((999, 0)).is_err(),
-            eager.get_object((999, 0)).is_err()
+            reader.resolve_object((10, 0)).unwrap(),
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => (11, 0) })
         );
+        assert_eq!(
+            reader.resolve_object((11, 0)).unwrap(),
+            Object::Dictionary(dictionary! { "Type" => "Pages", "Count" => 0, "Kids" => Vec::<Object>::new() })
+        );
+        assert_eq!(
+            reader.resolve_object((12, 0)).unwrap(),
+            Object::Array(vec![
+                Object::Integer(1),
+                Object::string_literal("two"),
+                Object::Dictionary(dictionary! { "Flag" => true })
+            ])
+        );
+        assert!(reader.resolve_object((999, 0)).is_err());
     }
 }
 
@@ -337,15 +349,14 @@ fn compressed_member_enforces_container_index_id_generation_and_shape() {
 }
 
 #[test]
-fn malformed_compressed_members_match_eager_and_resource_bounds_still_fail() {
+fn malformed_compressed_members_keep_fixture_values_and_resource_bounds_still_fail() {
     for n in [2, -1] {
         let fixture = object_stream_fixture(&format!("/Type /ObjStm /N {n} /First 5"), b"10 0 (ten)", &[(10, 0)]);
-        let eager = Document::load_mem(&fixture.pdf).unwrap();
         assert_eq!(
             open_reader(&fixture.pdf, ResolverLimits::default())
                 .resolve_object((10, 0))
                 .unwrap(),
-            eager.get_object((10, 0)).unwrap().clone()
+            Object::string_literal("ten")
         );
     }
 
@@ -354,13 +365,9 @@ fn malformed_compressed_members_match_eager_and_resource_bounds_still_fail() {
         b"10 0 11 0 (shared)",
         &[(10, 0), (11, 1)],
     );
-    let eager = Document::load_mem(&equal_offsets.pdf).unwrap();
     let reader = open_reader(&equal_offsets.pdf, ResolverLimits::default());
     for id in [(10, 0), (11, 0)] {
-        assert_eq!(
-            reader.resolve_object(id).unwrap(),
-            eager.get_object(id).unwrap().clone()
-        );
+        assert_eq!(reader.resolve_object(id).unwrap(), Object::string_literal("shared"));
     }
 
     let malformed = [
@@ -444,7 +451,7 @@ fn encrypted_and_object_stream_errors_are_deterministic_across_threads() {
 }
 
 #[test]
-fn fw9_style_compressed_fingerprint_matches_eager() {
+fn fw9_style_compressed_members_match_generated_fixture_values() {
     let bodies: Vec<_> = (10..110)
         .map(|id| format!("<< /T (field-{id}) /V ({}) /Rect [0 0 100 20] >>", id * 17))
         .collect();
@@ -462,11 +469,14 @@ fn fw9_style_compressed_fingerprint_matches_eager() {
         &(10..110).map(|id| (id, id - 10)).collect::<Vec<_>>(),
     );
     let reader = open_reader(&fixture.pdf, ResolverLimits::default());
-    let eager = Document::load_mem(&fixture.pdf).unwrap();
     for id in 10..110 {
         assert_eq!(
             reader.resolve_object((id, 0)).unwrap(),
-            eager.get_object((id, 0)).unwrap().clone()
+            Object::Dictionary(dictionary! {
+                "T" => Object::string_literal(format!("field-{id}")),
+                "V" => Object::string_literal((id * 17).to_string()),
+                "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+            })
         );
     }
 }
@@ -487,13 +497,10 @@ fn degraded_stream_position_is_relative_to_pdf_origin() {
     let resolved = open_reader(&prefixed, ResolverLimits::default())
         .resolve_object((1, 0))
         .unwrap();
-    let eager = Document::load_mem(&prefixed)
-        .unwrap()
-        .get_object((1, 0))
-        .unwrap()
-        .clone();
-
-    assert_eq!(resolved, eager);
+    assert_eq!(
+        resolved.as_stream().unwrap().dict,
+        dictionary! { "MissingLength" => true }
+    );
     assert!(resolved.as_stream().unwrap().content.is_empty());
     let physical_stream_start = prefixed
         .windows(b"stream\n".len())
@@ -529,24 +536,12 @@ fn parsed_normal_header_is_authoritative_over_xref_generation() {
         },
     ];
     let pdf = object_pdf(&definitions);
-    let eager = Document::load_mem(&pdf).unwrap();
-    assert!(eager.get_object((1, 0)).is_ok());
-    assert!(matches!(
-        eager.get_object((1, 1)),
-        Err(crate::Error::ObjectNotFound((1, 1)))
-    ));
-    assert_eq!(eager.page_iter().collect::<Vec<_>>(), vec![(3, 0)]);
+    let catalog = Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => (2, 0) });
 
     let reader = Arc::new(open_reader(&pdf, ResolverLimits::default()));
     for _ in 0..3 {
-        assert_eq!(
-            reader.resolve_object((1, 0)).unwrap(),
-            eager.get_object((1, 0)).unwrap().clone()
-        );
-        assert_eq!(
-            *reader.resolve_object_shared((1, 0)).unwrap(),
-            eager.get_object((1, 0)).unwrap().clone()
-        );
+        assert_eq!(reader.resolve_object((1, 0)).unwrap(), catalog.clone());
+        assert_eq!(*reader.resolve_object_shared((1, 0)).unwrap(), catalog.clone());
         assert_eq!(reader.page_map().unwrap().pages[0].id, (3, 0));
         assert!(matches!(
             reader.resolve_object((1, 1)),
@@ -587,14 +582,12 @@ fn parsed_normal_header_is_authoritative_over_xref_generation() {
     let expected_missing = reader.resolve_object((1, 1)).unwrap_err().to_string();
     for thread in threads {
         let (object, page, missing) = thread.join().unwrap();
-        assert_eq!(object, eager.get_object((1, 0)).unwrap().clone());
+        assert_eq!(object, catalog);
         assert_eq!(page, (3, 0));
         assert_eq!(missing, expected_missing);
     }
 
     let missing_root = object_pdf_with_root(&definitions, (1, 1));
-    let eager = Document::load_mem(&missing_root).unwrap();
-    assert!(eager.page_iter().next().is_none());
     let reader = open_reader(&missing_root, ResolverLimits::default());
     assert!(matches!(
         reader.resolve_object((1, 1)),
@@ -610,11 +603,6 @@ fn parsed_normal_header_is_authoritative_over_xref_generation() {
     assert!(reader.page_map().unwrap().is_empty());
 
     let mismatch = xref_number_header_mismatch_fixture();
-    let eager = Document::load_mem(&mismatch).unwrap();
-    assert!(matches!(
-        eager.get_object((1, 0)),
-        Err(crate::Error::ObjectNotFound((1, 0)))
-    ));
     let reader = open_reader(&mismatch, ResolverLimits::default());
     assert!(matches!(
         reader.resolve_object((1, 0)),
@@ -641,8 +629,6 @@ fn raw_compressed_generation_mismatch_is_not_a_semantic_page_map_omission() {
         .unwrap();
     fixture.pdf[root + b"/Root 10 ".len()] = b'1';
 
-    let eager = Document::load_mem(&fixture.pdf).unwrap();
-    assert!(eager.page_iter().next().is_none());
     let reader = open_reader(&fixture.pdf, ResolverLimits::default());
     assert!(matches!(
         reader.resolve_object((10, 1)),
@@ -661,13 +647,8 @@ fn raw_compressed_generation_mismatch_is_not_a_semantic_page_map_omission() {
 }
 
 #[test]
-fn malformed_normal_xref_header_probe_matches_eager_object_omission() {
+fn malformed_normal_xref_header_probe_reports_fixture_omission() {
     let pdf = nul_header_probe_fixture();
-    let eager = Document::load_mem(&pdf).unwrap();
-    assert!(matches!(
-        eager.get_object((1, 0)),
-        Err(crate::Error::ObjectNotFound((1, 0)))
-    ));
 
     let classify = |error: &IndexedReaderError| match error {
         IndexedReaderError::MissingNormalObjectAtXref {
@@ -697,16 +678,11 @@ fn malformed_normal_xref_header_probe_matches_eager_object_omission() {
 }
 
 #[test]
-fn xref_offset_inside_object_body_matches_eager_object_omission() {
+fn xref_offset_inside_object_body_reports_fixture_omission() {
     const NASA_OBJECT_ID: u32 = 34_472;
     // The observed file records an offset exactly twelve bytes after the
     // matching `34472 0 obj` header, at the first byte of the object body.
     let pdf = malformed_normal_xref_fixture(NASA_OBJECT_ID, 12, b"[/Indexed 34471 0 R 255 34473 0 R]");
-    let eager = Document::load_mem(&pdf).unwrap();
-    assert!(matches!(
-        eager.get_object((NASA_OBJECT_ID, 0)),
-        Err(crate::Error::ObjectNotFound((NASA_OBJECT_ID, 0)))
-    ));
 
     let reader = open_reader(&pdf, ResolverLimits::default());
     for _ in 0..3 {
@@ -728,7 +704,7 @@ fn xref_offset_inside_object_body_matches_eager_object_omission() {
 }
 
 #[test]
-fn scalar_before_reference_in_array_matches_eager_nasa_shape() {
+fn scalar_before_reference_in_array_matches_the_nasa_fixture_shape() {
     let pdf = object_pdf(&[
         ObjectDef {
             id: 1,
@@ -749,11 +725,15 @@ fn scalar_before_reference_in_array_matches_eager_nasa_shape() {
             body: b"<< /Length 0 >>\nstream\n\nendstream",
         },
     ]);
-    let eager = Document::load_mem(&pdf).unwrap();
     let reader = open_reader(&pdf, ResolverLimits::default());
     assert_eq!(
         reader.resolve_object((1, 0)).unwrap(),
-        eager.get_object((1, 0)).unwrap().clone()
+        Object::Array(vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Reference((2, 0)),
+            Object::Integer(255),
+            Object::Reference((3, 0))
+        ])
     );
     assert!(matches!(
         reader.resolve_stream_descriptor((1, 0)),

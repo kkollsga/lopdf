@@ -43,15 +43,10 @@ fn direct_indirect_and_nested_lengths_read_exact_owned_content() {
         },
     ]);
     let reader = open_reader(&pdf, ResolverLimits::default());
-    let eager = Document::load_mem(&pdf).unwrap();
 
     for (id, expected) in [((1, 0), b"hello".as_slice()), ((2, 0), b"world"), ((4, 0), b"abcde")] {
         let resolved = reader.resolve_object(id).unwrap();
         assert_eq!(resolved.as_stream().unwrap().content, expected);
-        assert_eq!(
-            resolved.as_stream().unwrap().content,
-            eager.get_object(id).unwrap().as_stream().unwrap().content
-        );
     }
 
     let descriptor_permit = crate::ScalarResolutionPermit::new(1024 * 1024);
@@ -169,7 +164,6 @@ fn stream_descriptors_distinguish_known_zero_from_unavailable_lengths() {
             body: b"<< /Length 5 /Kind /MissingEndstream >>\nstream\nhello",
         },
     ]);
-    let eager = Document::load_mem(&pdf).unwrap();
     let source = Arc::new(LengthTracingBytesSource {
         bytes: pdf.clone(),
         len_calls: AtomicUsize::new(0),
@@ -188,15 +182,10 @@ fn stream_descriptors_distinguish_known_zero_from_unavailable_lengths() {
         assert_eq!(descriptor.encoded_length(), EncodedStreamLength::Known(expected));
         assert_eq!(descriptor.encoded_len(), Some(expected));
         assert_eq!(read_all_encoded(&descriptor, 3), scalar.content);
-        assert_eq!(
-            reader.resolve_object((id, 0)).unwrap(),
-            eager.get_object((id, 0)).unwrap().clone()
-        );
     }
     for id in [5, 6, 7, 10] {
         let scalar = reader.resolve_object((id, 0)).unwrap();
         assert!(scalar.as_stream().unwrap().content.is_empty());
-        assert_eq!(scalar, eager.get_object((id, 0)).unwrap().clone());
         let descriptor = reader.resolve_stream_descriptor((id, 0)).unwrap();
         let reason = EncodedStreamLengthUnavailableReason::MissingOrInvalid;
         assert_eq!(descriptor.encoded_length(), EncodedStreamLength::Unavailable(reason));
@@ -845,11 +834,9 @@ fn missing_malformed_cyclic_and_deep_lengths_degrade_to_empty_streams() {
             ..ResolverLimits::default()
         },
     );
-    let eager = Document::load_mem(&pdf).unwrap();
 
     for id in [(1, 0), (2, 0), (3, 0), (4, 0)] {
         let resolved = reader.resolve_object(id).unwrap();
-        assert_eq!(&resolved, eager.get_object(id).unwrap());
         assert!(resolved.as_stream().unwrap().content.is_empty());
     }
     assert!(
@@ -860,10 +847,6 @@ fn missing_malformed_cyclic_and_deep_lengths_degrade_to_empty_streams() {
             .unwrap()
             .content
             .is_empty()
-    );
-    assert_eq!(
-        eager.get_object((7, 0)).unwrap().as_stream().unwrap().content,
-        b"ignored"
     );
 }
 
@@ -1287,10 +1270,6 @@ fn bounded_object_stream_decodes_every_admitted_filter_and_predictor_form() {
         drop(resolved);
         assert_eq!(permit.stats().current_bytes, 0, "{name}");
         permit.close().unwrap();
-
-        // Whatever the encoding, the lazy answer is the eager answer.
-        let eager = crate::Document::load_mem(&fixture.pdf).unwrap();
-        assert_eq!(eager.get_object((10, 0)).unwrap(), &expected, "{name}");
     }
 }
 

@@ -109,12 +109,17 @@ fn oversized_encrypted_materialization_refuses_before_payload_and_releases_permi
 }
 
 #[test]
-fn bounded_encrypted_object_stream_matches_eager_and_releases_every_charge() {
+fn bounded_encrypted_object_stream_matches_the_complete_fixture_value_and_releases_every_charge() {
     for revision in 2..=6 {
         for flate in [false, true] {
             let (pdf, _, _) = encrypted_object_stream_pdf(revision, flate, 0);
             let reader = open_encrypted(&pdf, Some(b"user")).unwrap();
-            let expected = reader.resolve_object((10, 0)).unwrap();
+            let expected = Object::Dictionary(dictionary! {
+                "Type" => "Catalog",
+                "Text" => Object::string_literal("member secret"),
+                "Image" => (20, 0),
+                "Pad" => Object::string_literal(""),
+            });
 
             let permit = crate::ScalarResolutionPermit::new(8 * 1024 * 1024);
             let scalar = reader.resolve_scalar_with_permit((10, 0), &permit).unwrap();
@@ -229,13 +234,17 @@ fn encrypted_object_stream_overlap_refusal_precedes_payload_read_and_retries_ide
 }
 
 #[test]
-fn public_preparation_matches_eager_for_encrypted_object_streams_without_private_cache_use() {
+fn public_preparation_matches_the_complete_encrypted_fixture_without_private_cache_use() {
     for revision in 2..=6 {
         for flate in [false, true] {
             for stream_eol in [b"\n".as_slice(), b"\r".as_slice(), b"\r\n".as_slice()] {
                 let (pdf, _, _) = encrypted_object_stream_pdf_with_eol(revision, flate, 0, stream_eol);
-                let eager = Document::load_mem_with_options(&pdf, crate::LoadOptions::with_password("user")).unwrap();
-                let expected = eager.get_object((10, 0)).unwrap();
+                let expected = Object::Dictionary(dictionary! {
+                    "Type" => "Catalog",
+                    "Text" => Object::string_literal("member secret"),
+                    "Image" => (20, 0),
+                    "Pad" => Object::string_literal(""),
+                });
                 let source = Arc::new(TracingBytesSource {
                     bytes: pdf,
                     requests: Mutex::new(Vec::new()),
@@ -270,7 +279,7 @@ fn public_preparation_matches_eager_for_encrypted_object_streams_without_private
                 let reads_after_prepare = source.requests.lock().unwrap().len();
 
                 let member = prepared.resolve_member((10, 0), index).unwrap();
-                assert_eq!(member.as_object(), expected);
+                assert_eq!(member.as_object(), &expected);
                 assert_eq!(
                     member
                         .as_object()
