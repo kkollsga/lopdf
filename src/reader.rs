@@ -24,21 +24,9 @@ use crate::error::{ParseError, XrefError};
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
+use crate::reader_extensions::merge_object_stream_batches;
 use crate::xref::{Xref, XrefEntry, XrefType};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
-
-type ObjectStreamBatch = (u32, BTreeMap<ObjectId, Object>);
-
-/// Merge eagerly parsed object-stream members in the same order as the serial
-/// outer xref walk, independently of worker completion order.
-fn merge_object_stream_batches(objects: &mut BTreeMap<ObjectId, Object>, mut batches: Vec<ObjectStreamBatch>) {
-    batches.sort_by_key(|(xref_key, _)| *xref_key);
-    for (_, batch) in batches {
-        for (id, object) in batch {
-            objects.entry(id).or_insert(object);
-        }
-    }
-}
 
 #[cfg(not(feature = "async"))]
 impl Document {
@@ -611,7 +599,7 @@ impl Reader<'_> {
 
         // Fall back to reconstruction only after standard xref resolution,
         // including lenient correction of slightly wrong offsets, has failed.
-        let (reference_table, trailer) = match self.resolve_xref_and_trailer() {
+        let (reference_table, trailer) = match crate::reader_extensions::resolve_xref_and_trailer(self) {
             Ok(resolved) => resolved,
             Err(err) => match self.reconstruct_xref_and_trailer() {
                 Some(reconstructed) => {
@@ -629,73 +617,6 @@ impl Reader<'_> {
             reference_table,
             trailer,
         })
-    }
-
-    /// Reconcile the trailer's declared `/Size` with the table the chain
-    /// actually produced.
-    ///
-    /// A conforming `/Size` sits between two values the merged table knows:
-    /// `max_id() + 1` — one past the highest object the file still *defines*,
-    /// which is the least it can be — and `max_entry_id() + 1`, one past the
-    /// last row the table holds at all, which is the most a file that lists
-    /// every number below `/Size` (ISO 32000-1, 7.5.4) can claim. A revision
-    /// that frees its highest-numbered object lands strictly between them and
-    /// is correct exactly as written, so nothing is warned about and nothing is
-    /// rewritten. Only a `/Size` outside that band is a real disagreement, and
-    /// it is clamped to the nearer bound with the warning this reader has
-    /// always emitted.
-    fn normalize_declared_size(reference_table: &mut Xref) -> Result<()> {
-        let lowest = reference_table.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
-        let highest = reference_table
-            .max_entry_id()
-            .checked_add(1)
-            .ok_or(ParseError::InvalidXref)?;
-        let corrected = reference_table.size.clamp(lowest, highest);
-        if reference_table.size != corrected {
-            warn!(
-                "Size entry of trailer dictionary is {}, correct value is {}.",
-                reference_table.size, corrected
-            );
-            reference_table.size = corrected;
-        }
-        Ok(())
-    }
-
-    /// Apply a hybrid-reference section's `/XRefStm` supplement to that
-    /// section's own entries.
-    ///
-    /// Per ISO 32000-1, 7.5.8.4 the supplement lists the revision's compressed
-    /// objects, which the classic section must mask as free for the benefit of
-    /// readers that do not support object streams. A reader that does support
-    /// them has to let the supplement take precedence within the revision, so
-    /// the entries are superseded rather than merged. `already_seen` keeps a
-    /// chain that names the same supplement twice from re-reading it.
-    ///
-    /// A supplement that cannot be read is **skipped**, not fatal. The classic
-    /// section is a complete cross-reference table on its own — that is the
-    /// whole point of a hybrid file, which stays loadable by readers that
-    /// ignore `/XRefStm` entirely — so a damaged supplement costs the document
-    /// its compressed objects and nothing else. Failing the load instead would
-    /// refuse files that opened before every section's supplement was read, for
-    /// bytes no reader is required to look at.
-    fn apply_hybrid_supplement(&self, section: &mut Xref, start: Option<Object>, already_seen: &mut HashSet<i64>) {
-        let Some(start) = start.and_then(|offset| offset.as_i64().ok()) else {
-            return;
-        };
-        if start < 0 || start as usize > self.buffer.len() {
-            warn!("XRefStm {start} is outside the file; the hybrid-reference supplement is ignored.");
-            return;
-        }
-        if !already_seen.insert(start) {
-            return;
-        }
-
-        match self.xref_and_trailer_at(start as usize) {
-            Ok((supplement, _)) => section.supersede(supplement),
-            Err(error) => {
-                warn!("XRefStm {start} could not be read ({error}); the hybrid-reference supplement is ignored.")
-            }
-        }
     }
 
     /// Read metadata (title and page count) without loading the entire document.
@@ -1452,49 +1373,9 @@ impl Reader<'_> {
 
     /// Parse the cross-reference section recorded at `offset`, first correcting
     /// the offset if it is slightly miswritten (lenient mode only).
-    fn xref_and_trailer_at(&self, offset: usize) -> Result<(Xref, Dictionary)> {
+    pub(crate) fn xref_and_trailer_at(&self, offset: usize) -> Result<(Xref, Dictionary)> {
         let offset = self.correct_xref_offset(offset);
         parser::xref_and_trailer(&self.buffer[offset..], self)
-    }
-
-    /// Resolve the cross-reference table/stream and trailer, including the
-    /// `/Prev` chain, and record the resolved start offset on the document.
-    fn resolve_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
-        let xref_start = Self::get_xref_start(self.buffer)?;
-        if xref_start > self.buffer.len() {
-            return Err(Error::Xref(XrefError::Start));
-        }
-        let xref_start = self.correct_xref_offset(xref_start);
-        self.document.xref_start = xref_start;
-
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
-
-        // Every section owns its `/XRefStm` supplement. Apply it before
-        // merging that revision so compressed entries supersede the classic
-        // table's compatibility rows, including along the `/Prev` chain.
-        let mut already_seen = HashSet::new();
-        let mut already_seen_supplements = HashSet::new();
-        let xref_stream_start = trailer.remove(b"XRefStm");
-        self.apply_hybrid_supplement(&mut xref, xref_stream_start, &mut already_seen_supplements);
-
-        let mut prev_xref_start = trailer.remove(b"Prev");
-        while let Some(prev) = prev_xref_start.take().and_then(|offset| offset.as_i64().ok()) {
-            if !already_seen.insert(prev) {
-                break;
-            }
-            if prev < 0 || prev as usize > self.buffer.len() {
-                return Err(Error::Xref(XrefError::PrevStart));
-            }
-
-            let (mut prev_xref, mut prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
-            let prev_xref_stream_start = prev_trailer.remove(b"XRefStm");
-            self.apply_hybrid_supplement(&mut prev_xref, prev_xref_stream_start, &mut already_seen_supplements);
-            xref.merge(prev_xref);
-            prev_xref_start = prev_trailer.remove(b"Prev");
-        }
-        Self::normalize_declared_size(&mut xref)?;
-
-        Ok((xref, trailer))
     }
 
     /// Last-resort recovery: rebuild the cross-reference table by scanning the
@@ -1733,7 +1614,7 @@ impl Reader<'_> {
     /// or an indirect object (cross-reference stream), scan a small window
     /// around it for a parseable xref table or xref-stream object and use the
     /// nearest match instead.
-    fn correct_xref_offset(&self, offset: usize) -> usize {
+    pub(crate) fn correct_xref_offset(&self, offset: usize) -> usize {
         const RECOVERY_WINDOW: usize = 64;
 
         if self.strict || offset >= self.buffer.len() {
@@ -1784,7 +1665,7 @@ impl Reader<'_> {
         Self::parse_object_header(input).is_some()
     }
 
-    fn get_xref_start(buffer: &[u8]) -> Result<usize> {
+    pub(crate) fn get_xref_start(buffer: &[u8]) -> Result<usize> {
         let seek_pos = buffer.len() - cmp::min(buffer.len(), 512);
         Self::search_substring(buffer, b"%%EOF", seek_pos)
             .filter(|&eof_pos| eof_pos > 25)

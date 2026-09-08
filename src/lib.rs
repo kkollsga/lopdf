@@ -34,6 +34,7 @@ mod object_stream;
 mod parser;
 mod parser_aux;
 mod reader;
+mod reader_extensions;
 mod save_options;
 mod scalar_budget;
 mod source_cache;
