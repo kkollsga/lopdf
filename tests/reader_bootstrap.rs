@@ -449,6 +449,28 @@ fn hybrid_supplement_is_merged_with_its_own_section() {
     );
 }
 
+#[test]
+fn slightly_miswritten_hybrid_supplement_offset_is_corrected() {
+    let pdf = hybrid_incremental_pdf_declaring(|supplement| supplement + 4);
+    let eager = assert_shared_fingerprint(&pdf, "hybrid", 7, false);
+
+    assert!(matches!(
+        eager.reference_table.get(7),
+        Some(XrefEntry::Compressed { container: 5, index: 0 })
+    ));
+    assert!(
+        eager
+            .get_object((7, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Hybrid")
+            .unwrap()
+            .as_bool()
+            .unwrap()
+    );
+}
+
 /// Both halves of 7.5.8.4 on the file that states them at once: the supplement's **definition**
 /// of the compressed object lifts the mask the classic section is required to write for legacy
 /// readers, and the type-0 rows the supplement's contiguous `/Index` forces it to emit for
@@ -644,20 +666,29 @@ fn pdf_with_incremental_trailer(prev: &str, extra: &str) -> Vec<u8> {
     pdf
 }
 
-fn assert_same_bootstrap_error(pdf: &[u8], expected: &str) {
-    let eager = format!("{:?}", Document::load_mem(pdf).unwrap_err());
-    let metadata = format!("{:?}", Document::load_metadata_mem(pdf).unwrap_err());
-    assert_eq!(eager, metadata);
-    assert!(eager.contains(expected), "expected {expected:?} in {eager:?}");
-}
-
 #[test]
-fn prev_bounds_errors_match_between_call_sites() {
-    let bad_prev = pdf_with_incremental_trailer("-1", "");
-    assert_same_bootstrap_error(&bad_prev, "Prev");
+fn prev_bounds_reconstruct_leniently_and_remain_strict_errors() {
+    for pdf in [
+        pdf_with_incremental_trailer("-1", ""),
+        pdf_with_incremental_trailer("99999999", ""),
+    ] {
+        let eager = Document::load_mem(&pdf).unwrap();
+        let metadata = Document::load_metadata_mem(&pdf).unwrap();
+        assert_eq!(eager.xref_start, 0, "reconstruction marks the xref offset unknown");
+        assert_eq!(eager_title(&eager), "new");
+        assert_eq!(metadata.title.as_deref(), Some("new"));
+        assert_eq!(metadata.page_count, eager.get_pages().len() as u32);
 
-    let bad_prev_high = pdf_with_incremental_trailer("99999999", "");
-    assert_same_bootstrap_error(&bad_prev_high, "Prev");
+        let strict = LoadOptions {
+            strict: true,
+            ..Default::default()
+        };
+        let error = format!("{:?}", Document::load_mem_with_options(&pdf, strict).unwrap_err());
+        assert!(
+            error.contains("Prev"),
+            "strict mode must retain the precise chain error: {error}"
+        );
+    }
 }
 
 /// A `/Prev` that does not resolve costs the document a whole revision, so it is fatal. A
@@ -702,7 +733,7 @@ fn a_damaged_supplement_keeps_the_rest_of_the_hybrid_file() {
     // Warns about `/XRefStm` like its sibling above, so it takes the same gate: the two must
     // not count each other's warnings.
     let _capture = capture_warnings();
-    let pdf = hybrid_incremental_pdf_declaring(|supplement| supplement + 12);
+    let pdf = hybrid_incremental_pdf_declaring(|_| 9);
     let eager = Document::load_mem(&pdf).unwrap();
 
     assert_eq!(eager_title(&eager), "hybrid");

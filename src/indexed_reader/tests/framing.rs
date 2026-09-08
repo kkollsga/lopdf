@@ -31,12 +31,26 @@ fn malformed_stream_syntax_backtracks_to_dictionary_like_eager() {
         },
     ]);
     let reader = open_reader(&pdf, ResolverLimits::default());
-    let eager = Document::load_mem(&pdf).unwrap();
-
     for id in [(1, 0), (2, 0), (3, 0), (4, 0)] {
         let resolved = reader.resolve_object(id).unwrap();
         assert!(matches!(resolved, Object::Dictionary(_)));
-        assert_eq!(&resolved, eager.get_object(id).unwrap());
+        // This fixture pins the indexed reader's established malformed-object
+        // contract. Upstream #568 made eager parsing reject these objects while
+        // adding bounded recovery for a different shape: an unambiguous,
+        // EOL-framed `endstream` followed by `endobj`. Porting that recovery
+        // into the random-access framer is separate work; it must not silently
+        // remove the indexed reader's conservative dictionary fallback.
+        let expected: &[u8] = match id.0 {
+            1 => b"BadHeader",
+            2 => b"BadEnd",
+            3 => b"MissingEnd",
+            4 => b"PastSource",
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            resolved.as_dict().unwrap().get(b"Case").unwrap().as_name().unwrap(),
+            expected
+        );
     }
 }
 
