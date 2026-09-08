@@ -1100,19 +1100,20 @@ fn fixture_normal_locations(pdf: &[u8]) -> BTreeMap<u32, ObjectLocation64> {
             .split(|byte| byte.is_ascii_whitespace())
             .filter(|field| !field.is_empty())
             .collect();
-        if fields.len() == 3 && fields[2] == b"obj" {
-            if let (Ok(object), Ok(generation)) = (
+        if fields.len() == 3
+            && fields[2] == b"obj"
+            && let (Ok(object), Ok(generation)) = (
                 std::str::from_utf8(fields[0]).unwrap().parse::<u32>(),
                 std::str::from_utf8(fields[1]).unwrap().parse::<u16>(),
-            ) {
-                locations.insert(
-                    object,
-                    ObjectLocation64::Normal {
-                        offset: offset as u64,
-                        generation,
-                    },
-                );
-            }
+            )
+        {
+            locations.insert(
+                object,
+                ObjectLocation64::Normal {
+                    offset: offset as u64,
+                    generation,
+                },
+            );
         }
         offset += line.len();
     }

@@ -926,8 +926,8 @@ mod selected_member_tests {
     #[test]
     fn eager_duplicate_ids_keep_the_last_declared_value() {
         let members: &[(u32, &[u8])] = &[(1, b"42"), (1, b"true"), (2, b"false"), (2, b"null")];
-        let mut stream = generated_stream(members);
-        let eager = ObjectStream::new(&mut stream).unwrap();
+        let stream = generated_stream(members);
+        let eager = ObjectStream::new(&stream).unwrap();
         assert_eq!(eager.objects.get(&(1, 0)), Some(&Object::Boolean(true)));
         assert_eq!(eager.objects.get(&(2, 0)), Some(&Object::Null));
     }
@@ -1016,8 +1016,8 @@ mod selected_member_tests {
         // allocation-compatible raw-byte fallback: indexed resolution used
         // this behavior before the merge and malformed unrelated filters must
         // not make a declared raw member disappear.
-        let mut eager_stream = stream.clone();
-        assert!(ObjectStream::new(&mut eager_stream).is_err());
+        let eager_stream = stream.clone();
+        assert!(ObjectStream::new(&eager_stream).is_err());
         assert_eq!(
             selected_fingerprint(&stream, (1, 0), 0),
             MemberFingerprint::Value(Object::Integer(42))
