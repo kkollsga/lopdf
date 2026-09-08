@@ -722,12 +722,13 @@ fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexedReaderResult<Xref
         return Err(IndexedReaderError::InvalidXref { offset });
     }
     let indices = integer_array(&trailer, b"Index").unwrap_or_else(|| vec![0, size]);
-    if !indices.chunks_exact(2).remainder().is_empty() {
+    let (index_pairs, remainder) = indices.as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(IndexedReaderError::InvalidXref { offset });
     }
 
     let mut total = 0_u64;
-    for pair in indices.chunks_exact(2) {
+    for pair in index_pairs {
         total = total
             .checked_add(pair[1])
             .ok_or(IndexedReaderError::EntryLimitExceeded {
@@ -751,7 +752,7 @@ fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexedReaderResult<Xref
 
     let mut content = stream.content.as_slice();
     let mut entries = BTreeMap::new();
-    for pair in indices.chunks_exact(2) {
+    for pair in index_pairs {
         let start = pair[0];
         let count = pair[1];
         for index in 0..count {
