@@ -1433,7 +1433,26 @@ impl Reader<'_> {
             // convincing `N G obj` lines whose later offsets would otherwise
             // override the genuine entries for those object numbers.
             if buffer[pos..].starts_with(STREAM_KEYWORD)
-                && !buffer[..pos].ends_with(b"end")
+                && (pos == 0
+                    || matches!(
+                        buffer[pos - 1],
+                        b'\0'
+                            | b'\t'
+                            | b'\n'
+                            | b'\x0c'
+                            | b'\r'
+                            | b' '
+                            | b'('
+                            | b')'
+                            | b'<'
+                            | b'>'
+                            | b'['
+                            | b']'
+                            | b'{'
+                            | b'}'
+                            | b'/'
+                            | b'%'
+                    ))
                 && matches!(buffer.get(pos + STREAM_KEYWORD.len()), Some(b'\r' | b'\n'))
             {
                 let after_keyword = pos + STREAM_KEYWORD.len();

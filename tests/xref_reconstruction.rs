@@ -383,3 +383,37 @@ fn incremental_update_omits_prev_without_a_real_xref_location() {
         xref_pos as i64
     );
 }
+
+#[test]
+fn reconstruction_does_not_treat_a_token_suffix_as_stream_keyword() {
+    // `stream` is a PDF keyword only at a token boundary. The recovery scan
+    // must not skip objects 1-4 merely because an unrelated token ends with
+    // those bytes and a later unrelated token spells `endstream`.
+    let mut pdf = new_pdf();
+    let bodies = sample_bodies();
+    pdf.extend_from_slice(b"% mystream\n");
+    let offsets = append_objects(&mut pdf, &bodies);
+    pdf.extend_from_slice(b"% endstream\n");
+    let broken_startxref = pdf.len() + 4096;
+    append_xref_trailer(&mut pdf, &offsets, "<< /Size 5 /Root 1 0 R >>", broken_startxref);
+
+    let document = Document::load_mem(&pdf).expect("token suffix must not hide reconstructed objects");
+    assert_eq!(document.get_pages().len(), 1);
+
+    let mut expected_pdf = new_pdf();
+    let expected_offsets = append_objects(&mut expected_pdf, &bodies);
+    let expected_xref = expected_pdf.len();
+    append_xref_trailer(
+        &mut expected_pdf,
+        &expected_offsets,
+        "<< /Size 5 /Root 1 0 R >>",
+        expected_xref,
+    );
+    let expected = Document::load_mem(&expected_pdf).unwrap();
+    for object_id in 1..=4 {
+        assert_eq!(
+            document.get_object((object_id, 0)).unwrap(),
+            expected.get_object((object_id, 0)).unwrap()
+        );
+    }
+}
