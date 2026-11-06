@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use log::warn;
 
 use crate::error::{ParseError, XrefError};
-use crate::reader::Reader;
+use crate::reader::{Reader, free_ids};
 use crate::xref::Xref;
 use crate::{Dictionary, Error, Object, ObjectId, Result};
 
@@ -31,18 +31,23 @@ pub(crate) fn resolve_xref_and_trailer(reader: &mut Reader<'_>) -> Result<(Xref,
     if xref_start > reader.buffer.len() {
         return Err(Error::Xref(XrefError::Start));
     }
-    let xref_start = reader.correct_xref_offset(xref_start);
+    let (xref_start, mut xref, mut trailer) = reader.xref_and_trailer_at(xref_start)?;
     reader.document.xref_start = xref_start;
-
-    let (mut xref, mut trailer) = reader.xref_and_trailer_at(xref_start)?;
+    reader.free_without_xref_stream.clear();
 
     // `/XRefStm` describes its own revision. Apply each supplement before
     // merging that section so compressed rows supersede compatibility rows.
-    let mut already_seen = HashSet::new();
     let mut already_seen_supplements = HashSet::new();
     let xref_stream_start = trailer.remove(b"XRefStm");
-    apply_hybrid_supplement(reader, &mut xref, xref_stream_start, &mut already_seen_supplements);
+    if apply_hybrid_supplement(reader, &mut xref, xref_stream_start, &mut already_seen_supplements)? {
+        reader.free_without_xref_stream.extend(free_ids(&xref));
+    }
+    let mut sections = 1;
 
+    // A `/Prev` that leads back to the section `startxref` names ends the chain
+    // like any other cycle.
+    let mut already_seen = HashSet::new();
+    already_seen.insert(xref_start as i64);
     let mut prev_xref_start = trailer.remove(b"Prev");
     while let Some(prev) = prev_xref_start.take().and_then(|offset| offset.as_i64().ok()) {
         if !already_seen.insert(prev) {
@@ -52,18 +57,26 @@ pub(crate) fn resolve_xref_and_trailer(reader: &mut Reader<'_>) -> Result<(Xref,
             return Err(Error::Xref(XrefError::PrevStart));
         }
 
-        let (mut prev_xref, mut prev_trailer) = reader.xref_and_trailer_at(prev as usize)?;
+        let (_, mut prev_xref, mut prev_trailer) = reader.xref_and_trailer_at(prev as usize)?;
+        sections += 1;
         let prev_xref_stream_start = prev_trailer.remove(b"XRefStm");
-        apply_hybrid_supplement(
+        if apply_hybrid_supplement(
             reader,
             &mut prev_xref,
             prev_xref_stream_start,
             &mut already_seen_supplements,
-        );
+        )? {
+            // Only the free entries that stay: a newer section's entry wins the merge below.
+            let hidden: Vec<u32> = free_ids(&prev_xref)
+                .filter(|id| !xref.entries.contains_key(id))
+                .collect();
+            reader.free_without_xref_stream.extend(hidden);
+        }
         xref.merge(prev_xref);
         prev_xref_start = prev_trailer.remove(b"Prev");
     }
     normalize_declared_size(&mut xref)?;
+    reader.document.xref_section_count = sections;
 
     Ok((xref, trailer))
 }
@@ -88,26 +101,37 @@ fn normalize_declared_size(reference_table: &mut Xref) -> Result<()> {
 }
 
 /// Overlay one hybrid-reference supplement on the classic rows for the same
-/// revision. A damaged supplement is optional and degrades to the classic
-/// section, which remains a complete table for readers without xref streams.
+/// revision. A damaged supplement is optional in lenient mode and degrades to the
+/// classic section, which remains a complete table for readers without xref
+/// streams; strict mode refuses it. Returns whether the section names a
+/// supplement that could not be read and was ignored, in which case its free
+/// rows may be placeholders for objects that only the supplement located.
 fn apply_hybrid_supplement(
-    reader: &Reader<'_>, section: &mut Xref, start: Option<Object>, already_seen: &mut HashSet<i64>,
-) {
+    reader: &mut Reader<'_>, section: &mut Xref, start: Option<Object>, already_seen: &mut HashSet<i64>,
+) -> Result<bool> {
     let Some(start) = start.and_then(|offset| offset.as_i64().ok()) else {
-        return;
+        return Ok(false);
     };
     if start < 0 || start as usize > reader.buffer.len() {
+        if reader.strict {
+            return Err(Error::Xref(XrefError::StreamStart));
+        }
         warn!("XRefStm {start} is outside the file; the hybrid-reference supplement is ignored.");
-        return;
+        return Ok(true);
     }
     if !already_seen.insert(start) {
-        return;
+        return Ok(false);
     }
 
     match reader.xref_and_trailer_at(start as usize) {
-        Ok((supplement, _)) => section.supersede(supplement),
+        Ok((_, supplement, _)) => {
+            section.supersede(supplement);
+            Ok(false)
+        }
+        Err(error) if reader.strict => Err(error),
         Err(error) => {
-            warn!("XRefStm {start} could not be read ({error}); the hybrid-reference supplement is ignored.")
+            warn!("XRefStm {start} could not be read ({error}); the hybrid-reference supplement is ignored.");
+            Ok(true)
         }
     }
 }

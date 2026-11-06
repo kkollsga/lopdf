@@ -103,6 +103,10 @@ pub enum Error {
     /// Found object ID does not match expected object ID.
     #[error("found object ID does not match expected object ID")]
     ObjectIdMismatch,
+    /// A new object ID was needed, but [`Document::max_id`](crate::Document::max_id) is already
+    /// `u32::MAX`.
+    #[error("object ID overflow: the next object number would exceed {}", u32::MAX)]
+    ObjectIdOverflow,
     /// Error when handling images.
     #[cfg(feature = "embed_image")]
     #[error("image error")]
@@ -151,6 +155,12 @@ pub enum DecompressError {
     /// to have the reference resolved.
     #[error("/DecodeParms entry {index} is an indirect reference and no document was available to resolve it")]
     UnresolvedDecodeParms { index: usize },
+
+    /// The stream names more filters than [`Stream::MAX_FILTERS`](crate::Stream::MAX_FILTERS).
+    /// Every filter can produce as much output as the size limit allows, so the number of
+    /// filters bounds the work of decoding one stream.
+    #[error("stream has {count} filters, more than the {limit} that are decoded")]
+    TooManyFilters { count: usize, limit: usize },
 }
 
 #[derive(Error, Debug)]

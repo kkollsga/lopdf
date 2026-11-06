@@ -256,7 +256,7 @@ fn write_unicode_map_to_string(unicode_map: &ToUnicodeCMap, bytes: &[u8], out: &
         }
         bytes_in_considered_code += 1;
         considered_source_code = considered_source_code * 256 + *byte as u32;
-        if let Some(mut value) = unicode_map.get(considered_source_code, bytes_in_considered_code) {
+        if let Some(mut value) = unicode_map.get_for_decoding(considered_source_code, bytes_in_considered_code) {
             considered_source_code = 0;
             bytes_in_considered_code = 0;
             output_bytes.append(&mut value);
@@ -399,10 +399,10 @@ mod tests {
           /CMapName /Owned-Exact def\n\
           /CMapType 2 def\n\
           4 begincodespacerange\n\
-          <00> <FF>\n\
-          <0000> <FFFF>\n\
-          <000000> <FFFFFF>\n\
-          <00000000> <FFFFFFFF>\n\
+          <01> <01>\n\
+          <0200> <02FF>\n\
+          <040000> <04FFFF>\n\
+          <07000000> <FFFFFFFF>\n\
           endcodespacerange\n\
           4 beginbfchar\n\
           <01> <0041>\n\
@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_caller_missing_differences_matches_borrowed_standard_fallback() {
+    fn owned_base_encoding_matches_borrowed_dictionary_without_differences() {
         let font = dictionary! {
             "Type" => "Font",
             "Encoding" => dictionary! {
@@ -639,10 +639,9 @@ mod tests {
         let document = Document::new();
         let borrowed = font.get_font_encoding(&document).unwrap();
         let bytes = [0x80, b'A'];
-        assert_eq!(
-            borrowed.bytes_to_string(&bytes).unwrap(),
-            owned_text(&OwnedEncoding::standard(), &bytes).unwrap()
-        );
+        let owned = OwnedEncoding::from_named(b"MacRomanEncoding", None).unwrap();
+        assert_eq!(borrowed.bytes_to_string(&bytes).unwrap(), "\u{c4}A");
+        assert_eq!(owned_text(&owned, &bytes).unwrap(), "\u{c4}A");
     }
 
     #[test]

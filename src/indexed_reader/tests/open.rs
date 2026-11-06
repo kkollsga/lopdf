@@ -806,6 +806,21 @@ fn semantic_xref_stream_error_stops_after_initial_window() {
     assert_eq!(lengths, vec![usize::try_from(XREF_INITIAL_WINDOW).unwrap()]);
 }
 
+/// Strict eager loading refuses framing the indexed reader refuses. Lenient eager loading rebuilds
+/// the table from the stream dictionary, the damaged-file envelope that may differ from the indexed
+/// route (docs/indexed-reader-contract.md).
+fn assert_strict_eager_refuses_and_lenient_rebuilds(pdf: &[u8]) {
+    let strict = crate::LoadOptions {
+        strict: true,
+        ..Default::default()
+    };
+    assert!(Document::load_mem_with_options(pdf, strict).is_err());
+    assert_eq!(
+        Document::load_mem(pdf).unwrap().xref_recovery,
+        Some(crate::xref::XrefRecovery::Reconstructed)
+    );
+}
+
 #[test]
 fn xref_stream_framing_matches_eager_reader() {
     let valid = xref_stream_pdf(true);
@@ -813,7 +828,7 @@ fn xref_stream_framing_matches_eager_reader() {
     assert!(open_without_recovery(Arc::new(BytesSource::from(valid.clone()))).is_ok());
 
     let missing_endstream = corrupt_marker(valid.clone(), b"endstream");
-    assert!(Document::load_mem(&missing_endstream).is_err());
+    assert_strict_eager_refuses_and_lenient_rebuilds(&missing_endstream);
     assert!(matches!(
         open_without_recovery(Arc::new(BytesSource::from(missing_endstream.clone()))),
         Err(IndexedReaderError::InvalidXref { .. })
@@ -854,7 +869,7 @@ fn xref_stream_framing_matches_eager_reader() {
             .unwrap();
         let eol = marker + b"stream".len();
         rejected.splice(eol..eol + 1, replacement.iter().copied());
-        assert!(Document::load_mem(&rejected).is_err());
+        assert_strict_eager_refuses_and_lenient_rebuilds(&rejected);
         assert!(matches!(
             open_without_recovery(Arc::new(BytesSource::from(rejected))),
             Err(IndexedReaderError::InvalidXref { .. })
@@ -874,7 +889,7 @@ fn xref_stream_framing_matches_eager_reader() {
         let mut rejected = valid.clone();
         let marker = rfind(&rejected, b"endstream").unwrap();
         rejected.splice(marker - 1..marker, replacement.iter().copied());
-        assert!(Document::load_mem(&rejected).is_err());
+        assert_strict_eager_refuses_and_lenient_rebuilds(&rejected);
         assert!(matches!(
             open_without_recovery(Arc::new(BytesSource::from(rejected))),
             Err(IndexedReaderError::InvalidXref { .. })

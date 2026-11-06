@@ -162,6 +162,42 @@ fn page_map_bounds_cycles_depth_and_page_count_without_trusting_count() {
     ));
 }
 
+/// A kid that does not load keeps its slot as a stand-in page on the eager route, so page numbers
+/// stay stable there; the page map lists only leaves it can resolve. A pinned divergence
+/// (docs/indexed-reader-contract.md): each route is asserted on its own.
+#[test]
+fn a_kid_that_does_not_load_is_a_page_only_on_the_eager_route() {
+    let pdf = object_pdf(&[
+        ObjectDef {
+            id: 1,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Type /Catalog /Pages 2 0 R >>",
+        },
+        ObjectDef {
+            id: 2,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 >>",
+        },
+        ObjectDef {
+            id: 3,
+            object_generation: 0,
+            xref_generation: 0,
+            body: b"<< /Type /Page /Parent 2 0 R >>",
+        },
+    ]);
+
+    let eager = Document::load_mem(&pdf).unwrap();
+    let eager_pages: Vec<_> = eager.page_iter().collect();
+    assert_eq!(eager_pages, vec![(3, 0), (9, 0)]);
+
+    let reader = open_reader(&pdf, ResolverLimits::default());
+    let page_map = PageMap::from_reader(&reader).unwrap();
+    let indexed_pages: Vec<_> = page_map.iter().map(PageMapEntry::id).collect();
+    assert_eq!(indexed_pages, vec![(3, 0)]);
+}
+
 /// The depth cap is inclusive, and crossing it *reports* rather than truncates.
 ///
 /// Returning a short page map for an over-deep tree is indistinguishable from a genuinely

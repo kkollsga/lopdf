@@ -23,3 +23,10 @@ The currently pinned divergences are:
   construction rejects an unsupported container filter;
 - indexed xref opening uses conservative bounded framing and typed recovery/refusal, while eager
   reconstruction may accept a different damaged-file envelope.
+- a free row beside an `/XRefStm` that cannot be read may be a placeholder, so the eager loader
+  takes that object from its container, while the indexed reader refuses the section and answers
+  from its rescan;
+- a page-tree kid that does not load keeps its slot as a stand-in page on the eager route and is
+  left out of the indexed page map;
+- a string that cannot be decrypted leaves the eager object partly decrypted with a warning, while
+  the indexed reader refuses the whole object with `ObjectDecryption`.

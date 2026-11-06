@@ -1,4 +1,5 @@
 use crate::parser;
+use crate::writer::{Style, Writer};
 use crate::{DecompressError, Document, Error, Object, ObjectId, Result, Stream};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -18,6 +19,14 @@ pub const MAX_SELECTED_OBJECT_STREAM_MEMBERS: usize = 131_072;
 use log::warn;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
+
+/// With the `rayon` feature, an object stream with fewer members is parsed on
+/// the calling thread unless that thread is one of rayon's workers. Outside
+/// the pool, handing a small stream to it costs more than it saves, as for a
+/// small document in `Reader`. Inside, splitting is cheap and lets idle
+/// workers share a stream that the rest of a parallel load waits for.
+#[cfg(feature = "rayon")]
+const MIN_PARALLEL_OBJECTS: usize = 32;
 
 #[derive(Debug)]
 pub struct ObjectStream {
@@ -95,8 +104,10 @@ impl ObjectStream {
         let index_block = content.get(..first_offset).ok_or(Error::InvalidOffset(first_offset))?;
 
         let numbers_str = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
+        // A comment is white space, and runs to the end of its line.
         let numbers: Vec<_> = numbers_str
-            .split_whitespace()
+            .split(['\r', '\n'])
+            .flat_map(|line| line.split('%').next().unwrap_or_default().split_whitespace())
             .map(|number| u32::from_str(number).ok())
             .collect();
         let len = numbers.len() / 2 * 2; // Ensure only pairs.
@@ -114,21 +125,23 @@ impl ObjectStream {
                 warn!("out-of-bounds offset in object stream");
                 return None;
             }
-            // Skip leading whitespace — some PDFs emit newlines before objects in ObjStm
-            let mut start = offset;
-            while start < content.len() && content[start].is_ascii_whitespace() {
-                start += 1;
-            }
-            if start >= content.len() {
+            // Skip white space and comments before the object, such as the newlines some PDFs
+            // emit there and the comment that qpdf writes in QDF files.
+            let (rest, ()) = parser::space(&content[offset..]).ok()?;
+            if rest.is_empty() {
                 warn!("only whitespace after offset in object stream");
                 return None;
             }
-            let object = parser::direct_object(&content[start..])?;
+            let object = parser::direct_object(rest)?;
 
             Some(((id, 0), object))
         };
         #[cfg(feature = "rayon")]
-        let objects = numbers[..len].par_chunks(2).filter_map(chunks_filter_map).collect();
+        let objects = if len / 2 >= MIN_PARALLEL_OBJECTS || rayon::current_thread_index().is_some() {
+            numbers[..len].par_chunks(2).filter_map(chunks_filter_map).collect()
+        } else {
+            numbers[..len].chunks(2).filter_map(chunks_filter_map).collect()
+        };
         #[cfg(not(feature = "rayon"))]
         let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
 
@@ -348,73 +361,87 @@ impl ObjectStream {
         self.objects.len()
     }
 
-    /// Build the stream content in the format required by PDF spec
-    pub fn build_stream_content(&self) -> Result<Vec<u8>> {
-        if self.objects.is_empty() {
-            return Ok(Vec::new());
-        }
+    /// The members in id order, each paired with its serialization: an object
+    /// stream stores them sorted, and both the offset table and the body walk
+    /// them in that order. The order comes from [`Self::sorted_object_ids`], so
+    /// the body and the cross-reference indices cannot drift apart.
+    fn sorted_serializations(&self, style: Style) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        self.sorted_object_ids()
+            .into_iter()
+            .map(|id| {
+                let mut bytes = Vec::new();
+                Writer::write_styled_object(&mut bytes, &self.objects[&id], style)?;
+                Ok((id, bytes))
+            })
+            .collect()
+    }
 
-        // Sort objects by ID for consistent output
-        let mut sorted_objects: Vec<_> = self.objects.iter().collect();
-        sorted_objects.sort_by_key(|(id, _)| *id);
+    /// The contained object ids in the order [`Self::build_stream_content`]
+    /// writes them, so a caller recording cross-reference entries can assign
+    /// each object the index it actually occupies in the stream. This is the
+    /// single source of that order.
+    pub(crate) fn sorted_object_ids(&self) -> Vec<ObjectId> {
+        let mut ids: Vec<ObjectId> = self.objects.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
 
-        // First build the offset table to know its size
-        let mut offset_entries = Vec::new();
+    /// The `N M N M ...` header of object numbers and their offsets from the
+    /// start of the body, which the `/First` entry records the length of.
+    fn offset_table(members: &[(ObjectId, Vec<u8>)]) -> String {
+        let mut entries = Vec::with_capacity(members.len());
         let mut current_offset = 0;
 
-        for ((obj_num, _gen), obj) in &sorted_objects {
-            // Store the object number and its offset
-            offset_entries.push(format!("{obj_num} {current_offset}"));
-
-            // Calculate size of this object's serialization
-            let mut obj_bytes = Vec::new();
-            crate::writer::Writer::write_object(&mut obj_bytes, obj)?;
-            current_offset += obj_bytes.len() + 1; // +1 for space separator
+        for ((obj_num, _gen), bytes) in members {
+            entries.push(format!("{obj_num} {current_offset}"));
+            // +1 for the space separator written after each object
+            current_offset += bytes.len() + 1;
         }
 
-        // Build the complete offset table with proper spacing
-        let offset_table = offset_entries.join(" ") + " ";
+        // Joined with spaces and a trailing space, so the body starts on a
+        // fresh token.
+        entries.join(" ") + " "
+    }
 
-        // Now build the final content
+    /// Build the stream content in the format required by PDF spec
+    pub fn build_stream_content(&self) -> Result<Vec<u8>> {
+        self.build_body(Style::default()).map(|(content, _)| content)
+    }
+
+    /// The object stream body — the offset table followed by the serialized
+    /// objects — together with the `/First` offset, which is where the table
+    /// ends. Both are needed to build the stream, so they are produced together
+    /// rather than by serializing the members twice.
+    fn build_body(&self, style: Style) -> Result<(Vec<u8>, usize)> {
+        if self.objects.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let members = self.sorted_serializations(style)?;
+        let table = Self::offset_table(&members);
+        let first_offset = table.len();
+
         let mut content = Vec::new();
-        content.extend_from_slice(offset_table.as_bytes());
+        content.extend_from_slice(table.as_bytes());
 
-        // Add serialized objects with space separators
-        for ((_, _), obj) in &sorted_objects {
-            let mut obj_bytes = Vec::new();
-            crate::writer::Writer::write_object(&mut obj_bytes, obj)?;
-            content.extend_from_slice(&obj_bytes);
+        for (_, bytes) in &members {
+            content.extend_from_slice(bytes);
             content.push(b' '); // Space separator between objects
         }
 
-        Ok(content)
+        Ok((content, first_offset))
     }
 
     /// Convert to a Stream object ready for insertion into a PDF
     pub fn to_stream_object(&self) -> Result<Stream> {
-        let content = self.build_stream_content()?;
+        self.to_styled_stream_object(Style::default())
+    }
 
-        // Calculate where the first object starts
-        // We need to find the size of the offset table
-        let mut sorted_objects: Vec<_> = self.objects.iter().collect();
-        sorted_objects.sort_by_key(|(id, _)| *id);
-
-        // Build the offset entries to calculate exact size
-        let mut offset_entries = Vec::new();
-        let mut current_offset = 0;
-
-        for ((obj_num, _gen), obj) in &sorted_objects {
-            offset_entries.push(format!("{obj_num} {current_offset}"));
-
-            // Calculate size of this object's serialization
-            let mut obj_bytes = Vec::new();
-            crate::writer::Writer::write_object(&mut obj_bytes, obj)?;
-            current_offset += obj_bytes.len() + 1; // +1 for space separator
-        }
-
-        // The offset table is joined with spaces and has a trailing space
-        let offset_table = offset_entries.join(" ") + " ";
-        let first_offset = offset_table.len();
+    /// [`Self::to_stream_object`] with the members serialized in the layout that `style` asks
+    /// for, as a save with [`crate::SaveOptions::ascii`] or [`crate::SaveOptions::pretty`]
+    /// writes them.
+    pub(crate) fn to_styled_stream_object(&self, style: Style) -> Result<Stream> {
+        let (content, first_offset) = self.build_body(style)?;
 
         let dict = dictionary! {
             "Type" => "ObjStm",
@@ -426,22 +453,7 @@ impl ObjectStream {
 
         // Apply compression - object streams should always be compressed
         if self.compression_level > 0 {
-            // Force compression by setting Filter directly
-            use flate2::Compression;
-            use flate2::write::ZlibEncoder;
-            use std::io::prelude::*;
-
-            let compression = match self.compression_level {
-                0 => Compression::none(),
-                1..=3 => Compression::fast(),
-                4..=6 => Compression::default(),
-                _ => Compression::best(),
-            };
-
-            let mut encoder = ZlibEncoder::new(Vec::new(), compression);
-            encoder.write_all(&stream.content)?;
-            let compressed = encoder.finish()?;
-
+            let compressed = crate::object::zlib_compress(&stream.content, self.compression_level)?;
             stream.dict.set("Filter", "FlateDecode");
             stream.set_content(compressed);
         }
@@ -495,9 +507,8 @@ impl ObjectStream {
 
     /// Check if a PDF document is linearized
     fn is_linearized(doc: &Document) -> bool {
-        // In a linearized PDF, the first object after the header should be a
-        // linearization dictionary with /Linearized entry
-        // For simplicity, we check if any object has a /Linearized entry
+        // In a linearized PDF the first object is a linearization dictionary; we just look for
+        // any object with a /Linearized entry.
         for obj in doc.objects.values() {
             if let Object::Dictionary(dict) = obj
                 && dict.has(b"Linearized")

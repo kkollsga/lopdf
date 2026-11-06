@@ -704,6 +704,8 @@ fn next_lru_stamp(cache: &mut CacheState) -> u64 {
     cache.clock
 }
 
+// `fetch_update` is deprecated in favour of `try_update`, which is newer than the MSRV.
+#[allow(deprecated)]
 fn saturating_add(counter: &AtomicU64, value: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(value))

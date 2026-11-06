@@ -196,13 +196,11 @@ impl ScalarAstScanner<'_> {
             return None;
         }
         self.position += 1;
-        // nom's `many0` starts its output Vec at capacity four, including for
-        // an empty name.
-        let mut vector = SimulatedVec {
-            capacity: 4,
-            peak: 4,
-            ..SimulatedVec::default()
-        };
+        // `parser::name` starts from an empty Vec, which an empty name never
+        // allocates, and copies each run of regular bytes in one extension; each
+        // `#xx` escape is one push after the run before it.
+        let mut vector = SimulatedVec::default();
+        let mut run = 0_usize;
         while let Some(byte) = self.peek() {
             if byte == b'#' {
                 let Some((first, second)) = self.input.get(self.position + 1).zip(self.input.get(self.position + 2))
@@ -212,14 +210,21 @@ impl ScalarAstScanner<'_> {
                 if !first.is_ascii_hexdigit() || !second.is_ascii_hexdigit() {
                     break;
                 }
+                if run > 0 {
+                    vector.push(run)?;
+                    run = 0;
+                }
                 vector.push(1)?;
                 self.position += 3;
             } else if !is_pdf_whitespace(byte) && !is_pdf_delimiter(byte) {
-                vector.push(1)?;
+                run = run.checked_add(1)?;
                 self.position += 1;
             } else {
                 break;
             }
+        }
+        if run > 0 {
+            vector.push(run)?;
         }
         Some((vector.capacity, vector.peak.saturating_sub(vector.capacity)))
     }

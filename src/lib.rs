@@ -15,6 +15,7 @@ mod document;
 mod incremental_document;
 #[cfg_attr(not(test), allow(dead_code))]
 mod indexed_reader;
+mod linearization;
 
 mod bookmarks;
 mod cmap_section;
@@ -47,6 +48,7 @@ pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
 
 pub use bookmarks::Bookmark;
 pub use common_data_structures::{decode_text_string, text_string};
+pub use datetime::DateTime;
 pub use destinations::Destination;
 pub use encodings::{Encoding, OwnedEncoding, encode_utf8, encode_utf16_be};
 pub use encryption::{EncryptionState, EncryptionVersion, Permissions};
@@ -61,7 +63,8 @@ pub use indexed_reader::{
     InheritedPageAttributeOwners, MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry,
     SharedIndexedReaderResult,
 };
-pub use load_options::{FilterFunc, LoadOptions};
+pub use linearization::Linearization;
+pub use load_options::{DEFAULT_MAX_DECOMPRESSED_SIZE, FilterFunc, LoadOptions};
 pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use outlines::Outline;
 pub use reader::{PdfMetadata, Reader};
@@ -73,6 +76,7 @@ pub use scalar_budget::{
 pub use source::FileSource;
 pub use source::{BytesSource, RandomAccessSource, SourceError, SourceResult};
 pub use toc::{Toc, TocType};
+pub use writer::Writer;
 
 pub use parser_aux::substr;
 pub use parser_aux::substring;

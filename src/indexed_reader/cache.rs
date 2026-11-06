@@ -775,6 +775,8 @@ impl SharedCache<PreparedObjectStream> {
     }
 }
 
+// `fetch_update` is deprecated in favour of `try_update`, which is newer than the MSRV.
+#[allow(deprecated)]
 pub(super) fn atomic_saturating_increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))

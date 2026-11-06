@@ -12,7 +12,7 @@
 //! talks about 7.
 
 use lopdf::xref::XrefEntry;
-use lopdf::{BytesSource, Document, IndexedReader, Object};
+use lopdf::{BytesSource, Document, IndexedReader, IndexedReaderError, Object};
 
 // ------------------------------------------------------------------ fixture construction
 
@@ -541,4 +541,42 @@ fn a_freed_member_is_never_expanded_into_the_object_map() {
             .any(|(_, object)| matches!(object, Object::Dictionary(d) if d.get(b"Doomed").is_ok()));
         assert!(!doomed, "{name}: the superseded member must not be loaded at all");
     }
+}
+
+/// A free row beside an `/XRefStm` that cannot be read may be a placeholder for an object only that
+/// stream located, so lenient eager loading takes it from its container. The indexed route refuses
+/// the damaged section and falls back to its rescan, which reports the object missing. A pinned
+/// divergence (docs/indexed-reader-contract.md): each route is asserted on its own.
+#[test]
+fn a_placeholder_behind_an_unreadable_supplement_differs_between_the_routes() {
+    let (mut pdf, offsets) = basic_body("hybrid");
+    let objstm = push_objstm(&mut pdf, 5, 7, "<< /Hidden true >>");
+    append_classic(
+        &mut pdf,
+        &[
+            (
+                0,
+                vec![
+                    Row::Free,
+                    Row::Normal(offsets[1]),
+                    Row::Normal(offsets[2]),
+                    Row::Normal(offsets[3]),
+                    Row::Normal(offsets[4]),
+                    Row::Normal(objstm),
+                ],
+            ),
+            (7, vec![Row::Free]),
+        ],
+        &format!("/Size 8 /XRefStm {}", offsets[1]),
+    );
+
+    let eager = Document::load_mem(&pdf).unwrap();
+    assert!(matches!(eager.reference_table.get(7), Some(XrefEntry::Free)));
+    assert!(eager.get_object((7, 0)).unwrap().as_dict().unwrap().has(b"Hidden"));
+
+    let lazy = IndexedReader::open(BytesSource::from(pdf)).unwrap();
+    assert!(matches!(
+        lazy.resolve_object((7, 0)),
+        Err(IndexedReaderError::MissingNormalObject { id: (7, 0), .. })
+    ));
 }

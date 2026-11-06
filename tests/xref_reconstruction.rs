@@ -1,4 +1,5 @@
-use lopdf::{Document, LoadOptions, Object};
+use lopdf::xref::XrefRecovery;
+use lopdf::{Document, IncrementalDocument, LoadOptions, Object, SaveOptions, dictionary};
 
 /// Append objects, returning each one's `(number, physical offset)`.
 fn append_objects(pdf: &mut Vec<u8>, bodies: &[(u32, u16, String)]) -> Vec<(u32, usize)> {
@@ -59,11 +60,13 @@ fn startxref_past_eof_is_reconstructed_from_object_markers() {
     let document = Document::load_mem(&pdf).unwrap();
     assert_eq!(document.get_pages().len(), 1);
     assert!(document.trailer.get(b"Root").is_ok());
+    assert_eq!(document.xref_recovery, Some(XrefRecovery::Reconstructed));
 
     assert!(document.get_object((99, 0)).is_err());
 
     let metadata = Document::load_metadata_mem(&pdf).unwrap();
     assert_eq!(metadata.page_count, 1);
+    assert_eq!(metadata.xref_recovery, Some(XrefRecovery::Reconstructed));
 }
 
 #[test]
@@ -127,6 +130,38 @@ fn reconstruction_prefers_newer_revisions_of_duplicated_objects() {
 }
 
 #[test]
+fn saving_a_reconstructed_document_writes_no_stale_prev() {
+    // The newest trailer chains to the first revision's table with /Prev, an
+    // offset into the damaged file that a save must not copy into the new one.
+    let mut pdf = new_pdf();
+    let mut offsets = append_objects(&mut pdf, &sample_bodies());
+    let first_xref = pdf.len();
+    append_xref_trailer(&mut pdf, &offsets, "<< /Size 5 /Root 1 0 R >>", first_xref);
+
+    let revision_offset = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.retain(|(number, _)| *number != 2);
+    offsets.push((2, revision_offset));
+    let broken_startxref = pdf.len() + 4096;
+    let trailer = format!("<< /Size 5 /Root 1 0 R /Prev {first_xref} >>");
+    append_xref_trailer(&mut pdf, &offsets, &trailer, broken_startxref);
+
+    let mut document = Document::load_mem(&pdf).unwrap();
+    assert!(!document.trailer.has(b"Prev"));
+    // Nor does an incremental update copy it: there is no table to chain to.
+    assert!(!Document::new_from_prev(&document).trailer.has(b"Prev"));
+
+    let mut saved = Vec::new();
+    document.save_to(&mut saved).unwrap();
+    let strict = LoadOptions {
+        strict: true,
+        ..Default::default()
+    };
+    let reloaded = Document::load_mem_with_options(&saved, strict).unwrap();
+    assert_eq!(reloaded.get_pages().len(), 1);
+}
+
+#[test]
 fn reconstruction_skips_trailers_whose_root_was_not_found() {
     // A trailing bogus trailer references absent catalog object 77.
     let mut pdf = new_pdf();
@@ -142,8 +177,11 @@ fn reconstruction_skips_trailers_whose_root_was_not_found() {
 
 #[test]
 fn reconstruction_fails_when_no_trailer_has_a_usable_root() {
+    // Nor can a catalog stand in for the trailer: its `/Pages` names an object the file lacks.
+    let mut bodies = sample_bodies();
+    bodies[0].2 = "<< /Type /Catalog /Pages 9 0 R >>".to_string();
     let mut pdf = new_pdf();
-    append_objects(&mut pdf, &sample_bodies());
+    append_objects(&mut pdf, &bodies);
     pdf.extend_from_slice(b"trailer\n<< /Size 5 >>\n");
     let broken_startxref = pdf.len() + 4096;
     append_xref_trailer(&mut pdf, &[], "", broken_startxref);
@@ -338,6 +376,39 @@ fn reconstruction_does_not_use_a_previous_objects_length_hint() {
 }
 
 #[test]
+fn reconstruction_takes_a_length_hint_only_from_the_streams_own_dictionary() {
+    // A `stream` line without a header of its own follows object 4's
+    // unterminated payload. Object 4's /Length must not bound that keyword's
+    // payload as well, or the scan skips the catalog header after it.
+    let mut pdf = new_pdf();
+    let fourth_offset = pdf.len();
+    pdf.extend_from_slice(b"4 0 obj\n<< /Length 7 >>\nstream\nPAYLOAD\nendstrXXm\nstream\n");
+    let mut offsets = append_objects(&mut pdf, &page_tree_bodies());
+    offsets.push((4, fourth_offset));
+    let broken_startxref = pdf.len() + 4096;
+    append_xref_trailer(&mut pdf, &offsets, "<< /Size 5 /Root 1 0 R >>", broken_startxref);
+
+    let document = Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.get_pages().len(), 1);
+    assert!(document.get_object((1, 0)).unwrap().as_dict().unwrap().has(b"Type"));
+}
+
+#[test]
+fn reconstruction_scan_stays_linear_after_many_unterminated_streams() {
+    // No `endstream` follows any of these keywords. Searching the rest of the
+    // file for one at every keyword, and back to the last `obj` for a /Length
+    // hint, made the scan quadratic: about 2 s for these 128 KiB in release.
+    let mut pdf = new_pdf();
+    let offsets = append_objects(&mut pdf, &sample_bodies());
+    pdf.extend_from_slice(&b"stream\n".repeat(128 * 1024 / 7));
+    let broken_startxref = pdf.len() + 4096;
+    append_xref_trailer(&mut pdf, &offsets, "<< /Size 5 /Root 1 0 R >>", broken_startxref);
+
+    let document = Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.get_pages().len(), 1);
+}
+
+#[test]
 fn reconstruction_accepts_indented_object_headers() {
     // Real generators indent object headers; blanks between the line start
     // and the digits must not hide the marker.
@@ -376,6 +447,8 @@ fn incremental_update_omits_prev_without_a_real_xref_location() {
     let xref_pos = valid.len();
     append_xref_trailer(&mut valid, &valid_offsets, "<< /Size 5 /Root 1 0 R >>", xref_pos);
     let valid_document = Document::load_mem(&valid).unwrap();
+    assert_eq!(valid_document.xref_recovery, None);
+    assert_eq!(Document::load_metadata_mem(&valid).unwrap().xref_recovery, None);
 
     let valid_update = Document::new_from_prev(&valid_document);
     assert_eq!(
@@ -416,4 +489,94 @@ fn reconstruction_does_not_treat_a_token_suffix_as_stream_keyword() {
             expected.get_object((object_id, 0)).unwrap()
         );
     }
+}
+
+/// `example.pdf` written with a cross-reference stream, so without a `trailer`
+/// keyword, and with its catalog and page tree in object streams if asked.
+fn xref_stream_file(use_object_streams: bool) -> Vec<u8> {
+    let mut document = Document::load_mem(include_bytes!("../assets/example.pdf")).unwrap();
+    let options = SaveOptions {
+        use_object_streams,
+        use_xref_streams: true,
+        ..Default::default()
+    };
+    let mut pdf = Vec::new();
+    document.save_with_options(&mut pdf, options).unwrap();
+    assert!(!pdf.windows(7).any(|window| window == b"trailer"));
+    pdf
+}
+
+/// Point the last `startxref` past the end of the file.
+fn break_startxref(pdf: &mut Vec<u8>) {
+    let keyword = pdf.windows(9).rposition(|window| window == b"startxref").unwrap();
+    pdf.truncate(keyword);
+    let broken_startxref = pdf.len() + 4096;
+    pdf.extend_from_slice(format!("startxref\n{broken_startxref}\n%%EOF\n").as_bytes());
+}
+
+#[test]
+fn reconstruction_uses_the_dictionary_of_a_cross_reference_stream_as_trailer() {
+    let mut pdf = xref_stream_file(false);
+    break_startxref(&mut pdf);
+
+    let document = Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.get_pages().len(), 1);
+    assert!(document.trailer.get(b"Root").is_ok());
+    assert_eq!(Document::load_metadata_mem(&pdf).unwrap().page_count, 1);
+
+    let strict = LoadOptions {
+        strict: true,
+        ..Default::default()
+    };
+    assert!(Document::load_mem_with_options(&pdf, strict).is_err());
+}
+
+#[test]
+fn reconstruction_finds_compressed_objects_through_cross_reference_streams() {
+    // The catalog and page tree live in an object stream and have no header
+    // of their own: only the cross-reference stream says where they are.
+    let mut pdf = xref_stream_file(true);
+    break_startxref(&mut pdf);
+
+    let document = Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.get_pages().len(), 1);
+    assert_eq!(Document::load_metadata_mem(&pdf).unwrap().page_count, 1);
+}
+
+#[test]
+fn reconstruction_takes_the_trailer_of_the_newest_cross_reference_stream() {
+    // An incremental update adds an Info dictionary. Its cross-reference
+    // stream lists only the new objects and chains to the first one with
+    // /Prev, so the catalog is found through the older stream.
+    let base = xref_stream_file(true);
+    let mut update: IncrementalDocument = base.as_slice().try_into().unwrap();
+    let info = update
+        .new_document
+        .add_object(dictionary! { "Title" => Object::string_literal("Revised") });
+    update.new_document.trailer.set("Info", info);
+    let mut pdf = Vec::new();
+    update.save_to(&mut pdf).unwrap();
+    break_startxref(&mut pdf);
+
+    let mut document = Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.get_pages().len(), 1);
+    assert!(!document.trailer.has(b"Prev"));
+    let metadata = Document::load_metadata_mem(&pdf).unwrap();
+    assert_eq!(metadata.title.as_deref(), Some("Revised"));
+    assert_eq!(metadata.page_count, 1);
+
+    // The trailer chain is gone, so a save writes a file that loads as is.
+    let mut saved = Vec::new();
+    document.save_to(&mut saved).unwrap();
+    let strict = LoadOptions {
+        strict: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        Document::load_mem_with_options(&saved, strict)
+            .unwrap()
+            .get_pages()
+            .len(),
+        1
+    );
 }
