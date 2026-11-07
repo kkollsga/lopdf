@@ -12,9 +12,18 @@ fn document() -> Vec<u8> {
         bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
     };
     add(&mut bytes, "<< /Type /Catalog /Pages 2 0 R >>".to_string());
-    add(&mut bytes, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 9 9] >>".to_string());
-    add(&mut bytes, "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>".to_string());
-    add(&mut bytes, "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_string());
+    add(
+        &mut bytes,
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 9 9] >>".to_string(),
+    );
+    add(
+        &mut bytes,
+        "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>".to_string(),
+    );
+    add(
+        &mut bytes,
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_string(),
+    );
     add(&mut bytes, "<< /Length 7 >>\nstream\nkept me\nendstream".to_string());
     add(&mut bytes, "<< /Length 7 >>\nstream\nsecret!\nendstream".to_string());
     let xref = bytes.len();
@@ -23,7 +32,13 @@ fn document() -> Vec<u8> {
     for offset in &offsets {
         bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
     }
-    bytes.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
     bytes
 }
 
@@ -44,7 +59,9 @@ enum Target {
     Other,
 }
 
-fn destination<'p>(target: Target, same: &'p std::path::Path, new: &'p std::path::Path, other: &'p std::path::Path) -> AppendDestination<'p> {
+fn destination<'p>(
+    target: Target, same: &'p std::path::Path, new: &'p std::path::Path, other: &'p std::path::Path,
+) -> AppendDestination<'p> {
     match target {
         Target::Same => AppendDestination::SameFile(same),
         Target::New => AppendDestination::NewFile(new),
@@ -95,9 +112,16 @@ fn a_failure_at_any_step_leaves_everything_as_it_was() {
                 },
             );
             assert!(reached, "{target:?} never got to {stop:?}");
-            assert!(matches!(result, Err(RewriteError::Io(_))), "{target:?} at {stop:?}: {result:?}");
+            assert!(
+                matches!(result, Err(RewriteError::Io(_))),
+                "{target:?} at {stop:?}: {result:?}"
+            );
             assert_eq!(std::fs::read(&same).unwrap(), original, "{target:?} at {stop:?}");
-            assert_eq!(std::fs::read(&other).unwrap(), b"someone else's", "{target:?} at {stop:?}");
+            assert_eq!(
+                std::fs::read(&other).unwrap(),
+                b"someone else's",
+                "{target:?} at {stop:?}"
+            );
             assert_eq!(names_in(folder.path()), before, "{target:?} at {stop:?}");
         }
     }
@@ -205,7 +229,12 @@ fn a_kill_at_any_step_leaves_the_original_or_a_whole_new_file() {
             std::fs::write(&same, &original).unwrap();
             std::fs::write(&other, b"someone else's").unwrap();
             let status = std::process::Command::new(&test_binary)
-                .args(["--exact", "indexed_reader::rewrite::tests::killed_child", "--nocapture", "--test-threads=1"])
+                .args([
+                    "--exact",
+                    "indexed_reader::rewrite::tests::killed_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
                 .env(KILL_FOLDER, folder.path())
                 .env(KILL_STEP, stop.to_string())
                 .env(KILL_TARGET, format!("{target:?}"))
@@ -225,22 +254,46 @@ fn a_kill_at_any_step_leaves_the_original_or_a_whole_new_file() {
                 assert!(written.ends_with(b"%%EOF\n"), "{target:?}: the new file isn't whole");
                 let opened = IndexedReader::open(FileSource::open(placed).unwrap()).unwrap();
                 assert_eq!(opened.page_count().unwrap(), 1);
-                assert!(!names_in(folder.path()).iter().any(|name| name.starts_with('.')), "{target:?}");
+                assert!(
+                    !names_in(folder.path()).iter().any(|name| name.starts_with('.')),
+                    "{target:?}"
+                );
                 continue;
             }
             assert_eq!(std::fs::read(&same).unwrap(), original, "{target:?} at {stop}");
-            assert_eq!(std::fs::read(&other).unwrap(), b"someone else's", "{target:?} at {stop}");
+            assert_eq!(
+                std::fs::read(&other).unwrap(),
+                b"someone else's",
+                "{target:?} at {stop}"
+            );
             assert!(!new.exists(), "{target:?} at {stop}");
-            let leftovers: Vec<String> = names_in(folder.path()).into_iter().filter(|name| name.starts_with('.')).collect();
+            let leftovers: Vec<String> = names_in(folder.path())
+                .into_iter()
+                .filter(|name| name.starts_with('.'))
+                .collect();
             assert_eq!(leftovers.len(), 1, "{target:?} at {stop}: {leftovers:?}");
 
             // The next save gets past it, and clears it once it's old enough.
             let leftover = folder.path().join(&leftovers[0]);
             let old = std::time::SystemTime::now() - super::super::append::STALE_TEMPORARY_AGE * 2;
-            std::fs::File::options().write(true).open(&leftover).unwrap().set_modified(old).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&leftover)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
             let reader = IndexedReader::open(FileSource::open(&same).unwrap()).unwrap();
-            rewrite_atomically(&reader, destination(target, &same, &new, &other), RewriteOptions::new(), |_| Ok(())).unwrap();
-            assert!(!leftover.exists(), "{target:?} at {stop}: the next save didn't clear what the kill left");
+            rewrite_atomically(
+                &reader,
+                destination(target, &same, &new, &other),
+                RewriteOptions::new(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert!(
+                !leftover.exists(),
+                "{target:?} at {stop}: the next save didn't clear what the kill left"
+            );
         }
     }
 }
@@ -268,13 +321,27 @@ fn a_write_that_fails_at_any_point_fails_the_rewrite() {
     let reader = IndexedReader::open(crate::source::BytesSource::from(bytes)).unwrap();
     for form in [RewriteForm::Table, RewriteForm::Stream] {
         let policy = RewritePolicy::new().form(RewriteFormChoice::Force(form));
-        let length = RewriteChanges::new(&reader).unwrap().write_to(policy, std::io::sink()).unwrap().new_len as usize;
+        let length = RewriteChanges::new(&reader)
+            .unwrap()
+            .write_to(policy, std::io::sink())
+            .unwrap()
+            .new_len as usize;
         // The output buffer holds 64 KiB, so a small file only reaches its writer at the end, in one piece.
         for allowed in 0..length {
-            let result = RewriteChanges::new(&reader).unwrap().write_to(policy, FailsAfter(allowed));
-            assert!(matches!(result, Err(RewriteError::Io(_))), "{form:?} at {allowed}: {result:?}");
+            let result = RewriteChanges::new(&reader)
+                .unwrap()
+                .write_to(policy, FailsAfter(allowed));
+            assert!(
+                matches!(result, Err(RewriteError::Io(_))),
+                "{form:?} at {allowed}: {result:?}"
+            );
         }
-        assert!(RewriteChanges::new(&reader).unwrap().write_to(policy, FailsAfter(length)).is_ok());
+        assert!(
+            RewriteChanges::new(&reader)
+                .unwrap()
+                .write_to(policy, FailsAfter(length))
+                .is_ok()
+        );
     }
 }
 
@@ -287,20 +354,31 @@ fn only_a_whole_deflate_stream_counts_as_read() {
     encoder.write_all(b"Name").unwrap();
     let whole = encoder.finish().unwrap();
     assert_eq!(resources::inflate_whole(&whole, 1 << 20).unwrap().len(), 100_004);
-    assert!(resources::inflate_whole(&whole[..whole.len() / 2], 1 << 20).is_none(), "truncated");
+    assert!(
+        resources::inflate_whole(&whole[..whole.len() / 2], 1 << 20).is_none(),
+        "truncated"
+    );
     assert!(resources::inflate_whole(&whole, 1_000).is_none(), "over the limit");
     let mut wrong_check = whole.clone();
     let last = wrong_check.len() - 1;
     wrong_check[last] ^= 0xFF;
-    assert!(resources::inflate_whole(&wrong_check, 1 << 20).is_none(), "its check doesn't match");
+    assert!(
+        resources::inflate_whole(&wrong_check, 1 << 20).is_none(),
+        "its check doesn't match"
+    );
 }
 
 /// The name search missing a name because of what's around it, which takes out something a page uses.
 #[test]
 fn the_name_search_finds_every_name_wherever_it_is() {
     let mut found = Vec::new();
-    resources::every_name(b"q/A Do(/B)Tj/C#20D[/E]<</F 1>>BI ID \xFF/G\xFFEI /H", |name| found.push(name.to_vec()));
-    let found: Vec<String> = found.iter().map(|name| String::from_utf8_lossy(name).into_owned()).collect();
+    resources::every_name(b"q/A Do(/B)Tj/C#20D[/E]<</F 1>>BI ID \xFF/G\xFFEI /H", |name| {
+        found.push(name.to_vec())
+    });
+    let found: Vec<String> = found
+        .iter()
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect();
     for name in ["A", "B", "C D", "C#20D", "E", "F", "G\u{FFFD}EI", "H"] {
         assert!(found.iter().any(|known| known == name), "{name} in {found:?}");
     }

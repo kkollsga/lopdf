@@ -89,7 +89,10 @@ pub(super) struct SharedResources {
 
 impl SharedResources {
     pub(super) fn remember_kept_pages(&mut self, kept: &[&PageMapEntry]) {
-        self.kept_pages = kept.iter().map(|entry| (entry.id.0, entry.inherited.resources.map(|owner| owner.0))).collect();
+        self.kept_pages = kept
+            .iter()
+            .map(|entry| (entry.id.0, entry.inherited.resources.map(|owner| owner.0)))
+            .collect();
     }
 }
 
@@ -173,7 +176,21 @@ pub(super) fn every_name(bytes: &[u8], mut found: impl FnMut(&[u8])) {
     let is_end = |byte: u8| {
         matches!(
             byte,
-            0 | b'\t' | b'\n' | 0x0C | b'\r' | b' ' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+            0 | b'\t'
+                | b'\n'
+                | 0x0C
+                | b'\r'
+                | b' '
+                | b'('
+                | b')'
+                | b'<'
+                | b'>'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'/'
+                | b'%'
         )
     };
     let mut decoded = Vec::new();
@@ -302,7 +319,9 @@ impl Plan<'_> {
     }
 
     /// Note what a removed page's resources are. `owner` is the page, or the node it inherits them from.
-    pub(super) fn note_removed_resources(&mut self, owner: crate::ObjectId, shared: &mut SharedResources) -> RewriteResult<()> {
+    pub(super) fn note_removed_resources(
+        &mut self, owner: crate::ObjectId, shared: &mut SharedResources,
+    ) -> RewriteResult<()> {
         let Some(dict) = self.peek_dict(owner.0)? else {
             return Ok(());
         };
@@ -345,7 +364,12 @@ impl Plan<'_> {
             found: BTreeSet::new(),
             opaque: Vec::new(),
             decoded: 0,
-            decoded_limit: self.view.index.source_len.saturating_mul(SCAN_PER_FILE_BYTE).max(SCAN_ALLOWANCE),
+            decoded_limit: self
+                .view
+                .index
+                .source_len
+                .saturating_mul(SCAN_PER_FILE_BYTE)
+                .max(SCAN_ALLOWANCE),
         };
         if pruner.holders.is_empty() {
             return Ok(pruner);
@@ -369,7 +393,9 @@ impl Plan<'_> {
         for (page, owner) in &shared.kept_pages {
             let Some(owner) = owner else { continue };
             let Some(dict) = self.peek_dict(*owner)? else { continue };
-            let Ok(resources) = dict.get(b"Resources") else { continue };
+            let Ok(resources) = dict.get(b"Resources") else {
+                continue;
+            };
             let scope = self.scope_within(&resources.clone(), *owner, &pruner)?;
             if scope.is_empty() {
                 continue;
@@ -380,7 +406,9 @@ impl Plan<'_> {
                     state.has_user = true;
                 }
             }
-            let Some(page_dict) = self.peek_dict(*page)? else { continue };
+            let Some(page_dict) = self.peek_dict(*page)? else {
+                continue;
+            };
             self.queue_page_content(&page_dict, &scope, &mut pruner)?;
         }
         self.run_searches(&mut pruner)?;
@@ -394,7 +422,9 @@ impl Plan<'_> {
         Ok(holders)
     }
 
-    fn queue_page_content(&mut self, page: &Dictionary, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner) -> RewriteResult<()> {
+    fn queue_page_content(
+        &mut self, page: &Dictionary, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner,
+    ) -> RewriteResult<()> {
         match page.get(b"Contents") {
             Ok(Object::Reference((number, _))) => {
                 let number = *number;
@@ -444,7 +474,9 @@ impl Plan<'_> {
 
     /// Something a used name led to. If it has content that falls back on this scope, or has its own in a holder that matters, queue it.
     /// A soft mask's group, a Type 3 font's glyphs and an appearance's states can all be direct.
-    fn follow(&mut self, value: &Object, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner, depth: usize) -> RewriteResult<()> {
+    fn follow(
+        &mut self, value: &Object, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner, depth: usize,
+    ) -> RewriteResult<()> {
         if depth > 8 {
             return Ok(());
         }
@@ -541,10 +573,9 @@ impl Plan<'_> {
                     if names.has(name)
                         && let Some(state) = pruner.holders.get_mut(holder)
                         && state.used.insert(name.to_vec())
+                        && let Ok(value) = names.get(name)
                     {
-                        if let Ok(value) = names.get(name) {
-                            newly_used.push(value.clone());
-                        }
+                        newly_used.push(value.clone());
                     }
                 }
             });
@@ -564,7 +595,10 @@ impl Plan<'_> {
                 if length > self.view.limits.max_stream_bytes {
                     return Ok(None);
                 }
-                let content = self.view.source.read_range(start, length, self.view.limits.max_stream_bytes)?;
+                let content = self
+                    .view
+                    .source
+                    .read_range(start, length, self.view.limits.max_stream_bytes)?;
                 (dict, content)
             }
             Some(Loaded::Stream(dict, StreamBody::Given)) => match self.objects.get(&number) {
@@ -615,8 +649,12 @@ impl Plan<'_> {
         let mut queue = Vec::new();
         for number in found {
             let Some(loaded) = self.peek(number)? else { continue };
-            let Some(dict) = loaded.dictionary().cloned() else { continue };
-            let Ok(resources) = dict.get(b"Resources").cloned() else { continue };
+            let Some(dict) = loaded.dictionary().cloned() else {
+                continue;
+            };
+            let Ok(resources) = dict.get(b"Resources").cloned() else {
+                continue;
+            };
             let scope = self.scope_within(&resources, number, pruner)?;
             if scope.is_empty() {
                 continue;
@@ -625,7 +663,9 @@ impl Plan<'_> {
         }
         for (number, loaded, dict, scope) in queue {
             let scope = Rc::new(scope);
-            let was_unused = scope.iter().any(|holder| pruner.holders.get(holder).is_some_and(|state| !state.has_user));
+            let was_unused = scope
+                .iter()
+                .any(|holder| pruner.holders.get(holder).is_some_and(|state| !state.has_user));
             for holder in scope.iter() {
                 if let Some(state) = pruner.holders.get_mut(holder) {
                     state.has_user = true;
@@ -682,9 +722,9 @@ impl Plan<'_> {
                 };
                 let Some(names) = names else { continue };
                 let before = names.len();
-                names
-                    .as_hashmap_mut()
-                    .retain(|name, _| state.used.contains(name) || NAMES_LOOKED_UP_IMPLICITLY.contains(&name.as_slice()));
+                names.as_hashmap_mut().retain(|name, _| {
+                    state.used.contains(name) || NAMES_LOOKED_UP_IMPLICITLY.contains(&name.as_slice())
+                });
                 changed |= names.len() != before;
             }
             if changed {
@@ -704,14 +744,18 @@ impl Plan<'_> {
     pub(super) fn finish_pruner(&mut self, pruner: Pruner) {
         for (holder, state) in &pruner.holders {
             if state.whole {
-                self.report.resources_left_whole.push((holder.object(), self.generation(holder.object())));
+                self.report
+                    .resources_left_whole
+                    .push((holder.object(), self.generation(holder.object())));
             } else if state.has_user
                 && let Some(base) = pruner.bases.get(&holder.object()).and_then(Loaded::dictionary)
                 && let Some(names) = holder.names(base)
             {
                 let gone = names
                     .iter()
-                    .filter(|(name, _)| !state.used.contains(*name) && !NAMES_LOOKED_UP_IMPLICITLY.contains(&name.as_slice()))
+                    .filter(|(name, _)| {
+                        !state.used.contains(*name) && !NAMES_LOOKED_UP_IMPLICITLY.contains(&name.as_slice())
+                    })
                     .count();
                 self.report.resource_names_pruned += gone as u64;
             }

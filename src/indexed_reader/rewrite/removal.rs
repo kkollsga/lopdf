@@ -174,7 +174,9 @@ impl Plan<'_> {
     /// Whether a destination ends at a removed page. A destination that names nothing known isn't this.
     fn destination_is_gone(&mut self, value: &Object, depth: usize) -> RewriteResult<bool> {
         Ok(match value {
-            Object::Array(items) => matches!(items.first(), Some(Object::Reference((number, _))) if self.dead.get(*number)),
+            Object::Array(items) => {
+                matches!(items.first(), Some(Object::Reference((number, _))) if self.dead.get(*number))
+            }
             Object::Reference(_) if depth < 8 => match self.deref(value)? {
                 Some(target) => self.destination_is_gone(&target, depth + 1)?,
                 None => false,
@@ -211,7 +213,8 @@ impl Plan<'_> {
             let holder = reference(catalog, b"Dests");
             if let Some(mut dests) = self.deref_dict(Some(&value))? {
                 let mut gone = Vec::new();
-                let entries: Vec<(Vec<u8>, Object)> = dests.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+                let entries: Vec<(Vec<u8>, Object)> =
+                    dests.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
                 for (name, value) in entries {
                     if self.destination_is_gone(&value, 0)? {
                         gone.push(name);
@@ -731,7 +734,8 @@ impl Plan<'_> {
             Ok(kids) => self.deref(&kids.clone())?,
             Err(_) => None,
         };
-        let had_kids = !matches!(&kids, None | Some(Object::Null)) && !matches!(&kids, Some(Object::Array(items)) if items.is_empty());
+        let had_kids = !matches!(&kids, None | Some(Object::Null))
+            && !matches!(&kids, Some(Object::Array(items)) if items.is_empty());
         let any_stays = match kids {
             Some(kids) => self.structure_alive(kids)?,
             None => false,
@@ -845,8 +849,7 @@ impl Plan<'_> {
                 }
             };
             if element.has_type(b"MCR") || element.has_type(b"OBJR") {
-                let dead_reference =
-                    |key: &[u8]| matches!(element.get(key), Ok(Object::Reference((number, _))) if self.dead.get(*number));
+                let dead_reference = |key: &[u8]| matches!(element.get(key), Ok(Object::Reference((number, _))) if self.dead.get(*number));
                 let alive = !(dead_reference(b"Pg") || dead_reference(b"Obj") || (page_gone && !element.has(b"Pg")));
                 if let Some(frame) = stack.last_mut() {
                     frame.any |= alive;
@@ -889,8 +892,9 @@ impl Plan<'_> {
             }
             let position = i64::try_from(old_index).unwrap_or(i64::MAX);
             let range_at = ranges.partition_point(|(start, _)| *start <= position);
-            let continues =
-                previous.is_some_and(|(previous_old, previous_range)| previous_old + 1 == old_index && previous_range == range_at);
+            let continues = previous.is_some_and(|(previous_old, previous_range)| {
+                previous_old + 1 == old_index && previous_range == range_at
+            });
             if !continues {
                 let mut label = Dictionary::new();
                 if let Some((start, dict)) = range_at.checked_sub(1).and_then(|at| ranges.get(at)) {
@@ -1006,7 +1010,11 @@ impl Plan<'_> {
         if ring.iter().all(|(_, gone)| !gone) {
             return Ok(true);
         }
-        let kept: Vec<u32> = ring.iter().filter(|(_, gone)| !gone).map(|(number, _)| *number).collect();
+        let kept: Vec<u32> = ring
+            .iter()
+            .filter(|(_, gone)| !gone)
+            .map(|(number, _)| *number)
+            .collect();
         for (number, gone) in &ring {
             if *gone && self.dead.set(*number) {
                 self.report.thread_beads += 1;

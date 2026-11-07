@@ -597,7 +597,6 @@ impl<'r, 'c> RewriteChanges<'r, 'c> {
         let plan = Plan::prepare(self, policy, false)?;
         write_plan(reader, plan, out).map(|(summary, _)| summary)
     }
-
 }
 
 /// How [`rewrite_atomically`] treats what it replaces, and what it may do. As with [`AppendOptions`], a replaced file is
@@ -608,9 +607,12 @@ impl<'r, 'c> RewriteChanges<'r, 'c> {
 #[must_use]
 pub struct RewriteOptions<'h> {
     policy: RewritePolicy,
-    prepare: Option<Box<dyn FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()> + 'h>>,
+    prepare: Option<PrepareReplacement<'h>>,
     allow_breaking_hard_links: bool,
 }
+
+#[cfg(any(unix, windows))]
+type PrepareReplacement<'h> = Box<dyn FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()> + 'h>;
 
 #[cfg(any(unix, windows))]
 impl<'h> RewriteOptions<'h> {
@@ -774,9 +776,7 @@ where
 
 /// Whether this destination puts the new file over the file the reader has open, whatever it was called.
 #[cfg(any(unix, windows))]
-fn is_original(
-    reader: &IndexedReader, destination: &AppendDestination<'_>, seen: Option<&std::fs::Metadata>,
-) -> bool {
+fn is_original(reader: &IndexedReader, destination: &AppendDestination<'_>, seen: Option<&std::fs::Metadata>) -> bool {
     match destination {
         AppendDestination::SameFile(_) => true,
         _ => seen.is_some_and(|metadata| reader.whole_file_source().is_same_file(metadata) == Some(true)),

@@ -3,8 +3,8 @@
 
 use lopdf::{
     AppendDestination, AppendError, BytesSource, Dictionary, FileSource, IndexedReader, IndexedSignatureKind, Object,
-    RewriteChanges, RewriteError, RewriteForm, RewriteFormChoice, RewriteOptions, RewritePolicy, RewriteSummary, Stream,
-    dictionary, rewrite_atomically,
+    RewriteChanges, RewriteError, RewriteForm, RewriteFormChoice, RewriteOptions, RewritePolicy, RewriteSummary,
+    Stream, dictionary, rewrite_atomically,
 };
 use std::path::Path;
 
@@ -97,7 +97,10 @@ fn rich_objects() -> Vec<Obj> {
             "<< /Font << /F1 7 0 R >> /XObject << /Keep 10 0 R /Shared 11 0 R /Gone 12 0 R >> \
              /Properties << /KeepOC 60 0 R /GoneOC 61 0 R >> >>",
         ),
-        obj(7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Note (K_FONT) >>"),
+        obj(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Note (K_FONT) >>",
+        ),
         page(3, "/Contents 13 0 R /Annots [14 0 R 15 0 R] /StructParents 0"),
         page(
             4,
@@ -195,7 +198,10 @@ fn rich_objects() -> Vec<Obj> {
             32,
             "<< /Limits [(A_keep) (M_DESTNAME)] /Names [(A_keep) [3 0 R /Fit] (M_DESTNAME) [4 0 R /Fit]] >>",
         ),
-        obj(34, "<< /Limits [(M_DEST_ONLY) (M_DEST_ONLY)] /Names [(M_DEST_ONLY) 35 0 R] >>"),
+        obj(
+            34,
+            "<< /Limits [(M_DEST_ONLY) (M_DEST_ONLY)] /Names [(M_DEST_ONLY) 35 0 R] >>",
+        ),
         obj(35, "<< /D [4 0 R /Fit] >>"),
         obj(33, "<< /OldKeep [5 0 R /Fit] /M_OLDDEST [4 0 R /Fit] >>"),
         // Tagged content, on one page, on the other, and over both.
@@ -203,8 +209,14 @@ fn rich_objects() -> Vec<Obj> {
             50,
             "<< /Type /StructTreeRoot /K [51 0 R 52 0 R 53 0 R] /ParentTree 54 0 R /IDTree 55 0 R /ParentTreeNextKey 8 >>",
         ),
-        obj(51, "<< /S /P /P 50 0 R /Pg 3 0 R /K 0 /ActualText (K_ACTUAL) /ID (keepid) >>"),
-        obj(52, "<< /S /P /P 50 0 R /Pg 4 0 R /K 0 /ActualText (M_ACTUAL) /ID (M_IDKEY) >>"),
+        obj(
+            51,
+            "<< /S /P /P 50 0 R /Pg 3 0 R /K 0 /ActualText (K_ACTUAL) /ID (keepid) >>",
+        ),
+        obj(
+            52,
+            "<< /S /P /P 50 0 R /Pg 4 0 R /K 0 /ActualText (M_ACTUAL) /ID (M_IDKEY) >>",
+        ),
         obj(
             53,
             "<< /S /Sect /P 50 0 R /K [ << /Type /MCR /Pg 5 0 R /MCID 0 >> << /Type /MCR /Pg 4 0 R /MCID 1 >> 56 0 R ] >>",
@@ -213,19 +225,22 @@ fn rich_objects() -> Vec<Obj> {
             56,
             "<< /S /Figure /P 53 0 R /Pg 4 0 R /Alt (M_ALT) /K << /Type /OBJR /Obj 19 0 R /Pg 4 0 R >> >>",
         ),
-        obj(
-            54,
-            "<< /Nums [0 [51 0 R] 1 [52 0 R 53 0 R] 2 [53 0 R] 7 56 0 R] >>",
-        ),
+        obj(54, "<< /Nums [0 [51 0 R] 1 [52 0 R 53 0 R] 2 [53 0 R] 7 56 0 R] >>"),
         obj(55, "<< /Names [(M_IDKEY) 52 0 R (keepid) 51 0 R] >>"),
         // Layers: one used on a kept page, one only on the removed page.
         obj(60, "<< /Type /OCG /Name (K_LAYER) >>"),
         obj(61, "<< /Type /OCG /Name (M_LAYER) >>"),
         // Threads: one all on the removed page, one running through it.
         obj(70, "<< /Type /Thread /F 72 0 R /I << /Title (M_THREAD) >> >>"),
-        obj(72, "<< /Type /Bead /T 70 0 R /N 72 0 R /V 72 0 R /P 4 0 R /R [0 0 9 9] >>"),
+        obj(
+            72,
+            "<< /Type /Bead /T 70 0 R /N 72 0 R /V 72 0 R /P 4 0 R /R [0 0 9 9] >>",
+        ),
         obj(71, "<< /Type /Thread /F 73 0 R /I << /Title (K_THREAD) >> >>"),
-        obj(73, "<< /Type /Bead /T 71 0 R /N 74 0 R /V 75 0 R /P 3 0 R /R [0 0 9 9] >>"),
+        obj(
+            73,
+            "<< /Type /Bead /T 71 0 R /N 74 0 R /V 75 0 R /P 3 0 R /R [0 0 9 9] >>",
+        ),
         obj(74, "<< /Type /Bead /N 75 0 R /V 73 0 R /P 4 0 R /R [0 0 9 9] >>"),
         obj(75, "<< /Type /Bead /N 73 0 R /V 74 0 R /P 5 0 R /R [0 0 9 9] >>"),
         // Nothing refers to these, and in the compressed forms the first shares an object stream with what's live.
@@ -283,7 +298,9 @@ fn rewrite_with(
     (output, summary, after)
 }
 
-fn rewrite(bytes: &[u8], change: impl FnOnce(&mut RewriteChanges<'_, 'static>)) -> (Vec<u8>, RewriteSummary, IndexedReader) {
+fn rewrite(
+    bytes: &[u8], change: impl FnOnce(&mut RewriteChanges<'_, 'static>),
+) -> (Vec<u8>, RewriteSummary, IndexedReader) {
     rewrite_with(bytes, RewritePolicy::new(), change)
 }
 
@@ -303,10 +320,7 @@ fn gone(reader: &IndexedReader, number: u32) -> bool {
 fn assert_markers(output: &[u8], gone: &[&str], kept: &[&str]) {
     let streams = every_decoded_stream(output);
     for marker in gone {
-        assert!(
-            !holds_marker(output, &streams, marker),
-            "{marker} is still in the file"
-        );
+        assert!(!holds_marker(output, &streams, marker), "{marker} is still in the file");
     }
     for marker in kept {
         assert!(holds_marker(output, &streams, marker), "{marker} went missing");
@@ -335,8 +349,16 @@ fn nothing_of_a_removed_page_or_an_old_revision_stays_in_the_file() {
     for form in ALL_FORMS {
         let bytes = rich_document(form);
         let streams = every_decoded_stream(&bytes);
-        for marker in GONE.iter().filter(|marker| **marker != "M_ORDER_LABEL_NOT_THIS").chain(&HIDDEN).chain(&KEPT) {
-            assert!(holds_marker(&bytes, &streams, marker), "{marker} isn't in the {form:?} fixture");
+        for marker in GONE
+            .iter()
+            .filter(|marker| **marker != "M_ORDER_LABEL_NOT_THIS")
+            .chain(&HIDDEN)
+            .chain(&KEPT)
+        {
+            assert!(
+                holds_marker(&bytes, &streams, marker),
+                "{marker} isn't in the {form:?} fixture"
+            );
         }
         let (output, summary, after) = rewrite(&bytes, remove_second_page);
         dump(&format!("rich_{form:?}.pdf"), &output);
@@ -346,8 +368,14 @@ fn nothing_of_a_removed_page_or_an_old_revision_stays_in_the_file() {
         assert_eq!(after.page_count().unwrap(), 2, "{form:?}");
         assert_eq!(summary.removal.pages, vec![(4, 0)]);
         // What a viewer starts from has to be whole too.
-        assert!(after.revisions().unwrap().revisions.len() == 1, "{form:?}: more than one revision");
-        assert!(!after.index_stats().unwrap().recovered(), "{form:?}: it needed a rescan");
+        assert!(
+            after.revisions().unwrap().revisions.len() == 1,
+            "{form:?}: more than one revision"
+        );
+        assert!(
+            !after.index_stats().unwrap().recovered(),
+            "{form:?}: it needed a rescan"
+        );
     }
 }
 
@@ -364,7 +392,12 @@ fn a_rewrite_with_no_changes_still_leaves_only_what_is_reachable() {
         assert_markers(&output, &[], &["M_CONTENT", "M_ANNOT", "M_LAYER"]);
         assert_eq!(after.page_count().unwrap(), 3);
         assert!(summary.objects_dropped >= 2, "{form:?}: {}", summary.objects_dropped);
-        assert!(summary.new_len < bytes.len() as u64, "{form:?}: {} from {}", summary.new_len, bytes.len());
+        assert!(
+            summary.new_len < bytes.len() as u64,
+            "{form:?}: {} from {}",
+            summary.new_len,
+            bytes.len()
+        );
     }
 }
 
@@ -386,10 +419,16 @@ fn a_replaced_object_is_gone_too() {
         builder.finish_revision(form, "/Root 1 0 R");
         let (output, _, after) = rewrite(&builder.bytes, |changes| {
             changes
-                .write_object((4, 0), Object::Dictionary(dictionary! { "Text" => Object::string_literal("K_NEW_TEXT") }))
+                .write_object(
+                    (4, 0),
+                    Object::Dictionary(dictionary! { "Text" => Object::string_literal("K_NEW_TEXT") }),
+                )
                 .unwrap();
             changes
-                .write_object((6, 0), Object::Stream(Stream::new(Dictionary::new(), b"(K_NEW_STREAM) Tj".to_vec())))
+                .write_object(
+                    (6, 0),
+                    Object::Stream(Stream::new(Dictionary::new(), b"(K_NEW_STREAM) Tj".to_vec())),
+                )
                 .unwrap();
         });
         assert_markers(
@@ -397,7 +436,18 @@ fn a_replaced_object_is_gone_too() {
             &["M_REPLACED_DIRECT", "M_REPLACED_STREAM"],
             &["K_NEW_TEXT", "K_NEW_STREAM", "K_NEIGHBOUR"],
         );
-        assert_eq!(after.resolve_object((4, 0)).unwrap().as_dict().unwrap().get(b"Text").unwrap().as_str().unwrap(), b"K_NEW_TEXT");
+        assert_eq!(
+            after
+                .resolve_object((4, 0))
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Text")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            b"K_NEW_TEXT"
+        );
     }
 }
 
@@ -410,7 +460,10 @@ fn links_to_a_removed_page_go_and_others_stay() {
     assert_eq!(summary.removal.links, 1);
     assert!(gone(&after, 14));
     let page = dict(&after, 3);
-    assert_eq!(page.get(b"Annots").unwrap().as_array().unwrap(), &vec![Object::Reference((15, 0))]);
+    assert_eq!(
+        page.get(b"Annots").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((15, 0))]
+    );
     assert_eq!(summary.removal.annotations, 4);
     for number in [19, 21, 22, 47] {
         assert!(gone(&after, number), "{number}");
@@ -422,7 +475,10 @@ fn links_to_a_removed_page_go_and_others_stay() {
 #[test]
 fn bookmarks_keep_their_shape_around_what_went() {
     let (_, summary, after) = rewrite(&rich_document(Form::Compressed), remove_second_page);
-    assert_eq!(summary.removal.outline_items, 4, "the bookmark, its named child, the heading and its child");
+    assert_eq!(
+        summary.removal.outline_items, 4,
+        "the bookmark, its named child, the heading and its child"
+    );
     assert_eq!(summary.removal.outline_items_promoted, 1);
     for number in [24, 25, 27, 28, 93] {
         assert!(gone(&after, number), "{number}");
@@ -438,7 +494,10 @@ fn bookmarks_keep_their_shape_around_what_went() {
     let child = dict(&after, 26);
     assert_eq!(reference(&child, b"Parent"), 20);
     assert_eq!(reference(&child, b"Prev"), 23);
-    assert!(!child.has(b"Next"), "the sibling it had went, and nothing took its place");
+    assert!(
+        !child.has(b"Next"),
+        "the sibling it had went, and nothing took its place"
+    );
 }
 
 /// All bookmarks on removed pages leaving an empty /Outlines behind, which some viewers show as an empty panel.
@@ -464,7 +523,10 @@ fn two_pages(catalog: &str, objects: &[Obj], first: &str, second: &str) -> Vec<u
     let mut builder = Builder::new(500);
     let mut all = vec![
         obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>")),
-        obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>"),
+        obj(
+            2,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>",
+        ),
         obj(3, &format!("<< /Type /Page /Parent 2 0 R {first} >>")),
         obj(4, &format!("<< /Type /Page /Parent 2 0 R {second} >>")),
     ];
@@ -480,7 +542,11 @@ fn two_pages(catalog: &str, objects: &[Obj], first: &str, second: &str) -> Vec<u
 fn destination_names_go_with_their_page() {
     let (output, summary, after) = rewrite(&rich_document(Form::Table), remove_second_page);
     assert_eq!(summary.removal.named_destinations, 3);
-    assert_markers(&output, &["M_DESTNAME", "M_DEST_ONLY", "M_OLDDEST"], &["A_keep", "OldKeep"]);
+    assert_markers(
+        &output,
+        &["M_DESTNAME", "M_DEST_ONLY", "M_OLDDEST"],
+        &["A_keep", "OldKeep"],
+    );
     assert!(gone(&after, 34), "the leaf with nothing left");
     let kept = dict(&after, 32);
     assert_eq!(
@@ -498,18 +564,40 @@ fn an_annotation_goes_with_its_page_whatever_else_names_it_unless_a_kept_page_li
     let bytes = two_pages(
         "/AcroForm << /Fields [10 0 R] >> /StructTreeRoot << /K [13 0 R] >>",
         &[
-            obj(10, "<< /Type /Annot /Subtype /Widget /Rect [0 0 9 9] /FT /Tx /V (M_NO_P) >>"),
-            obj(11, "<< /Type /Annot /Subtype /Text /Rect [0 0 9 9] /Popup 12 0 R /Contents (K_MARKUP) >>"),
-            obj(12, "<< /Type /Annot /Subtype /Popup /Rect [0 0 9 9] /Contents (M_POPUP_THERE) >>"),
-            obj(13, "<< /S /Figure /K [<< /Type /OBJR /Obj 14 0 R >> << /Type /OBJR /Obj 15 0 R >>] >>"),
-            obj(14, "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /Contents (M_STAMP) >>"),
-            obj(15, "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /Contents (K_ON_BOTH) >>"),
+            obj(
+                10,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 9 9] /FT /Tx /V (M_NO_P) >>",
+            ),
+            obj(
+                11,
+                "<< /Type /Annot /Subtype /Text /Rect [0 0 9 9] /Popup 12 0 R /Contents (K_MARKUP) >>",
+            ),
+            obj(
+                12,
+                "<< /Type /Annot /Subtype /Popup /Rect [0 0 9 9] /Contents (M_POPUP_THERE) >>",
+            ),
+            obj(
+                13,
+                "<< /S /Figure /K [<< /Type /OBJR /Obj 14 0 R >> << /Type /OBJR /Obj 15 0 R >>] >>",
+            ),
+            obj(
+                14,
+                "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /Contents (M_STAMP) >>",
+            ),
+            obj(
+                15,
+                "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /Contents (K_ON_BOTH) >>",
+            ),
         ],
         "/Annots [11 0 R 15 0 R]",
         "/Annots [10 0 R 12 0 R 14 0 R 15 0 R]",
     );
     let (output, summary, after) = rewrite(&bytes, remove_second_page);
-    assert_markers(&output, &["M_NO_P", "M_POPUP_THERE", "M_STAMP"], &["K_MARKUP", "K_ON_BOTH"]);
+    assert_markers(
+        &output,
+        &["M_NO_P", "M_POPUP_THERE", "M_STAMP"],
+        &["K_MARKUP", "K_ON_BOTH"],
+    );
     assert_eq!(summary.removal.annotations, 3);
     assert!(!dict(&after, 1).has(b"AcroForm"));
     assert!(!dict(&after, 11).has(b"Popup"));
@@ -525,10 +613,16 @@ fn a_go_to_by_name_counts_as_going_there() {
         "/Dests << /Secret [4 0 R /Fit] /Open [3 0 R /Fit] >> /Outlines 10 0 R",
         &[
             obj(10, "<< /First 11 0 R /Last 12 0 R /Count 2 >>"),
-            obj(11, "<< /Title (M_BY_NAME) /Parent 10 0 R /Next 12 0 R /A << /S /GoTo /D /Secret >> >>"),
+            obj(
+                11,
+                "<< /Title (M_BY_NAME) /Parent 10 0 R /Next 12 0 R /A << /S /GoTo /D /Secret >> >>",
+            ),
             obj(12, "<< /Title (K_BY_NAME) /Parent 10 0 R /Prev 11 0 R /A 13 0 R >>"),
             obj(13, "<< /S /GoTo /D /Open >>"),
-            obj(14, "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A 15 0 R /Contents (M_LINK_NAMED) >>"),
+            obj(
+                14,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A 15 0 R /Contents (M_LINK_NAMED) >>",
+            ),
             obj(15, "<< /S /GoTo /D /Secret >>"),
         ],
         "/Annots [14 0 R]",
@@ -536,7 +630,11 @@ fn a_go_to_by_name_counts_as_going_there() {
     );
     let (output, summary, after) = rewrite(&bytes, remove_second_page);
     assert_eq!(summary.removal.links, 1);
-    assert_markers(&output, &["M_BY_NAME", "M_LINK_NAMED", "Secret"], &["K_BY_NAME", "Open"]);
+    assert_markers(
+        &output,
+        &["M_BY_NAME", "M_LINK_NAMED", "Secret"],
+        &["K_BY_NAME", "Open"],
+    );
     assert!(gone(&after, 15));
 }
 
@@ -545,17 +643,31 @@ fn a_go_to_by_name_counts_as_going_there() {
 fn an_open_action_and_named_trees_to_a_removed_page_go() {
     let bytes = two_pages(
         "/OpenAction 10 0 R /Names << /Dests << /Names [(x) [4 0 R /Fit]] >> /Pages << /Names [(pagename) 4 0 R (pagekeep) 3 0 R] >> >> /AA << /WC << /S /GoTo /D [4 0 R /Fit] >> >>",
-        &[obj(10, "<< /S /GoTo /D [4 0 R /Fit] /Next << /S /URI /URI (M_AFTER) >> >>")],
+        &[obj(
+            10,
+            "<< /S /GoTo /D [4 0 R /Fit] /Next << /S /URI /URI (M_AFTER) >> >>",
+        )],
         "",
         "",
     );
     let (output, _, after) = rewrite(&bytes, remove_second_page);
     let catalog = dict(&after, 1);
-    assert!(!catalog.has(b"OpenAction"), "the action object has nowhere to go, so the reference to it goes");
+    assert!(
+        !catalog.has(b"OpenAction"),
+        "the action object has nowhere to go, so the reference to it goes"
+    );
     assert!(gone(&after, 10));
     let names = catalog.get(b"Names").unwrap().as_dict().unwrap();
     assert!(!names.has(b"Dests"));
-    let pages = names.get(b"Pages").unwrap().as_dict().unwrap().get(b"Names").unwrap().as_array().unwrap();
+    let pages = names
+        .get(b"Pages")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Names")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(pages.len(), 2);
     assert!(!catalog.get(b"AA").unwrap().as_dict().unwrap().has(b"WC"));
     assert_markers(&output, &["M_AFTER", "pagename"], &["pagekeep"]);
@@ -566,14 +678,27 @@ fn an_open_action_and_named_trees_to_a_removed_page_go() {
 #[test]
 fn form_fields_go_with_their_widgets() {
     let (output, summary, after) = rewrite(&rich_document(Form::Table), remove_second_page);
-    assert_eq!(summary.removal.form_fields, 4, "two fields that went, and the widgets of two fields");
+    assert_eq!(
+        summary.removal.form_fields, 4,
+        "two fields that went, and the widgets of two fields"
+    );
     assert!(summary.removal.xfa_dropped);
     let form = dict(&after, 40);
-    assert_eq!(form.get(b"Fields").unwrap().as_array().unwrap(), &vec![Object::Reference((43, 0))]);
+    assert_eq!(
+        form.get(b"Fields").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((43, 0))]
+    );
     assert!(form.get(b"CO").unwrap().as_array().unwrap().is_empty());
     assert!(!form.has(b"XFA"));
-    assert_eq!(dict(&after, 43).get(b"Kids").unwrap().as_array().unwrap(), &vec![Object::Reference((42, 0))]);
-    assert_markers(&output, &["M_FIELD_VALUE", "M_FIELD_PARENT", "M_WIDGET_AP", "M_XFA"], &["K_FIELD"]);
+    assert_eq!(
+        dict(&after, 43).get(b"Kids").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((42, 0))]
+    );
+    assert_markers(
+        &output,
+        &["M_FIELD_VALUE", "M_FIELD_PARENT", "M_WIDGET_AP", "M_XFA"],
+        &["K_FIELD"],
+    );
 }
 
 /// /AcroForm left in place with no fields, which makes viewers show a form bar for a document with no form.
@@ -581,7 +706,10 @@ fn form_fields_go_with_their_widgets() {
 fn no_fields_left_means_no_form() {
     let bytes = two_pages(
         "/AcroForm << /Fields [10 0 R] >>",
-        &[obj(10, "<< /Type /Annot /Subtype /Widget /Rect [0 0 9 9] /FT /Tx /V (M_V) /P 4 0 R >>")],
+        &[obj(
+            10,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 9 9] /FT /Tx /V (M_V) /P 4 0 R >>",
+        )],
         "",
         "/Annots [10 0 R]",
     );
@@ -602,11 +730,17 @@ fn the_structure_tree_keeps_only_what_is_on_kept_pages() {
     let mixed = dict(&after, 53);
     let kids = mixed.get(b"K").unwrap().as_array().unwrap();
     assert_eq!(kids.len(), 1, "only what's on the kept page is left");
-    assert_eq!(kids[0].as_dict().unwrap().get(b"Pg").unwrap().as_reference().unwrap().0, 5);
+    assert_eq!(
+        kids[0].as_dict().unwrap().get(b"Pg").unwrap().as_reference().unwrap().0,
+        5
+    );
     assert!(dict(&after, 51).has(b"Pg"));
     let nums = dict(&after, 54);
     let nums = nums.get(b"Nums").unwrap().as_array().unwrap();
-    assert_eq!(summary.removal.parent_tree_entries, 2, "the page's own and its annotation's");
+    assert_eq!(
+        summary.removal.parent_tree_entries, 2,
+        "the page's own and its annotation's"
+    );
     assert_eq!(nums.len(), 4, "{nums:?}");
     assert_eq!(nums[0], Object::Integer(0));
     assert_markers(&output, &["M_ACTUAL", "M_ALT", "M_IDKEY"], &["K_ACTUAL", "keepid"]);
@@ -628,8 +762,19 @@ fn a_parent_tree_array_keeps_its_positions() {
     let (output, _, after) = rewrite(&bytes, remove_second_page);
     let catalog = dict(&after, 1);
     let tree = catalog.get(b"StructTreeRoot").unwrap().as_dict().unwrap();
-    let nums = tree.get(b"ParentTree").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
-    assert_eq!(nums[1].as_array().unwrap(), &vec![Object::Reference((10, 0)), Object::Null, Object::Reference((10, 0))]);
+    let nums = tree
+        .get(b"ParentTree")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Nums")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        nums[1].as_array().unwrap(),
+        &vec![Object::Reference((10, 0)), Object::Null, Object::Reference((10, 0))]
+    );
     assert_markers(&output, &["M_T"], &[]);
 }
 
@@ -640,7 +785,16 @@ fn every_kept_page_keeps_its_label() {
     assert!(summary.removal.page_labels_rebuilt);
     assert_markers(&output, &["M_LABEL"], &[]);
     let labels = dict(&after, 1);
-    let nums = labels.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap().clone();
+    let nums = labels
+        .get(b"PageLabels")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Nums")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone();
     assert_eq!(nums.len(), 4, "{nums:?}");
     assert_eq!(nums[0], Object::Integer(0));
     assert_eq!(nums[1].as_dict().unwrap().get(b"S").unwrap().as_name().unwrap(), b"r");
@@ -655,8 +809,14 @@ fn every_kept_page_keeps_its_label() {
 fn a_gap_inside_a_label_range_starts_a_new_one_at_the_right_number() {
     let mut builder = Builder::new(500);
     let mut objects = vec![
-        obj(1, "<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /D /St 10 >>] >> >>"),
-        obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 /MediaBox [0 0 9 9] >>"),
+        obj(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /D /St 10 >>] >> >>",
+        ),
+        obj(
+            2,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 /MediaBox [0 0 9 9] >>",
+        ),
     ];
     for number in 3..=6 {
         objects.push(obj(number, "<< /Type /Page /Parent 2 0 R >>"));
@@ -665,7 +825,15 @@ fn a_gap_inside_a_label_range_starts_a_new_one_at_the_right_number() {
     builder.finish_revision(Form::Table, "/Root 1 0 R");
     let (_, _, after) = rewrite(&builder.bytes, remove_second_page);
     let catalog = dict(&after, 1);
-    let nums = catalog.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
+    let nums = catalog
+        .get(b"PageLabels")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Nums")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(nums.len(), 4, "{nums:?}");
     assert_eq!(nums[1].as_dict().unwrap().get(b"St").unwrap().as_i64().unwrap(), 10);
     assert_eq!(nums[2], Object::Integer(1));
@@ -681,9 +849,15 @@ fn a_layer_only_a_removed_page_used_goes() {
     assert!(gone(&after, 61));
     let catalog = dict(&after, 1);
     let layers = catalog.get(b"OCProperties").unwrap().as_dict().unwrap();
-    assert_eq!(layers.get(b"OCGs").unwrap().as_array().unwrap(), &vec![Object::Reference((60, 0))]);
+    assert_eq!(
+        layers.get(b"OCGs").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((60, 0))]
+    );
     let config = layers.get(b"D").unwrap().as_dict().unwrap();
-    assert_eq!(config.get(b"ON").unwrap().as_array().unwrap(), &vec![Object::Reference((60, 0))]);
+    assert_eq!(
+        config.get(b"ON").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((60, 0))]
+    );
     assert_markers(&output, &["M_LAYER"], &["K_LAYER"]);
 }
 
@@ -693,7 +867,10 @@ fn article_threads_close_up_around_what_went() {
     let (output, summary, after) = rewrite(&rich_document(Form::Table), remove_second_page);
     assert_eq!(summary.removal.thread_beads, 2);
     assert_eq!(summary.removal.threads, 1);
-    assert_eq!(dict(&after, 1).get(b"Threads").unwrap().as_array().unwrap(), &vec![Object::Reference((71, 0))]);
+    assert_eq!(
+        dict(&after, 1).get(b"Threads").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((71, 0))]
+    );
     let first = dict(&after, 73);
     assert_eq!(first.get(b"N").unwrap().as_reference().unwrap().0, 75);
     assert_eq!(first.get(b"V").unwrap().as_reference().unwrap().0, 75);
@@ -744,7 +921,11 @@ fn a_form_on_both_pages_stays_whole() {
         &[
             deflated(10, "", b"/Both Do"),
             deflated(11, "", b"/Both Do (M_ONLY_ON_REMOVED) Tj"),
-            deflated(12, "/Subtype /Form /BBox [0 0 9 9] /Resources << /XObject << /Inner 13 0 R >> >>", b"/Inner Do (K_FORM)"),
+            deflated(
+                12,
+                "/Subtype /Form /BBox [0 0 9 9] /Resources << /XObject << /Inner 13 0 R >> >>",
+                b"/Inner Do (K_FORM)",
+            ),
             deflated(13, "/Subtype /Form /BBox [0 0 9 9]", b"(K_INNER)"),
         ],
         "",
@@ -828,10 +1009,17 @@ fn everything_that_falls_back_on_the_page_resources_counts() {
     let form = "/Subtype /Form /BBox [0 0 9 9]";
     let bytes = resource_sharing(
         &[
-            obj(5, "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /AP << /N 6 0 R /D << /On 7 0 R >> >> >>"),
+            obj(
+                5,
+                "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /AP << /N 6 0 R /D << /On 7 0 R >> >> >>",
+            ),
             deflated(6, form, b"/FromAppearance Do"),
             deflated(7, form, b"/FromAppearanceState Do"),
-            deflated(10, "", b"BT /T3 1 Tf /T3Direct 1 Tf ET /Mask gs /MaskDirect gs /Tile scn"),
+            deflated(
+                10,
+                "",
+                b"BT /T3 1 Tf /T3Direct 1 Tf ET /Mask gs /MaskDirect gs /Tile scn",
+            ),
             deflated(11, "", b"/Secret Do"),
             obj(20, "<< /Type /Font /Subtype /Type3 /CharProcs << /a 21 0 R >> >>"),
             deflated(21, "", b"/FromGlyph Do"),
@@ -861,7 +1049,15 @@ fn everything_that_falls_back_on_the_page_resources_counts() {
     assert_markers(
         &output,
         &["M_SECRET"],
-        &["K_APPEARANCE", "K_STATE", "K_GLYPH", "K_DIRECT_GLYPH", "K_MASK", "K_DIRECT_MASK", "K_PATTERN"],
+        &[
+            "K_APPEARANCE",
+            "K_STATE",
+            "K_GLYPH",
+            "K_DIRECT_GLYPH",
+            "K_MASK",
+            "K_DIRECT_MASK",
+            "K_PATTERN",
+        ],
     );
 }
 
@@ -869,13 +1065,25 @@ fn everything_that_falls_back_on_the_page_resources_counts() {
 /// form's text can't be drawn again. Or /Resources in something direct, which says nothing about what it uses.
 #[test]
 fn what_a_search_cannot_see_keeps_the_dictionary_whole() {
-    for catalog in ["/AcroForm << /Fields [] /DR << /Font 9 0 R >> >>", "/Odd [<< /Resources << /Font 9 0 R >> >>]"] {
+    for catalog in [
+        "/AcroForm << /Fields [] /DR << /Font 9 0 R >> >>",
+        "/Odd [<< /Resources << /Font 9 0 R >> >>]",
+    ] {
         let mut builder = Builder::new(500);
         let objects = vec![
             obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>")),
-            obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>"),
-            obj(3, "<< /Type /Page /Parent 2 0 R /Contents 10 0 R /Resources << /Font 9 0 R >> >>"),
-            obj(4, "<< /Type /Page /Parent 2 0 R /Contents 11 0 R /Resources << /Font 9 0 R >> >>"),
+            obj(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>",
+            ),
+            obj(
+                3,
+                "<< /Type /Page /Parent 2 0 R /Contents 10 0 R /Resources << /Font 9 0 R >> >>",
+            ),
+            obj(
+                4,
+                "<< /Type /Page /Parent 2 0 R /Contents 11 0 R /Resources << /Font 9 0 R >> >>",
+            ),
             obj(9, "<< /Used 20 0 R /Helv 21 0 R >>"),
             deflated(10, "", b"/Used 1 Tf"),
             deflated(11, "", b"/Used 1 Tf"),
@@ -1020,7 +1228,10 @@ fn the_page_tree_stays_right_when_a_parent_goes() {
         assert!(gone(&after, 10));
         assert_markers(&output, &["M_FONT_ONE", "K_FORM_ON_OTHER"], &["K_FONT_TWO"]);
         let root = dict(&after, 2);
-        assert_eq!(root.get(b"Kids").unwrap().as_array().unwrap(), &vec![Object::Reference((11, 0))]);
+        assert_eq!(
+            root.get(b"Kids").unwrap().as_array().unwrap(),
+            &vec![Object::Reference((11, 0))]
+        );
         assert_eq!(root.get(b"Count").unwrap().as_i64().unwrap(), 1);
         // The page that's left still inherits from the parent that's left.
         let map = after.page_map().unwrap();
@@ -1050,7 +1261,10 @@ fn a_node_a_kept_page_inherits_from_by_parent_stays() {
     let objects = vec![
         obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
         obj(2, "<< /Type /Pages /Kids [10 0 R 11 0 R] /Count 2 >>"),
-        obj(10, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /MediaBox [0 0 100 100] >>"),
+        obj(
+            10,
+            "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /MediaBox [0 0 100 100] >>",
+        ),
         obj(11, "<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 1 >>"),
         // Listed under 11, inherits from 10.
         obj(3, "<< /Type /Page /Parent 10 0 R >>"),
@@ -1070,7 +1284,10 @@ fn a_page_listed_twice_goes_from_both_places() {
     let mut builder = Builder::new(500);
     let objects = vec![
         obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-        obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 3 0 R] /Count 3 /MediaBox [0 0 9 9] >>"),
+        obj(
+            2,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 3 0 R] /Count 3 /MediaBox [0 0 9 9] >>",
+        ),
         obj(3, "<< /Type /Page /Parent 2 0 R /Note (M_TWICE) >>"),
         obj(4, "<< /Type /Page /Parent 2 0 R >>"),
     ];
@@ -1090,7 +1307,10 @@ fn pages_that_cannot_be_removed_are_refused() {
     let mut changes = RewriteChanges::new(&reader).unwrap();
     changes.remove_page(0);
     changes.remove_page(1);
-    assert!(matches!(changes.write_to(RewritePolicy::new(), std::io::sink()), Err(RewriteError::NoPagesLeft)));
+    assert!(matches!(
+        changes.write_to(RewritePolicy::new(), std::io::sink()),
+        Err(RewriteError::NoPagesLeft)
+    ));
     let mut changes = RewriteChanges::new(&reader).unwrap();
     changes.remove_page(2);
     assert!(matches!(
@@ -1108,11 +1328,17 @@ fn a_page_reached_by_ten_paths_is_gone_from_all_of_them() {
          /Outlines 10 0 R /Names << /Pages << /Names [(p) 4 0 R] >> >> /StructTreeRoot << /K [12 0 R] >> /Threads [13 0 R]",
         &[
             obj(10, "<< /First 11 0 R /Last 11 0 R /Count 1 >>"),
-            obj(11, "<< /Title (K_KEPT_BOOK) /Parent 10 0 R /Dest [3 0 R /Fit] /Custom 4 0 R >>"),
+            obj(
+                11,
+                "<< /Title (K_KEPT_BOOK) /Parent 10 0 R /Dest [3 0 R /Fit] /Custom 4 0 R >>",
+            ),
             obj(12, "<< /S /P /Pg 3 0 R /K 0 /Ref 4 0 R >>"),
             obj(13, "<< /F 14 0 R >>"),
             obj(14, "<< /T 13 0 R /N 14 0 R /V 14 0 R /P 3 0 R /Other 4 0 R >>"),
-            obj(15, "<< /Type /Annot /Subtype /Text /Rect [0 0 9 9] /P 4 0 R /Contents (K_NOTE) >>"),
+            obj(
+                15,
+                "<< /Type /Annot /Subtype /Text /Rect [0 0 9 9] /P 4 0 R /Contents (K_NOTE) >>",
+            ),
             deflated(16, "", b"(M_ONLY_THERE) Tj"),
         ],
         "/Annots [15 0 R]",
@@ -1123,13 +1349,19 @@ fn a_page_reached_by_ten_paths_is_gone_from_all_of_them() {
     assert!(gone(&after, 4));
     let catalog = dict(&after, 1);
     assert!(!catalog.has(b"Custom"));
-    assert_eq!(catalog.get(b"CustomList").unwrap().as_array().unwrap(), &vec![Object::Null, Object::Reference((3, 0))]);
+    assert_eq!(
+        catalog.get(b"CustomList").unwrap().as_array().unwrap(),
+        &vec![Object::Null, Object::Reference((3, 0))]
+    );
     assert!(!catalog.has(b"OpenAction"));
     assert!(!dict(&after, 15).has(b"P"));
     // Whatever's left refers to nothing that's gone, in any object.
     for id in after.object_ids() {
         let text = format!("{:?}", after.resolve_object(id).unwrap());
-        assert!(!text.contains("Reference((4, 0))"), "object {id:?} still refers to the page: {text}");
+        assert!(
+            !text.contains("Reference((4, 0))"),
+            "object {id:?} still refers to the page: {text}"
+        );
     }
 }
 
@@ -1139,13 +1371,18 @@ fn a_page_reached_by_ten_paths_is_gone_from_all_of_them() {
 /// that's simply broken, would show. The new file has to hold exactly the same bytes, and its /Length has to be right.
 #[test]
 fn stream_data_is_copied_byte_for_byte_without_being_decoded() {
-    let garbage: Vec<u8> = (0..200_000_u32).map(|value| (value.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let garbage: Vec<u8> = (0..200_000_u32)
+        .map(|value| (value.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
     let bytes = {
         let mut builder = Builder::new(500);
         let objects = vec![
             obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
             obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] /Contents 4 0 R /Thumb 5 0 R >>"),
+            obj(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] /Contents 4 0 R /Thumb 5 0 R >>",
+            ),
             raw_stream(4, "/Filter /FlateDecode", &garbage),
             raw_stream(5, "/Filter /JBIG2Decode /Subtype /Image", b"\x00\x01\x02endstrea"),
         ];
@@ -1242,7 +1479,11 @@ fn an_object_keeps_its_generation() {
     let (_, _, after) = rewrite(&bytes, |_| {});
     assert!(after.resolve_object((4, 3)).unwrap().as_dict().unwrap().has(b"Note"));
     // The stream form can't compress it, but has to find it just the same.
-    let (_, _, after) = rewrite_with(&bytes, RewritePolicy::new().form(RewriteFormChoice::Force(RewriteForm::Stream)), |_| {});
+    let (_, _, after) = rewrite_with(
+        &bytes,
+        RewritePolicy::new().form(RewriteFormChoice::Force(RewriteForm::Stream)),
+        |_| {},
+    );
     assert!(after.resolve_object((4, 3)).unwrap().as_dict().unwrap().has(b"Note"));
 }
 
@@ -1254,14 +1495,20 @@ fn an_object_whose_header_disagrees_with_the_table_stays() {
     let objects = vec![
         obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
         obj(2, "<< /Type /Pages /Kids [11 0 R] /Count 1 >>"),
-        obj(11, "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /MediaBox [0 0 9 9] >>"),
+        obj(
+            11,
+            "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /MediaBox [0 0 9 9] >>",
+        ),
         obj(5, "<< /Type /Page /Parent 11 0 R >>"),
     ];
     builder.place(Form::Table, &objects, 100);
     builder.generations.insert(11, 2000);
     builder.finish_revision(Form::Table, "/Root 1 0 R");
     assert_eq!(open_bytes(&builder.bytes).page_count().unwrap(), 1);
-    for policy in [RewriteFormChoice::MatchSource, RewriteFormChoice::Force(RewriteForm::Stream)] {
+    for policy in [
+        RewriteFormChoice::MatchSource,
+        RewriteFormChoice::Force(RewriteForm::Stream),
+    ] {
         let (_, _, after) = rewrite_with(&builder.bytes, RewritePolicy::new().form(policy), |_| {});
         assert_eq!(after.page_count().unwrap(), 1, "{policy:?}");
     }
@@ -1273,7 +1520,9 @@ fn a_reference_to_nothing_cannot_come_to_mean_something() {
     let bytes = two_pages("/Dangling 50 0 R /Freed 51 0 R", &[], "", "");
     let (_, _, after) = rewrite(&bytes, |changes| {
         // The next numbers, past the highest in the file.
-        let id = changes.add_object(Object::Dictionary(dictionary! { "New" => 1 })).unwrap();
+        let id = changes
+            .add_object(Object::Dictionary(dictionary! { "New" => 1 }))
+            .unwrap();
         assert_eq!(id, (5, 0));
     });
     let catalog = dict(&after, 1);
@@ -1383,11 +1632,16 @@ fn bad_changes_are_refused() {
         changes.write_object((3, 0), Object::Real(f32::NAN)),
         Err(RewriteError::InvalidObject { .. })
     ));
-    assert!(matches!(changes.set_info(Object::Integer(1)), Err(RewriteError::InvalidObject { .. })));
+    assert!(matches!(
+        changes.set_info(Object::Integer(1)),
+        Err(RewriteError::InvalidObject { .. })
+    ));
 
     for (declared, given) in [(10_u64, &b"short"[..]), (2, b"longer than that")] {
         let mut changes = RewriteChanges::new(&reader).unwrap();
-        changes.write_stream_from((3, 0), Dictionary::new(), declared, given).unwrap();
+        changes
+            .write_stream_from((3, 0), Dictionary::new(), declared, given)
+            .unwrap();
         assert!(matches!(
             changes.write_to(RewritePolicy::new(), std::io::sink()),
             Err(RewriteError::StreamLengthMismatch { .. })
@@ -1402,21 +1656,38 @@ fn a_stream_from_a_reader_is_written_as_given() {
     let content = vec![b'x'; 300_000];
     let (output, summary, after) = rewrite(&bytes, |changes| {
         changes
-            .write_stream_from((5, 0), Dictionary::new(), content.len() as u64, std::io::Cursor::new(content.clone()))
+            .write_stream_from(
+                (5, 0),
+                Dictionary::new(),
+                content.len() as u64,
+                std::io::Cursor::new(content.clone()),
+            )
             .unwrap();
     });
     assert_markers(&output, &["M_OLD_CONTENT"], &[]);
-    assert_eq!(after.resolve_object((5, 0)).unwrap().as_stream().unwrap().content, content);
+    assert_eq!(
+        after.resolve_object((5, 0)).unwrap().as_stream().unwrap().content,
+        content
+    );
     assert_eq!(summary.stream_bytes_copied, content.len() as u64);
 }
 
 /// New objects and a new /Info and /Root not reaching the file, or a removed object staying because something else still names it.
 #[test]
 fn new_objects_a_new_root_and_a_removed_object() {
-    let bytes = two_pages("/Keep 5 0 R /Drop 6 0 R", &[obj(5, "<< /K (K_KEEP) >>"), obj(6, "<< /D (M_DROP) >>")], "", "");
+    let bytes = two_pages(
+        "/Keep 5 0 R /Drop 6 0 R",
+        &[obj(5, "<< /K (K_KEEP) >>"), obj(6, "<< /D (M_DROP) >>")],
+        "",
+        "",
+    );
     let (output, _, after) = rewrite(&bytes, |changes| {
         changes.remove_object((6, 0));
-        let info = changes.add_object(Object::Dictionary(dictionary! { "Title" => Object::string_literal("K_NEW_INFO") })).unwrap();
+        let info = changes
+            .add_object(Object::Dictionary(
+                dictionary! { "Title" => Object::string_literal("K_NEW_INFO") },
+            ))
+            .unwrap();
         changes.set_info(Object::Reference(info)).unwrap();
         let root = changes
             .add_object(Object::Dictionary(dictionary! {
@@ -1431,7 +1702,19 @@ fn new_objects_a_new_root_and_a_removed_object() {
     assert_markers(&output, &["M_DROP"], &["K_KEEP", "K_NEW_INFO"]);
     assert_eq!(after.page_count().unwrap(), 2);
     assert!(gone(&after, 1), "nothing reaches the old catalog");
-    assert_eq!(after.trailer_entry_owned(b"Info").unwrap().unwrap().as_dict().unwrap().get(b"Title").unwrap().as_str().unwrap(), b"K_NEW_INFO");
+    assert_eq!(
+        after
+            .trailer_entry_owned(b"Info")
+            .unwrap()
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Title")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        b"K_NEW_INFO"
+    );
 }
 
 // ---- Refusals. ----
@@ -1538,7 +1821,12 @@ fn files_it_cannot_be_sure_of_are_refused() {
     let encrypted = two_pages("", &[], "", "");
     let mut with_encrypt = encrypted.clone();
     let at = find(&with_encrypt, b"/Root 1 0 R").unwrap();
-    with_encrypt.splice(at..at, b"/Encrypt << /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >> ".iter().copied());
+    with_encrypt.splice(
+        at..at,
+        b"/Encrypt << /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >> "
+            .iter()
+            .copied(),
+    );
     if let Ok(reader) = IndexedReader::open(BytesSource::from(with_encrypt)) {
         assert!(matches!(RewriteChanges::new(&reader), Err(RewriteError::Encrypted)));
     }
@@ -1548,7 +1836,10 @@ fn files_it_cannot_be_sure_of_are_refused() {
     damaged.truncate(at);
     damaged.extend_from_slice(b"startxref\n999999\n%%EOF\n");
     let reader = open_bytes(&damaged);
-    assert!(matches!(RewriteChanges::new(&reader), Err(RewriteError::RecoveredIndex)));
+    assert!(matches!(
+        RewriteChanges::new(&reader),
+        Err(RewriteError::RecoveredIndex)
+    ));
 
     let mut builder = Builder::new(500);
     let objects = vec![
@@ -1578,8 +1869,13 @@ fn an_object_that_can_be_reached_and_cannot_be_read_is_refused() {
     builder.place(Form::Table, &objects, 100);
     builder.finish_revision(Form::Table, "/Root 1 0 R");
     let reader = open_bytes(&builder.bytes);
-    let refused = RewriteChanges::new(&reader).unwrap().write_to(RewritePolicy::new(), std::io::sink());
-    assert!(matches!(refused, Err(RewriteError::UnreadableObject { id: (4, 0), .. })), "{refused:?}");
+    let refused = RewriteChanges::new(&reader)
+        .unwrap()
+        .write_to(RewritePolicy::new(), std::io::sink());
+    assert!(
+        matches!(refused, Err(RewriteError::UnreadableObject { id: (4, 0), .. })),
+        "{refused:?}"
+    );
 }
 
 // ---- Destinations. ----
@@ -1610,26 +1906,50 @@ fn every_destination_writes_a_whole_file() {
     let (path, reader) = on_disk(folder.path(), &bytes);
 
     let new_path = folder.path().join("new.pdf");
-    let done = rewrite_atomically(&reader, AppendDestination::NewFile(&new_path), RewriteOptions::new(), |changes| {
-        changes.remove_page(1);
-        Ok(())
-    })
+    let done = rewrite_atomically(
+        &reader,
+        AppendDestination::NewFile(&new_path),
+        RewriteOptions::new(),
+        |changes| {
+            changes.remove_page(1);
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(done.reader.page_count().unwrap(), 2);
     assert_eq!(std::fs::metadata(&new_path).unwrap().len(), done.summary.new_len);
     assert_eq!(std::fs::read(&path).unwrap(), bytes, "a Save As changed the original");
 
     // There's a file there now.
-    let again = rewrite_atomically(&reader, AppendDestination::NewFile(&new_path), RewriteOptions::new(), |_| Ok(()));
-    assert!(matches!(again, Err(RewriteError::Destination(AppendError::TargetExists { .. }))));
+    let again = rewrite_atomically(
+        &reader,
+        AppendDestination::NewFile(&new_path),
+        RewriteOptions::new(),
+        |_| Ok(()),
+    );
+    assert!(matches!(
+        again,
+        Err(RewriteError::Destination(AppendError::TargetExists { .. }))
+    ));
 
-    let done = rewrite_atomically(&reader, AppendDestination::OverwriteOther(&new_path), RewriteOptions::new(), |_| Ok(())).unwrap();
+    let done = rewrite_atomically(
+        &reader,
+        AppendDestination::OverwriteOther(&new_path),
+        RewriteOptions::new(),
+        |_| Ok(()),
+    )
+    .unwrap();
     assert_eq!(done.reader.page_count().unwrap(), 3);
 
-    let done = rewrite_atomically(&reader, AppendDestination::SameFile(&path), RewriteOptions::new(), |changes| {
-        changes.remove_page(1);
-        Ok(())
-    })
+    let done = rewrite_atomically(
+        &reader,
+        AppendDestination::SameFile(&path),
+        RewriteOptions::new(),
+        |changes| {
+            changes.remove_page(1);
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(done.reader.page_count().unwrap(), 2);
     let saved = std::fs::read(&path).unwrap();
@@ -1639,10 +1959,24 @@ fn every_destination_writes_a_whole_file() {
     no_temporary_names(folder.path());
 
     // A save with the old reader finds the file has moved on.
-    let stale = rewrite_atomically(&reader, AppendDestination::SameFile(&path), RewriteOptions::new(), |_| Ok(()));
-    assert!(matches!(stale, Err(RewriteError::Destination(AppendError::TargetChanged { .. }))));
+    let stale = rewrite_atomically(
+        &reader,
+        AppendDestination::SameFile(&path),
+        RewriteOptions::new(),
+        |_| Ok(()),
+    );
+    assert!(matches!(
+        stale,
+        Err(RewriteError::Destination(AppendError::TargetChanged { .. }))
+    ));
     // The new one can save again.
-    let done_again = rewrite_atomically(&done.reader, AppendDestination::SameFile(&path), RewriteOptions::new(), |_| Ok(())).unwrap();
+    let done_again = rewrite_atomically(
+        &done.reader,
+        AppendDestination::SameFile(&path),
+        RewriteOptions::new(),
+        |_| Ok(()),
+    )
+    .unwrap();
     assert_eq!(done_again.reader.page_count().unwrap(), 2);
     no_temporary_names(folder.path());
 }
@@ -1657,8 +1991,16 @@ fn hard_links_and_read_only_targets_are_refused_as_append_refuses_them() {
     let (path, reader) = on_disk(folder.path(), &bytes);
     let link = folder.path().join("link.pdf");
     std::fs::hard_link(&path, &link).unwrap();
-    let refused = rewrite_atomically(&reader, AppendDestination::SameFile(&path), RewriteOptions::new(), |_| Ok(()));
-    assert!(matches!(refused, Err(RewriteError::Destination(AppendError::TargetHasHardLinks { .. }))));
+    let refused = rewrite_atomically(
+        &reader,
+        AppendDestination::SameFile(&path),
+        RewriteOptions::new(),
+        |_| Ok(()),
+    );
+    assert!(matches!(
+        refused,
+        Err(RewriteError::Destination(AppendError::TargetHasHardLinks { .. }))
+    ));
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 
     let done = rewrite_atomically(
@@ -1668,15 +2010,27 @@ fn hard_links_and_read_only_targets_are_refused_as_append_refuses_them() {
         |_| Ok(()),
     )
     .unwrap();
-    assert_eq!(std::fs::read(&link).unwrap(), bytes, "the other name keeps the old bytes, which is what was asked for");
+    assert_eq!(
+        std::fs::read(&link).unwrap(),
+        bytes,
+        "the other name keeps the old bytes, which is what was asked for"
+    );
     assert_eq!(done.reader.page_count().unwrap(), 2);
 
     use std::os::unix::fs::PermissionsExt;
     let other = folder.path().join("other.pdf");
     std::fs::write(&other, b"not yours").unwrap();
     std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o444)).unwrap();
-    let refused = rewrite_atomically(&reader, AppendDestination::OverwriteOther(&other), RewriteOptions::new(), |_| Ok(()));
-    assert!(matches!(refused, Err(RewriteError::Destination(AppendError::TargetReadOnly { .. }))));
+    let refused = rewrite_atomically(
+        &reader,
+        AppendDestination::OverwriteOther(&other),
+        RewriteOptions::new(),
+        |_| Ok(()),
+    );
+    assert!(matches!(
+        refused,
+        Err(RewriteError::Destination(AppendError::TargetReadOnly { .. }))
+    ));
     assert_eq!(std::fs::read(&other).unwrap(), b"not yours");
     no_temporary_names(folder.path());
 }
@@ -1700,7 +2054,10 @@ fn a_prepare_step_works_as_it_does_for_an_append() {
         |_| Ok(()),
     )
     .unwrap();
-    assert_eq!(seen_target.as_deref(), Some(std::fs::canonicalize(&path).unwrap().as_path()));
+    assert_eq!(
+        seen_target.as_deref(),
+        Some(std::fs::canonicalize(&path).unwrap().as_path())
+    );
 
     let (path, reader) = on_disk(folder.path(), &bytes);
     let failed = rewrite_atomically(
@@ -1739,7 +2096,9 @@ fn a_signed_file_is_never_replaced_and_a_save_as_says_what_broke() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 
     let new = folder.path().join("copy.pdf");
-    let refused = rewrite_atomically(&reader, AppendDestination::NewFile(&new), RewriteOptions::new(), |_| Ok(()));
+    let refused = rewrite_atomically(&reader, AppendDestination::NewFile(&new), RewriteOptions::new(), |_| {
+        Ok(())
+    });
     assert!(matches!(refused, Err(RewriteError::SignaturesWouldBreak { .. })));
     assert!(!new.exists());
 
@@ -1786,14 +2145,18 @@ fn a_rewritten_file_can_be_appended_to_and_rewritten_again() {
         let mut writer = lopdf::AppendWriter::new(&after, &mut appended).unwrap();
         let added = writer.add_object(&Object::Integer(7)).unwrap();
         let summary = writer.finish().unwrap();
-        let source: std::sync::Arc<dyn lopdf::RandomAccessSource> = std::sync::Arc::new(BytesSource::from(appended.clone()));
+        let source: std::sync::Arc<dyn lopdf::RandomAccessSource> =
+            std::sync::Arc::new(BytesSource::from(appended.clone()));
         let again = after.verify_appended(source, &summary).unwrap();
         assert_eq!(again.resolve_object(added.id).unwrap(), Object::Integer(7));
         assert!(appended.starts_with(&output));
 
         let (output_two, _, after_two) = rewrite(&appended, |changes| changes.remove_page(0));
         assert_eq!(after_two.page_count().unwrap(), 1);
-        assert!(after_two.resolve_object(added.id).is_err(), "nothing refers to it, so it goes");
+        assert!(
+            after_two.resolve_object(added.id).is_err(),
+            "nothing refers to it, so it goes"
+        );
         assert_markers(&output_two, &["K_PAGE_ONE"], &["K_PAGE_THREE"]);
     }
 }
@@ -1813,7 +2176,10 @@ fn an_ambiguous_hybrid_is_refused() {
     builder.write_obj(&obj(4, "<< /Which (classic) >>"));
     builder.finish_revision(Form::Hybrid, "/Root 1 0 R");
     let reader = open_bytes(&builder.bytes);
-    assert!(matches!(RewriteChanges::new(&reader), Err(RewriteError::AmbiguousHybrid { .. })));
+    assert!(matches!(
+        RewriteChanges::new(&reader),
+        Err(RewriteError::AmbiguousHybrid { .. })
+    ));
 }
 
 /// A document opened through a symbolic link having the link replaced by a file, and the real document left with what should be gone.
@@ -1827,10 +2193,15 @@ fn a_symbolic_link_stays_a_link() {
     let link = folder.path().join("link.pdf");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let reader = IndexedReader::open(FileSource::open(&link).unwrap()).unwrap();
-    rewrite_atomically(&reader, AppendDestination::SameFile(&link), RewriteOptions::new(), |changes| {
-        changes.remove_page(1);
-        Ok(())
-    })
+    rewrite_atomically(
+        &reader,
+        AppendDestination::SameFile(&link),
+        RewriteOptions::new(),
+        |changes| {
+            changes.remove_page(1);
+            Ok(())
+        },
+    )
     .unwrap();
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     assert_markers(&std::fs::read(&real).unwrap(), &["M_GONE"], &[]);
@@ -1891,7 +2262,10 @@ fn a_million_references_to_one_object_copy_it_once() {
     .unwrap();
     let started = std::time::Instant::now();
     let mut output = Vec::new();
-    let summary = RewriteChanges::new(&reader).unwrap().write_to(RewritePolicy::new(), &mut output).unwrap();
+    let summary = RewriteChanges::new(&reader)
+        .unwrap()
+        .write_to(RewritePolicy::new(), &mut output)
+        .unwrap();
     assert_eq!(summary.objects_written, 5);
     assert!(started.elapsed().as_secs() < 60, "{:?}", started.elapsed());
     let count = output.windows(8).filter(|window| window == b"K_TARGET").count();
@@ -1904,14 +2278,23 @@ fn a_million_references_to_one_object_copy_it_once() {
 fn a_page_tree_loop_is_handled() {
     let bytes = plain_file(vec![
         obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-        obj(2, "<< /Type /Pages /Kids [3 0 R 10 0 R] /Count 2 /MediaBox [0 0 9 9] >>"),
+        obj(
+            2,
+            "<< /Type /Pages /Kids [3 0 R 10 0 R] /Count 2 /MediaBox [0 0 9 9] >>",
+        ),
         obj(3, "<< /Type /Page /Parent 2 0 R >>"),
-        obj(10, "<< /Type /Pages /Parent 2 0 R /Kids [2 0 R 10 0 R 4 0 R] /Count 1 >>"),
+        obj(
+            10,
+            "<< /Type /Pages /Parent 2 0 R /Kids [2 0 R 10 0 R 4 0 R] /Count 1 >>",
+        ),
         obj(4, "<< /Type /Page /Parent 10 0 R >>"),
     ]);
     let reader = open_bytes(&bytes);
     let mut output = Vec::new();
-    RewriteChanges::new(&reader).unwrap().write_to(RewritePolicy::new(), &mut output).unwrap();
+    RewriteChanges::new(&reader)
+        .unwrap()
+        .write_to(RewritePolicy::new(), &mut output)
+        .unwrap();
     assert!(IndexedReader::open(BytesSource::from(output)).is_ok());
 
     let mut changes = RewriteChanges::new(&reader).unwrap();
@@ -1939,7 +2322,10 @@ fn a_huge_kids_array_is_quick() {
     }
     let mut objects = vec![
         obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-        obj(2, &format!("<< /Type /Pages /Kids [{kids}] /Count {PAGES} /MediaBox [0 0 9 9] >>")),
+        obj(
+            2,
+            &format!("<< /Type /Pages /Kids [{kids}] /Count {PAGES} /MediaBox [0 0 9 9] >>"),
+        ),
     ];
     for number in 0..PAGES {
         objects.push(obj(number + 10, "<< /Type /Page /Parent 2 0 R >>"));
@@ -1958,8 +2344,14 @@ fn outline_loops_end() {
         "/Outlines 10 0 R",
         &[
             obj(10, "<< /First 11 0 R /Last 12 0 R /Count 2 >>"),
-            obj(11, "<< /Title (a) /Parent 10 0 R /Next 12 0 R /First 11 0 R /Dest [3 0 R /Fit] >>"),
-            obj(12, "<< /Title (M_LOOP) /Parent 10 0 R /Prev 11 0 R /Next 11 0 R /First 10 0 R /Dest [4 0 R /Fit] >>"),
+            obj(
+                11,
+                "<< /Title (a) /Parent 10 0 R /Next 12 0 R /First 11 0 R /Dest [3 0 R /Fit] >>",
+            ),
+            obj(
+                12,
+                "<< /Title (M_LOOP) /Parent 10 0 R /Prev 11 0 R /Next 11 0 R /First 10 0 R /Dest [4 0 R /Fit] >>",
+            ),
         ],
         "",
         "",
@@ -2042,9 +2434,18 @@ fn very_deep_trees_do_not_overflow_the_stack() {
     let mut objects = Vec::new();
     for number in 0..DEPTH {
         objects.push(obj(1_000 + number, &format!("<< /S /P /K [{} 0 R] >>", 1_001 + number)));
-        objects.push(obj(100_000 + number, &format!("<< /FT /Tx /Kids [{} 0 R] >>", 100_001 + number)));
-        objects.push(obj(200_000 + number, &format!("<< /Kids [{} 0 R] >>", 200_001 + number)));
-        objects.push(obj(300_000 + number, &format!("<< /Title (x) /Parent 10 0 R /First {} 0 R >>", 300_001 + number)));
+        objects.push(obj(
+            100_000 + number,
+            &format!("<< /FT /Tx /Kids [{} 0 R] >>", 100_001 + number),
+        ));
+        objects.push(obj(
+            200_000 + number,
+            &format!("<< /Kids [{} 0 R] >>", 200_001 + number),
+        ));
+        objects.push(obj(
+            300_000 + number,
+            &format!("<< /Title (x) /Parent 10 0 R /First {} 0 R >>", 300_001 + number),
+        ));
     }
     let bytes = two_pages(
         "/StructTreeRoot << /K [1000 0 R] >> /AcroForm << /Fields [100000 0 R] >> /Names << /Dests 200000 0 R >> /Outlines 10 0 R",
@@ -2072,7 +2473,10 @@ fn damaged_files_never_panic_and_never_give_a_bad_result() {
     let seeds: Vec<Vec<u8>> = ALL_FORMS.iter().map(|form| rich_document(*form)).collect();
     let mut produced = 0;
     for seed in &seeds {
-        assert!(property::check_rewrite_on_any_bytes(seed), "an undamaged file has to come out");
+        assert!(
+            property::check_rewrite_on_any_bytes(seed),
+            "an undamaged file has to come out"
+        );
         for _ in 0..300 {
             let mut bytes = seed.clone();
             // Most damage that moves a byte breaks the cross-reference data, and that's refused. So half of it doesn't.
@@ -2091,5 +2495,8 @@ fn damaged_files_never_panic_and_never_give_a_bad_result() {
             produced += usize::from(property::check_rewrite_on_any_bytes(&bytes));
         }
     }
-    assert!(produced > 50, "only {produced} of 900 damaged files got through: the check isn't reaching the writer");
+    assert!(
+        produced > 50,
+        "only {produced} of 900 damaged files got through: the check isn't reaching the writer"
+    );
 }

@@ -56,20 +56,20 @@ pub use error::{DecompressError, Error, ParseError, Result};
 pub use incremental_document::IncrementalDocument;
 #[cfg(any(unix, windows))]
 pub use indexed_reader::{AppendDestination, AppendOptions, AppendedFile, TemporaryOutput, append_atomically};
-#[cfg(any(unix, windows))]
-pub use indexed_reader::{RewriteOptions, RewrittenFile, rewrite_atomically};
 pub use indexed_reader::{
     AppendError, AppendOutput, AppendResult, AppendSummary, AppendWriter, AppendedObject,
     BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES, BoundedObjectStream, EncodedStreamLength,
     EncodedStreamLengthUnavailableReason, EncodedStreamProtection, EncodedStreamReader, IndexedObjectCacheStats,
     IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
     IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats, IndexedReaderOptions, IndexedReaderResult,
-    IndexedReaderSourceCacheStats, IndexedRevision, IndexedRevisionChain, IndexedStreamDescriptor,
-    IndexedSignature, IndexedSignatureKind, IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind,
+    IndexedReaderSourceCacheStats, IndexedRevision, IndexedRevisionChain, IndexedSignature, IndexedSignatureKind,
+    IndexedStreamDescriptor, IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind,
     InheritedPageAttributeOwners, MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry,
     RemovalReport, RewriteChanges, RewriteError, RewriteForm, RewriteFormChoice, RewritePolicy, RewriteResult,
     RewriteSummary, SharedIndexedReaderResult,
 };
+#[cfg(any(unix, windows))]
+pub use indexed_reader::{RewriteOptions, RewrittenFile, rewrite_atomically};
 pub use linearization::Linearization;
 pub use load_options::{DEFAULT_MAX_DECOMPRESSED_SIZE, FilterFunc, LoadOptions};
 pub use object_stream::{MAX_SELECTED_OBJECT_STREAM_MEMBERS, ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};

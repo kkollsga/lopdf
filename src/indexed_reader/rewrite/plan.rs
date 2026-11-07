@@ -130,7 +130,6 @@ pub(super) struct Plan<'c> {
     pub(super) objects: BTreeMap<u32, Change<'c>>,
     pub(super) policy: RewritePolicy,
     pub(super) root: u32,
-    pub(super) root_generation: u16,
     pub(super) info: Option<Object>,
     pub(super) next_number: u32,
     /// Whatever refers to one of these loses the reference.
@@ -171,7 +170,9 @@ impl IndexedReader {
 }
 
 /// Whether what a rewrite would break is allowed to break. The bytes of a signed file never change, whatever is asked for.
-fn check_signatures(signatures: &[IndexedSignature], policy: RewritePolicy, replaces_original: bool) -> RewriteResult<()> {
+fn check_signatures(
+    signatures: &[IndexedSignature], policy: RewritePolicy, replaces_original: bool,
+) -> RewriteResult<()> {
     if signatures.is_empty() {
         return Ok(());
     }
@@ -190,7 +191,9 @@ fn check_signatures(signatures: &[IndexedSignature], policy: RewritePolicy, repl
 
 impl<'c> Plan<'c> {
     /// Everything up to the first byte written: what goes, what stays and whether that's allowed.
-    pub(super) fn prepare(changes: RewriteChanges<'_, 'c>, policy: RewritePolicy, replaces_original: bool) -> RewriteResult<Self> {
+    pub(super) fn prepare(
+        changes: RewriteChanges<'_, 'c>, policy: RewritePolicy, replaces_original: bool,
+    ) -> RewriteResult<Self> {
         let RewriteChanges {
             reader,
             objects,
@@ -222,7 +225,6 @@ impl<'c> Plan<'c> {
             objects,
             policy,
             root,
-            root_generation,
             info,
             next_number,
             dead: Bits::new(capacity),
@@ -237,7 +239,11 @@ impl<'c> Plan<'c> {
             expected_pages: None,
             containers: Containers::default(),
             work: 0,
-            work_limit: reader.index.source_len.saturating_mul(WORK_PER_FILE_BYTE).max(WORK_ALLOWANCE),
+            work_limit: reader
+                .index
+                .source_len
+                .saturating_mul(WORK_PER_FILE_BYTE)
+                .max(WORK_ALLOWANCE),
         };
         if plan.load(root)?.is_none_or(|object| object.dictionary().is_none()) {
             return Err(RewriteError::InvalidRoot);
@@ -257,7 +263,11 @@ impl<'c> Plan<'c> {
                 plan.expected_pages = removal.as_ref().map(PageRemoval::kept_count);
             }
         } else if identity {
-            plan.expected_pages = plan.view.page_map_with_container_budget(RETAINED_CONTAINER_BYTES).ok().map(|map| map.len());
+            plan.expected_pages = plan
+                .view
+                .page_map_with_container_budget(RETAINED_CONTAINER_BYTES)
+                .ok()
+                .map(|map| map.len());
         }
         plan.walk(removal)?;
         if plan.live.count() > MAX_REWRITE_OBJECTS {
@@ -290,7 +300,10 @@ impl<'c> Plan<'c> {
         match self.objects.get(&number) {
             Some(Change::Object { generation, .. } | Change::Stream { generation, .. }) => *generation,
             Some(Change::Reserved) => 0,
-            None => match (self.header_generations.get(&number), self.view.index.locations.get(&number)) {
+            None => match (
+                self.header_generations.get(&number),
+                self.view.index.locations.get(&number),
+            ) {
                 (Some(generation), _) => *generation,
                 (None, Some(ObjectLocation64::Normal { generation, .. })) => *generation,
                 _ => 0,
@@ -414,7 +427,9 @@ impl<'c> Plan<'c> {
         let (body_offset, source_len, parsed) = match framed {
             Ok(framed) => framed,
             // The entry names nothing. Everyone reads that as null.
-            Err(IndexedReaderError::MissingNormalObject { .. } | IndexedReaderError::MissingNormalObjectAtXref { .. }) => {
+            Err(
+                IndexedReaderError::MissingNormalObject { .. } | IndexedReaderError::MissingNormalObjectAtXref { .. },
+            ) => {
                 return Ok(None);
             }
             Err(error) => return Err(unreadable(error)),
@@ -426,7 +441,12 @@ impl<'c> Plan<'c> {
         let stream_start = body_offset
             .checked_add(u64::try_from(parsed.consumed).unwrap_or(u64::MAX))
             .and_then(|offset| offset.checked_add(prefix))
-            .ok_or_else(|| unreadable(IndexedReaderError::InvalidIndirectObject { id, offset: body_offset }))?;
+            .ok_or_else(|| {
+                unreadable(IndexedReaderError::InvalidIndirectObject {
+                    id,
+                    offset: body_offset,
+                })
+            })?;
         let fallback = parsed.object.as_dict().cloned().ok();
         let mut state = ResolutionState::default();
         let metadata = self.view.finish_stream_metadata(
@@ -450,7 +470,11 @@ impl<'c> Plan<'c> {
                 },
             ))),
             Err(StreamMetadataError::EncodedLimit { id, length, limit }) => {
-                Err(unreadable(IndexedReaderError::StreamLimitExceeded { id, length, limit }))
+                Err(unreadable(IndexedReaderError::StreamLimitExceeded {
+                    id,
+                    length,
+                    limit,
+                }))
             }
             Err(error) => {
                 let error = error.into_reader_error();
@@ -458,14 +482,19 @@ impl<'c> Plan<'c> {
                     (
                         IndexedReaderError::MissingEndstream { .. } | IndexedReaderError::NegativeStreamLength { .. },
                         Some(dictionary),
-                    ) => self.stream_by_scanning(id, dictionary, stream_start, source_len).map(Some),
+                    ) => self
+                        .stream_by_scanning(id, dictionary, stream_start, source_len)
+                        .map(Some),
                     _ => Err(unreadable(error)),
                 }
             }
             // A wrong /Length. PDFium looks for `endstream`, so what it draws comes from there, and the new file has to hold the same bytes.
-            Ok(FramedStreamMetadata::MissingLength { dictionary, .. } | FramedStreamMetadata::Scalar(Object::Dictionary(dictionary))) => {
-                self.stream_by_scanning(id, dictionary, stream_start, source_len).map(Some)
-            }
+            Ok(
+                FramedStreamMetadata::MissingLength { dictionary, .. }
+                | FramedStreamMetadata::Scalar(Object::Dictionary(dictionary)),
+            ) => self
+                .stream_by_scanning(id, dictionary, stream_start, source_len)
+                .map(Some),
             Ok(FramedStreamMetadata::Scalar(object)) => Ok(Some(Loaded::Plain(object))),
         }
     }
@@ -480,7 +509,8 @@ impl<'c> Plan<'c> {
         let mut position = start;
         let mut found = None;
         while position < source_len && found.is_none() {
-            let step = usize::try_from(source_len - position).map_or(COPY_CHUNK_BYTES, |left| left.min(COPY_CHUNK_BYTES));
+            let step =
+                usize::try_from(source_len - position).map_or(COPY_CHUNK_BYTES, |left| left.min(COPY_CHUNK_BYTES));
             self.view.source.read_exact_at(position, &mut buffer[..step])?;
             self.charge(step as u64)?;
             found = buffer[..step]
@@ -797,7 +827,9 @@ impl<'c> Plan<'c> {
 
     /// Follow references from what's queued. Each round goes in the order of the file's object streams, so a stream is decoded
     /// as few times as can be however far apart the references are.
-    fn reach(&mut self, mut frontier: Vec<u32>, mut pruner: Option<&mut Pruner>, hold_back: Option<&[u8]>) -> RewriteResult<()> {
+    fn reach(
+        &mut self, mut frontier: Vec<u32>, mut pruner: Option<&mut Pruner>, hold_back: Option<&[u8]>,
+    ) -> RewriteResult<()> {
         while !frontier.is_empty() {
             let locations = &self.view.index.locations;
             frontier.sort_by_cached_key(|number| match locations.get(number) {

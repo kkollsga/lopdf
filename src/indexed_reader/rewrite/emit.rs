@@ -249,8 +249,16 @@ impl<W: Write> Output<W> {
             compressed: false,
             first: offset,
         });
-        let largest = self.entries.iter().map(|entry| entry.first).max().unwrap_or(0).max(offset);
-        let width = usize::try_from((u64::BITS - largest.leading_zeros()).div_ceil(8)).unwrap_or(8).max(1);
+        let largest = self
+            .entries
+            .iter()
+            .map(|entry| entry.first)
+            .max()
+            .unwrap_or(0)
+            .max(offset);
+        let width = usize::try_from((u64::BITS - largest.leading_zeros()).div_ceil(8))
+            .unwrap_or(8)
+            .max(1);
         let mut index = vec![Object::Integer(0), Object::Integer(1)];
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         // Object 0, the head of the free list.
@@ -282,7 +290,11 @@ impl<W: Write> Output<W> {
         trailer.set("Size", i64::from(self.next_number));
         trailer.set(
             "W",
-            Object::Array(vec![Object::Integer(1), Object::Integer(width as i64), Object::Integer(2)]),
+            Object::Array(vec![
+                Object::Integer(1),
+                Object::Integer(width as i64),
+                Object::Integer(2),
+            ]),
         );
         trailer.set("Index", Object::Array(index));
         trailer.set("Filter", Object::Name(b"FlateDecode".to_vec()));
@@ -375,7 +387,9 @@ pub(super) fn write_plan<W: AppendOutput>(
                     output.stream_bytes += stream.content.len() as u64;
                     output.stream_tail()?;
                 }
-                Some(Change::Stream { length, mut content, .. }) => {
+                Some(Change::Stream {
+                    length, mut content, ..
+                }) => {
                     output.stream_head(number, generation, &mut dict, length)?;
                     output.copy_from_reader((number, generation), length, &mut content)?;
                     output.stream_tail()?;
@@ -407,7 +421,10 @@ pub(super) fn write_plan<W: AppendOutput>(
             _ => {}
         }
     }
-    trailer.set("ID", new_file_id(&reader.index.trailer, &output.sink.hash, reader.index.source_len));
+    trailer.set(
+        "ID",
+        new_file_id(&reader.index.trailer, &output.sink.hash, reader.index.source_len),
+    );
 
     output.entries.sort_unstable_by_key(|entry| entry.number);
     let xref_offset = match form {
@@ -432,7 +449,11 @@ pub(super) fn write_plan<W: AppendOutput>(
         .values()
         .filter(|location| !matches!(location, ObjectLocation64::Free { .. }))
         .count() as u64;
-    let kept_from_source = plan.live.iter().filter(|number| reader.index.locations.contains_key(number)).count() as u64;
+    let kept_from_source = plan
+        .live
+        .iter()
+        .filter(|number| reader.index.locations.contains_key(number))
+        .count() as u64;
     let summary = RewriteSummary {
         previous_len: reader.index.source_len,
         new_len: output.sink.position,
@@ -494,7 +515,8 @@ impl IndexedReader {
         let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
         let mut position = 0_u64;
         while position < summary.new_len {
-            let step = usize::try_from(summary.new_len - position).map_or(COPY_CHUNK_BYTES, |left| left.min(COPY_CHUNK_BYTES));
+            let step =
+                usize::try_from(summary.new_len - position).map_or(COPY_CHUNK_BYTES, |left| left.min(COPY_CHUNK_BYTES));
             written_source.read_exact_at(position, &mut buffer[..step])?;
             hash.update(&buffer[..step]);
             position += step as u64;
@@ -563,26 +585,27 @@ impl IndexedReader {
             }
         }
         drop(reuse);
-        if written.dead.iter().any(|number| {
-            !matches!(
-                index.locations.get(&number),
-                None | Some(ObjectLocation64::Free { .. })
-            )
-        }) {
+        if written
+            .dead
+            .iter()
+            .any(|number| !matches!(index.locations.get(&number), None | Some(ObjectLocation64::Free { .. })))
+        {
             return failed("something that was removed is still there");
         }
-        let root = index
-            .trailer
-            .get(b"Root")
-            .and_then(Object::as_reference)
-            .map_err(|_| RewriteError::VerificationFailed {
+        let root = index.trailer.get(b"Root").and_then(Object::as_reference).map_err(|_| {
+            RewriteError::VerificationFailed {
                 reason: "/Root is gone",
-            })?;
+            }
+        })?;
         if !matches!(reader.resolve_object(root), Ok(Object::Dictionary(_))) {
             return failed("/Root no longer resolves");
         }
         if let Some(expected) = written.expected_pages
-            && reader.page_map_with_container_budget(RETAINED_CONTAINER_BYTES).ok().map(|map| map.len()) != Some(expected)
+            && reader
+                .page_map_with_container_budget(RETAINED_CONTAINER_BYTES)
+                .ok()
+                .map(|map| map.len())
+                != Some(expected)
         {
             return failed("it doesn't have the pages it should");
         }

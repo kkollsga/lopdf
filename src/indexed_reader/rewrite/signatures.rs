@@ -58,13 +58,17 @@ fn signature_from(
         Ok(Object::Name(value) | Object::String(value, _)) => Some(value.clone()),
         _ => None,
     };
-    let byte_range = dict.get(b"ByteRange").and_then(Object::as_array).ok().and_then(|items| {
-        let numbers: Vec<u64> = items
-            .iter()
-            .filter_map(|item| item.as_i64().ok().and_then(|value| u64::try_from(value).ok()))
-            .collect();
-        <[u64; 4]>::try_from(numbers).ok()
-    });
+    let byte_range = dict
+        .get(b"ByteRange")
+        .and_then(Object::as_array)
+        .ok()
+        .and_then(|items| {
+            let numbers: Vec<u64> = items
+                .iter()
+                .filter_map(|item| item.as_i64().ok().and_then(|value| u64::try_from(value).ok()))
+                .collect();
+            <[u64; 4]>::try_from(numbers).ok()
+        });
     IndexedSignature {
         object,
         field_name,
@@ -117,7 +121,12 @@ impl IndexedReader {
         };
         let mut stack: Vec<u32> = Vec::new();
         if let Some(Object::Array(fields)) = self.value_at(form.get(b"Fields").ok()) {
-            stack.extend(fields.iter().rev().filter_map(|field| field.as_reference().ok().map(|id| id.0)));
+            stack.extend(
+                fields
+                    .iter()
+                    .rev()
+                    .filter_map(|field| field.as_reference().ok().map(|id| id.0)),
+            );
         }
         let mut seen = HashSet::new();
         while let Some(number) = stack.pop() {
@@ -135,7 +144,11 @@ impl IndexedReader {
                 self.note_field_signature(value, name, found);
             }
             if let Some(Object::Array(kids)) = self.value_at(field.get(b"Kids").ok()) {
-                stack.extend(kids.iter().rev().filter_map(|kid| kid.as_reference().ok().map(|id| id.0)));
+                stack.extend(
+                    kids.iter()
+                        .rev()
+                        .filter_map(|kid| kid.as_reference().ok().map(|id| id.0)),
+                );
             }
         }
         Ok(())
@@ -253,10 +266,13 @@ impl IndexedReader {
             });
             let in_this_object = dict.as_ref().is_some_and(|dict| {
                 is_signature_dictionary(dict).is_some()
-                    && dict
-                        .get(b"ByteRange")
-                        .and_then(Object::as_array)
-                        .is_ok_and(|items| items.iter().filter_map(|item| item.as_i64().ok()).map(|value| value as u64).eq(range))
+                    && dict.get(b"ByteRange").and_then(Object::as_array).is_ok_and(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_i64().ok())
+                            .map(|value| value as u64)
+                            .eq(range)
+                    })
             });
             if let (true, Some(dict), Some((_, number, generation))) = (in_this_object, &dict, holder) {
                 let kind = is_signature_dictionary(dict).unwrap_or(IndexedSignatureKind::Signature);
@@ -308,14 +324,15 @@ impl Plan<'_> {
         let duplicate = self.signatures.iter().any(|known| {
             object.is_some_and(|object| known.object == Some(object))
                 || (number.is_none()
-                    && dict
-                        .get(b"ByteRange")
-                        .and_then(Object::as_array)
-                        .is_ok_and(|items| {
-                            known.byte_range.is_some_and(|range| {
-                                items.iter().filter_map(|item| item.as_i64().ok()).map(|value| value as u64).eq(range)
-                            })
-                        }))
+                    && dict.get(b"ByteRange").and_then(Object::as_array).is_ok_and(|items| {
+                        known.byte_range.is_some_and(|range| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_i64().ok())
+                                .map(|value| value as u64)
+                                .eq(range)
+                        })
+                    }))
         });
         if !duplicate {
             self.signatures.push(signature_from(dict, object, None, kind, true));

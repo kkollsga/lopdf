@@ -1,7 +1,7 @@
 //! Runs real PDFs through the rewrite, and measures it. Doesn't touch its inputs.
 //!
 //!   rewrite_roundtrip corpus <out-dir> <file>...           An identity rewrite and one removing a page, for each file, a JSON line each.
-//!   rewrite_roundtrip measure <identity|remove> <out-dir> <file>   One rewrite, timed.
+//!   rewrite_roundtrip measure <identity|remove:N> <out-dir> <file>   One rewrite, timed. N is a page's position.
 //!
 //! Wrap `measure` in `/usr/bin/time -l` for the whole process's peak footprint.
 
@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use lopdf::{
-    AppendDestination, FileSource, IndexedReader, RewriteError, RewriteOptions, RewritePolicy, RewriteSummary, rewrite_atomically,
+    AppendDestination, FileSource, IndexedReader, RewriteError, RewriteOptions, RewritePolicy, RewriteSummary,
+    rewrite_atomically,
 };
 use serde_json::json;
 
@@ -31,7 +32,9 @@ fn main() {
         }
         Some("measure") if args.len() == 4 => measure(&args[1], Path::new(&args[2]), Path::new(&args[3])),
         _ => {
-            eprintln!("usage: rewrite_roundtrip corpus <out-dir> <file>... | measure <identity|remove> <out-dir> <file>");
+            eprintln!(
+                "usage: rewrite_roundtrip corpus <out-dir> <file>... | measure <identity|remove:N> <out-dir> <file>"
+            );
             std::process::exit(2);
         }
     }
@@ -43,7 +46,11 @@ fn open(path: &Path) -> Result<IndexedReader, String> {
 }
 
 fn error_kind(error: &RewriteError) -> String {
-    format!("{error:?}").split([' ', '{', '(']).next().unwrap_or("").to_string()
+    format!("{error:?}")
+        .split([' ', '{', '('])
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn describe(summary: &RewriteSummary) -> serde_json::Value {
@@ -182,8 +189,8 @@ fn measure(mode: &str, out: &Path, path: &Path) {
         AppendDestination::NewFile(&target),
         RewriteOptions::new().policy(policy),
         |changes| {
-            if mode == "remove" {
-                changes.remove_page(reader.page_count().unwrap() / 2);
+            if let Some(index) = mode.strip_prefix("remove:") {
+                changes.remove_page(index.parse().unwrap());
             }
             Ok(())
         },
