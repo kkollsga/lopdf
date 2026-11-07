@@ -16,10 +16,15 @@ pub fn check_append_on_any_bytes(data: &[u8]) -> bool {
         return false;
     };
     let _ = reader.revisions();
+    // The input's own bytes as a string, which has to read back as it went in, whatever they are.
+    let text = data[data.len().saturating_sub(4_096)..].to_vec();
     let mut output = Vec::new();
     let written = (|| {
         let mut writer = AppendWriter::new(&reader, &mut output)?;
-        let added = writer.add_object(&Object::Dictionary(dictionary! { "Fuzz" => 1 }))?;
+        let added = writer.add_object(&Object::Dictionary(dictionary! {
+            "Fuzz" => 1,
+            "Text" => Object::String(text.clone(), lopdf::StringFormat::Literal),
+        }))?;
         let summary = writer.finish()?;
         Ok::<_, AppendError>((added, summary))
     })();
@@ -38,10 +43,9 @@ pub fn check_append_on_any_bytes(data: &[u8]) -> bool {
         | Err(AppendError::Reader(lopdf::IndexedReaderError::EntryLimitExceeded { .. })) => return false,
         Err(error) => panic!("the update failed its own check: {error}"),
     };
-    assert!(
-        matches!(after.resolve_object(added.id), Ok(Object::Dictionary(_))),
-        "the new object doesn't read back"
-    );
+    let read = after.resolve_object(added.id).expect("the new object doesn't read back");
+    let read = read.as_dict().expect("the new object came back as something else");
+    assert_eq!(read.get(b"Text").unwrap().as_str().unwrap(), text, "the new string came back different");
     for id in reader.object_ids().into_iter().take(MAX_COMPARED_OBJECTS) {
         if let Ok(before) = reader.resolve_object(id) {
             let now = after.resolve_object(id).expect("an old object stopped reading");

@@ -47,10 +47,41 @@ that isn't two direct strings is left alone.
 It refuses, before writing anything: an index rebuilt by a scan, encryption, a header not at byte 0, a
 `/Prev` loop, a chain already at `max_xref_sections`, a `/XRefStm` that redefines a live entry of its own
 table or sits on a stream section, and a `/Root` that isn't a reference to a dictionary. New object numbers
-stop at PDFium's limit of 4,194,304, and a table's offsets at 10 digits.
+stop at PDFium's limit of 4,194,304, and a table's offsets at 10 digits. An array or dictionary nested to the
+parser's 100th level is refused, and a string's parentheses past that depth go out escaped, so what's written
+can always be read. `verify_appended` parses every object written, without reading a stream's data, and
+compares what the trailer carries.
+
+There is no way to append to a file in place. `AppendWriter` takes a new, empty output, and a file on disk goes
+through `append_atomically`, which says where the result goes:
+
+- `AppendDestination::SameFile` is Save. The path has to still be the file the reader opened: same device,
+  inode, length and modification time, checked before the write and just before the rename, or `TargetChanged`.
+  A reader of bytes or of an earlier revision has no file of its own, and gets `TargetIdentityUnknown`.
+- `NewFile` is Save As to an empty path, moved into place by hard link so that it can't overwrite.
+- `OverwriteOther` replaces another file the caller named deliberately, and refuses if it changes meanwhile.
+
+A symbolic link is followed to the real file. A read-only target, or one with other hard links unless
+`AppendOptions::allow_breaking_hard_links` is set, is refused. **A replaced file gets the old one's name and mode
+bits and nothing else:** extended attributes, including Finder tags and `com.apple.quarantine`, ACLs, owner and
+birth time are lost unless `AppendOptions::prepare_replacement` copies them, which runs on the finished temporary
+file before it's checked and moved. The crate forbids unsafe code and can't copy them itself.
+
+The temporary file is created exclusively, at the mode of the file it becomes, and named from a hash of the target's
+name. A later save for the same target removes a leftover whose process is gone, if it's a regular file of this user's,
+over an hour old, and its name fits the pattern exactly. After the rename, only `AppendedFile::durability_warning` can
+report a problem, since the file is already in place.
+
+A small gap remains between the last check and the rename, which safe code can't close.
 
 A file whose last byte isn't a line ending gets `\n%line-ending-added\n` before the first object, so that
 the revision list can give back the original's exact length. A revision's range ends past the line ending
 after its `%%EOF`, and `eof_marker_end` gives the end before it. A range exists only if a `startxref` names
-the section and the sections run forward through the file. A linearized file's two sections count as one
-revision. Revisions are listed on request and nothing about them is held open.
+the section, the sections run forward through the file, and every section down its chain, and any `/XRefStm`, is
+inside it. A linearized file's two sections count as one revision, as do sections closed by one `startxref`.
+`open_revision` refuses bytes that would need a rescan. Revisions are listed on request and nothing about them is
+held open.
+
+One walk of the `/Prev` chain is bounded at `max_xref_sections` sections, 4,194,304 different numbers, 33,554,432
+entries listed, and four times the file's length read, plus 8 MiB. No chain of sections that don't overlap can reach
+the last. None of these fall back to a rescan.
