@@ -810,6 +810,10 @@ impl Plan<'_> {
             items: Vec<Object>,
             page_gone: bool,
             any: bool,
+            /// Something under it went.
+            lost: bool,
+            /// It has text of its own: /ActualText, /Alt, /E or /T.
+            text: bool,
         }
         let capacity = self.next_number.min(MAX_OBJECT_NUMBER).saturating_add(1);
         let mut seen = Bits::new(capacity);
@@ -818,6 +822,8 @@ impl Plan<'_> {
             items: vec![top],
             page_gone: false,
             any: false,
+            lost: false,
+            text: false,
         }];
         loop {
             let Some(frame) = stack.last_mut() else {
@@ -833,8 +839,14 @@ impl Plan<'_> {
                 {
                     self.report.structure_elements += 1;
                 }
+                if done.any && done.lost && done.text {
+                    self.report.structure_text_spanning_removed_pages += 1;
+                }
                 match stack.last_mut() {
-                    Some(parent) => parent.any |= done.any,
+                    Some(parent) => {
+                        parent.any |= done.any;
+                        parent.lost |= done.lost || !done.any;
+                    }
                     None => return Ok(done.any),
                 }
                 continue;
@@ -843,6 +855,7 @@ impl Plan<'_> {
             let (number, element) = match item {
                 Object::Integer(_) => {
                     frame.any |= !page_gone;
+                    frame.lost |= page_gone;
                     continue;
                 }
                 Object::Array(items) => {
@@ -851,11 +864,14 @@ impl Plan<'_> {
                         items,
                         page_gone,
                         any: false,
+                        lost: false,
+                        text: false,
                     });
                     continue;
                 }
                 Object::Reference((number, _)) => {
                     if self.dead.get(number) {
+                        frame.lost = true;
                         continue;
                     }
                     if !seen.set(number) {
@@ -878,6 +894,7 @@ impl Plan<'_> {
                 let alive = !(dead_reference(b"Pg") || dead_reference(b"Obj") || (page_gone && !element.has(b"Pg")));
                 if let Some(frame) = stack.last_mut() {
                     frame.any |= alive;
+                    frame.lost |= !alive;
                 }
                 continue;
             }
@@ -895,11 +912,16 @@ impl Plan<'_> {
                 Some(Object::Array(items)) => items,
                 Some(kid) => vec![kid],
             };
+            let text = [&b"ActualText"[..], b"Alt", b"E", b"T"]
+                .iter()
+                .any(|key| element.has(key));
             stack.push(Frame {
                 number,
                 any: items.is_empty() && !own_page_gone,
                 items,
                 page_gone: own_page_gone,
+                lost: false,
+                text,
             });
         }
     }

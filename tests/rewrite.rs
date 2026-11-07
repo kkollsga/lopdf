@@ -3002,9 +3002,18 @@ fn removed_content_reached_another_way_goes_or_is_reported() {
 fn a_huge_object_named_from_every_page_is_parsed_a_bounded_number_of_times() {
     const PAGES: u32 = 400;
     let mut builder = Builder::new(PAGES + 100);
-    let mut objects = vec![obj(1, "<< /Type /Catalog /Pages 2 0 R >>"), obj(3, &format!("[{}]", "0 ".repeat(200_000)))];
+    let mut objects = vec![
+        obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        obj(3, &format!("[{}]", "0 ".repeat(200_000))),
+    ];
     let kids: Vec<String> = (0..PAGES).map(|page| format!("{} 0 R", 10 + page)).collect();
-    objects.push(obj(2, &format!("<< /Type /Pages /Kids [{}] /Count {PAGES} /MediaBox [0 0 9 9] >>", kids.join(" "))));
+    objects.push(obj(
+        2,
+        &format!(
+            "<< /Type /Pages /Kids [{}] /Count {PAGES} /MediaBox [0 0 9 9] >>",
+            kids.join(" ")
+        ),
+    ));
     for page in 0..PAGES {
         objects.push(obj(10 + page, "<< /Type /Page /Parent 2 0 R /Annots 3 0 R >>"));
     }
@@ -3013,7 +3022,11 @@ fn a_huge_object_named_from_every_page_is_parsed_a_bounded_number_of_times() {
     let (_, summary, after) = rewrite(&builder.bytes, remove_second_page);
     assert_eq!(after.page_count().unwrap(), PAGES as usize - 1);
     // About 400 KB of array: a few passes over it, not one for each page.
-    assert!(summary.bytes_examined < 16 * 1_024 * 1_024, "{} bytes examined", summary.bytes_examined);
+    assert!(
+        summary.bytes_examined < 16 * 1_024 * 1_024,
+        "{} bytes examined",
+        summary.bytes_examined
+    );
 }
 
 /// Smaller routes that kept a removed page's words: a direct /Outlines, which pruning skipped; a bookmark with only /SE to an element that went;
@@ -3025,7 +3038,10 @@ fn the_smaller_routes_to_a_removed_page_are_closed() {
         let mut builder = Builder::new(500);
         let mut all = vec![
             obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>")),
-            obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 200 200] >>"),
+            obj(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 200 200] >>",
+            ),
             obj(3, "<< /Type /Page /Parent 2 0 R >>"),
             obj(4, "<< /Type /Page /Parent 2 0 R >>"),
             obj(5, "<< /Type /Page /Parent 2 0 R >>"),
@@ -3065,15 +3081,33 @@ fn the_smaller_routes_to_a_removed_page_are_closed() {
         "/Outlines 10 0 R",
         &[
             obj(10, "<< /First 11 0 R /Last 12 0 R /Count 2 >>"),
-            obj(11, "<< /Title (M_BY_POSITION) /Parent 10 0 R /Next 12 0 R /Dest [1 /Fit] >>"),
-            obj(12, "<< /Title (K_BY_POSITION) /Parent 10 0 R /Prev 11 0 R /A << /S /GoTo /D [2 /Fit] >> >>"),
-            obj(13, "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A << /S /GoToR /F (other.pdf) /D [2 /Fit] >> >>"),
+            obj(
+                11,
+                "<< /Title (M_BY_POSITION) /Parent 10 0 R /Next 12 0 R /Dest [1 /Fit] >>",
+            ),
+            obj(
+                12,
+                "<< /Title (K_BY_POSITION) /Parent 10 0 R /Prev 11 0 R /A << /S /GoTo /D [2 /Fit] >> >>",
+            ),
+            obj(
+                13,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A << /S /GoToR /F (other.pdf) /D [2 /Fit] >> >>",
+            ),
         ],
     );
     let (output, _, after) = rewrite(&bytes, remove_second_page);
     assert_markers(&output, &["M_BY_POSITION"], &["K_BY_POSITION"]);
     let kept = dict(&after, 12);
-    let destination = kept.get(b"A").unwrap().as_dict().unwrap().get(b"D").unwrap().as_array().unwrap().clone();
+    let destination = kept
+        .get(b"A")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"D")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone();
     assert_eq!(destination[0], Object::Integer(1), "the third page is the second now");
 
     // No /Pg of its own, under one on the removed page.
@@ -3087,4 +3121,48 @@ fn the_smaller_routes_to_a_removed_page_are_closed() {
     );
     let (output, _, _) = rewrite(&bytes, remove_second_page);
     assert_markers(&output, &["M_INHERITED"], &["K_OWN"]);
+}
+
+/// A removed page's words staying in what's the document's rather than a page's, as every IETF RFC's embedded source does, with nothing in the summary to say so.
+/// The caller has to be able to say what stays: embedded files, XMP, /Info, JavaScript, /PieceInfo, structure text that spanned the removed page, document
+/// parts, XFA, destinations by position, hidden layers.
+#[test]
+fn what_the_document_keeps_of_its_own_is_reported() {
+    let bytes = two_pages(
+        "/Names << /EmbeddedFiles << /Names [(source.xml) 10 0 R] >> /JavaScript << /Names [(s) 12 0 R] >> >> /Metadata 13 0 R \
+         /PieceInfo << /App << /Private 14 0 R >> >> /DPartRoot << /DPM << /Note (x) >> >> /AcroForm << /Fields [] /XFA 15 0 R >> \
+         /OCProperties << /OCGs [16 0 R] /D << /OFF [16 0 R] >> >> /StructTreeRoot << /K [17 0 R] >> /Outlines 19 0 R",
+        &[
+            obj(10, "<< /Type /Filespec /F (source.xml) /EF << /F 11 0 R >> >>"),
+            raw_stream(11, "/Type /EmbeddedFile", b"<rfc>M_PAGE_TWO_WORDS</rfc>"),
+            obj(12, "<< /S /JavaScript /JS (app.alert(1)) >>"),
+            raw_stream(13, "/Type /Metadata /Subtype /XML", b"<x/>"),
+            obj(14, "<< /Data (private) >>"),
+            raw_stream(15, "", b"<xdp/>"),
+            obj(16, "<< /Type /OCG /Name (hidden) >>"),
+            obj(17, "<< /S /Sect /Alt (Both pages) /K [18 0 R 20 0 R] >>"),
+            obj(18, "<< /S /P /Pg 3 0 R /K 0 >>"),
+            obj(20, "<< /S /P /Pg 4 0 R /K 0 >>"),
+            obj(19, "<< /First 21 0 R /Last 21 0 R /Count 1 >>"),
+            obj(21, "<< /Title (by position) /Parent 19 0 R /Dest [0 /Fit] >>"),
+        ],
+        "/Resources << /Properties << /L 16 0 R >> >>",
+        "",
+    );
+    let (output, summary, _) = rewrite(&bytes, remove_second_page);
+    let kept = &summary.document_data_kept;
+    assert_eq!(kept.embedded_files, 1);
+    assert!(kept.embedded_file_bytes > 0);
+    assert_eq!(kept.metadata_streams, 1);
+    assert_eq!(kept.javascript, 1);
+    assert_eq!(kept.piece_info, 1);
+    assert!(kept.document_parts);
+    assert_eq!(kept.page_position_destinations, 1);
+    assert_eq!(kept.hidden_layers, 1);
+    assert_eq!(summary.removal.structure_text_spanning_removed_pages, 1);
+    // What it says stays, stays: the report is a warning, not a removal.
+    assert_markers(&output, &[], &["M_PAGE_TWO_WORDS"]);
+    let identity = rewrite(&bytes, |_| {}).1;
+    assert_eq!(identity.document_data_kept.embedded_files, 1);
+    assert!(identity.document_data_kept.xfa);
 }

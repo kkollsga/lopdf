@@ -393,7 +393,10 @@ impl<'c> Plan<'c> {
         };
         let info = new_info.or_else(|| reader.index.trailer.get(b"Info").ok().cloned());
         // Room for the few objects planning itself adds, such as a direct /Outlines made an object of its own.
-        let capacity = next_number.saturating_add(PLANNED_OBJECTS).min(MAX_OBJECT_NUMBER).saturating_add(1);
+        let capacity = next_number
+            .saturating_add(PLANNED_OBJECTS)
+            .min(MAX_OBJECT_NUMBER)
+            .saturating_add(1);
         let identity = objects.is_empty() && removed_pages.is_empty() && removed_objects.is_empty();
         let mut plan = Self {
             view: reader.uncached_view(),
@@ -984,7 +987,10 @@ impl<'c> Plan<'c> {
         if !DESTINATION_FITS.contains(&fit.as_slice()) {
             return true;
         }
-        match usize::try_from(*position).ok().and_then(|position| positions.get(position)) {
+        match usize::try_from(*position)
+            .ok()
+            .and_then(|position| positions.get(position))
+        {
             Some(Some(now)) => {
                 items[0] = Object::Integer(*now);
                 true

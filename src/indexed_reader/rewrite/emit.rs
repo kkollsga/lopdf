@@ -357,6 +357,7 @@ pub(super) fn write_plan<W: AppendOutput>(
     output.emit(format!("%PDF-{}\n", header_version(reader.version(), form)).as_bytes())?;
     output.emit(b"%\xE2\xE3\xCF\xD3\n")?;
 
+    let mut kept = DocumentDataKept::default();
     // Numbers come out in order, so each list is settled as it goes.
     let numbers: Vec<u32> = plan.live.iter().collect();
     let source = Arc::clone(plan.view.whole_file_source());
@@ -365,6 +366,21 @@ pub(super) fn write_plan<W: AppendOutput>(
         let Some(loaded) = plan.load_for_output(number)? else {
             continue;
         };
+        match &loaded {
+            Loaded::Plain(object) => note_document_data(object, &mut kept, 0),
+            Loaded::Stream(dict, body) => {
+                if dict.has_type(b"EmbeddedFile") {
+                    kept.embedded_files += 1;
+                    if let StreamBody::Source { length, .. } = body {
+                        kept.embedded_file_bytes += length;
+                    }
+                }
+                if dict.has_type(b"Metadata") {
+                    kept.metadata_streams += 1;
+                }
+                note_document_data(&Object::Dictionary(dict.clone()), &mut kept, 0);
+            }
+        }
         match loaded {
             Loaded::Plain(object) => {
                 if output.can_compress(generation, &object) {
@@ -413,10 +429,14 @@ pub(super) fn write_plan<W: AppendOutput>(
     if let Some(info) = plan.info.take() {
         match info {
             Object::Reference((number, generation)) if plan.live.get(number) => {
+                if let Ok(Some(Loaded::Plain(Object::Dictionary(info)))) = plan.load_for_output(number) {
+                    kept.info_entries = info.len() as u64;
+                }
                 trailer.set("Info", Object::Reference((number, generation)));
             }
             Object::Dictionary(mut info) => {
                 plan.scrub_dict(&mut info);
+                kept.info_entries = info.len() as u64;
                 trailer.set("Info", Object::Dictionary(info));
             }
             _ => {}
@@ -468,6 +488,7 @@ pub(super) fn write_plan<W: AppendOutput>(
         stream_bytes_copied: output.stream_bytes,
         bytes_examined: plan.work,
         removal: std::mem::take(&mut plan.report),
+        document_data_kept: kept,
         removed_signatures: std::mem::take(&mut plan.signatures),
         signature_removal: std::mem::take(&mut plan.signature_removal),
         sha256,
@@ -479,6 +500,47 @@ pub(super) fn write_plan<W: AppendOutput>(
         unsigned: plan.unsigned,
     };
     Ok((summary, written))
+}
+
+/// Count what one written object holds of the document's own data, looking into what it holds directly.
+fn note_document_data(object: &Object, kept: &mut DocumentDataKept, depth: usize) {
+    if depth > crate::reader::MAX_BRACKET {
+        return;
+    }
+    match object {
+        Object::Dictionary(dict) => {
+            if matches!(dict.get(b"S"), Ok(Object::Name(name)) if name == b"JavaScript") {
+                kept.javascript += 1;
+            }
+            kept.piece_info += u64::from(dict.has(b"PieceInfo"));
+            kept.document_parts |= dict.has(b"DPartRoot");
+            kept.xfa |= dict.has(b"XFA") && dict.has(b"Fields");
+            let remote = matches!(dict.get(b"S"), Ok(Object::Name(name)) if name == b"GoToR" || name == b"GoToE");
+            for (key, value) in dict.iter() {
+                if !remote
+                    && (key == b"D" || key == b"Dest")
+                    && matches!(
+                        value.as_array().map(Vec::as_slice),
+                        Ok([Object::Integer(_), Object::Name(_), ..])
+                    )
+                {
+                    kept.page_position_destinations += 1;
+                }
+                if key == b"OFF"
+                    && let Object::Array(layers) = value
+                {
+                    kept.hidden_layers += layers.len() as u64;
+                }
+                note_document_data(value, kept, depth + 1);
+            }
+        }
+        Object::Array(items) => {
+            for item in items {
+                note_document_data(item, kept, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The first string of `/ID` is the file's permanent identifier and stays. The second changes with each version, so it comes from

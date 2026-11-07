@@ -58,7 +58,7 @@ pub use incremental_document::IncrementalDocument;
 pub use indexed_reader::{AppendDestination, AppendOptions, AppendedFile, TemporaryOutput, append_atomically};
 pub use indexed_reader::{
     AppendError, AppendOutput, AppendResult, AppendSummary, AppendWriter, AppendedObject,
-    BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES, BoundedObjectStream, EncodedStreamLength,
+    BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES, BoundedObjectStream, DocumentDataKept, EncodedStreamLength,
     EncodedStreamLengthUnavailableReason, EncodedStreamProtection, EncodedStreamReader, IndexedObjectCacheStats,
     IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
     IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats, IndexedReaderOptions, IndexedReaderResult,

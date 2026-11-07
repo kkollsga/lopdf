@@ -282,6 +282,9 @@ pub struct RemovalReport {
     /// Shared resource dictionaries left as they were because the content using them couldn't be searched, so
     /// what a removed page used through them may still be in the file.
     pub resources_left_whole: Vec<crate::ObjectId>,
+    /// Structure elements that stayed with text of their own, `/ActualText`, `/Alt`, `/E` or `/T`, though something under them was on a removed page:
+    /// that text may describe it.
+    pub structure_text_spanning_removed_pages: u64,
     /// Resource dictionaries a removed page could draw from that weren't even looked at, past the limit on how many are. What a removed
     /// page used through them may still be in the file.
     pub resource_dictionaries_unlisted: u64,
@@ -299,6 +302,34 @@ pub struct SignatureRemoval {
     pub signature_flags: bool,
     /// The `/DSS` security store was there.
     pub security_store: bool,
+}
+
+/// What the new file still holds that belongs to the document rather than a page, and so stays whatever pages go, though it can repeat what
+/// was on them. A removed page's words are often in an embedded source file, the XMP or `/Info`. This is what a caller can offer to remove as hidden
+/// data, and has to mention before saying anything is gone. Counted over everything written, so a rewrite with no removal says it too.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct DocumentDataKept {
+    /// Embedded files, `/Type /EmbeddedFile`, attached to the document, a page, an annotation or anything else.
+    pub embedded_files: u64,
+    /// Their bytes as stored.
+    pub embedded_file_bytes: u64,
+    /// XMP metadata streams: the document's, and any a page or an object has.
+    pub metadata_streams: u64,
+    /// Entries in `/Info`.
+    pub info_entries: u64,
+    /// JavaScript actions, `/S /JavaScript`, wherever they are, the document's named scripts among them.
+    pub javascript: u64,
+    /// `/PieceInfo` dictionaries: an application's private data, which can hold a whole copy of what was drawn.
+    pub piece_info: u64,
+    /// `/DPartRoot` is there: document-part metadata, which can name pages and hold text.
+    pub document_parts: bool,
+    /// An `/XFA` form is there: a second copy of the form and everything typed into it.
+    pub xfa: bool,
+    /// Destinations given as a page's position, `[3 /Fit]`, that stayed. Where pages went, they were moved to where their page is now.
+    pub page_position_destinations: u64,
+    /// Layers that are off by default: their content is in the file, not shown.
+    pub hidden_layers: u64,
 }
 
 /// What a finished rewrite wrote.
@@ -336,6 +367,8 @@ pub struct RewriteSummary {
     pub removed_signatures: Vec<IndexedSignature>,
     /// What of the signatures went, besides the signatures themselves.
     pub signature_removal: SignatureRemoval,
+    /// What the file still holds that's the document's rather than a page's.
+    pub document_data_kept: DocumentDataKept,
     /// SHA-256 of the whole new file.
     pub sha256: [u8; 32],
 }
