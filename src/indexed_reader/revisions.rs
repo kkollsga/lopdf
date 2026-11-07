@@ -23,6 +23,9 @@ use super::*;
 /// Bytes read past a section looking for its `startxref` and `%%EOF`.
 const END_MARKER_WINDOW: u64 = 4 * 1_024;
 
+/// Room after `startxref` for a number of 20 digits, the blanks around it, and `%%EOF`.
+const END_MARKER_MAX_TAIL: u64 = 64;
+
 /// Bytes of one copy step when extracting a revision.
 pub(super) const COPY_CHUNK_BYTES: usize = 64 * 1_024;
 
@@ -339,8 +342,12 @@ fn read_end_marker(
     let Some(remaining) = source_len.checked_sub(after) else {
         return Ok(None);
     };
-    let window = source.read_range(after, remaining.min(END_MARKER_WINDOW), END_MARKER_WINDOW)?;
-    let Some(keyword) = find(&window, b"startxref") else {
+    // `startxref` is looked for in the window. Past that, what follows a match has to fit too: its number, `%%EOF` and an
+    // added line ending, or a marker near the window's edge would come out one byte too long.
+    let limit = END_MARKER_WINDOW + END_MARKER_MAX_TAIL + ADDED_LINE_ENDING.len() as u64;
+    let window = source.read_range(after, remaining.min(limit), limit)?;
+    let search = window.len().min(END_MARKER_WINDOW as usize);
+    let Some(keyword) = find(&window[..search], b"startxref") else {
         return Ok(None);
     };
     let tail = &window[keyword + b"startxref".len()..];

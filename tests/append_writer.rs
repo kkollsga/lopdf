@@ -1285,6 +1285,37 @@ fn a_file_without_a_final_line_ending_comes_back_exact() {
     assert_eq!(copy, once);
 }
 
+/// The added line ending crossing the end of the window the marker is read from, which made it look like the old file's
+/// own, and the old revision came back one byte too long. Tried at every offset around the edge.
+#[test]
+fn an_added_line_ending_at_the_edge_of_the_window_is_still_recognised() {
+    let mut proved = 0;
+    for padding in 4_000..4_090 {
+        let mut pdf = Pdf::base();
+        let xref = pdf.table(TRAILER);
+        // A comment between the trailer and its marker pushes the marker towards the window's edge.
+        pdf.bytes.push(b'%');
+        pdf.bytes.resize(pdf.bytes.len() + padding, b'x');
+        pdf.bytes.push(b'\n');
+        let mut original = pdf.finish(xref);
+        assert_eq!(original.pop(), Some(b'\n'));
+        let (output, _, _) = small_update(&open(&original));
+        let chain = open(&output).revisions().unwrap();
+        match &chain.revisions[0].range {
+            Some(range) => {
+                proved += 1;
+                assert_eq!(range.end, original.len() as u64, "padding {padding}");
+            }
+            // A marker past the window proves nothing, which is fine. Coming out a byte long isn't.
+            None => assert!(
+                padding > 4_070,
+                "padding {padding}: this marker is well inside the window"
+            ),
+        }
+    }
+    assert!(proved > 60, "only {proved} markers were proved, so this checked little");
+}
+
 /// A linearized file reported as two revisions, the first of which would be a prefix that isn't a
 /// document, or an update on one chaining to the wrong section.
 #[test]

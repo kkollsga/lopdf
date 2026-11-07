@@ -79,17 +79,26 @@ fn matches_document_save_bytes() {
 }
 
 /// A literal string full of bytes to escape taking time quadratic in its length: 4 MiB of them, which
-/// the reader's object limit lets through from a hostile file, would run for hours.
+/// the reader's object limit lets through from a hostile file, would run for hours. The work runs on its own
+/// thread with a limit, so a regression fails here instead of hanging the whole test run.
 #[test]
 fn a_long_string_of_escapes_is_written_in_reasonable_time() {
-    let unbalanced = vec![b'('; 2 * 1_024 * 1_024];
-    let written = write(&Object::String(unbalanced.clone(), StringFormat::Literal));
-    assert_eq!(written.len(), unbalanced.len() * 2 + 2);
-    assert!(written[1..written.len() - 1].chunks(2).all(|pair| pair == b"\\("));
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let unbalanced = vec![b'('; 2 * 1_024 * 1_024];
+        let written = write(&Object::String(unbalanced.clone(), StringFormat::Literal));
+        assert_eq!(written.len(), unbalanced.len() * 2 + 2);
+        assert!(written[1..written.len() - 1].chunks(2).all(|pair| pair == b"\\("));
 
-    let backslashes = vec![b'\\'; 2 * 1_024 * 1_024];
-    let written = write(&Object::String(backslashes.clone(), StringFormat::Literal));
-    assert_eq!(written.len(), backslashes.len() * 2 + 2);
+        let backslashes = vec![b'\\'; 2 * 1_024 * 1_024];
+        let written = write(&Object::String(backslashes.clone(), StringFormat::Literal));
+        assert_eq!(written.len(), backslashes.len() * 2 + 2);
+        done.send(()).unwrap();
+    });
+    // Generous for a loaded machine on a debug build, and nowhere near what quadratic time would take.
+    finished
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("writing two 2 MiB strings took over two minutes, or panicked");
 }
 
 /// The sorted lookup changing which bytes get escaped: balanced parentheses stay bare, and the rest of
