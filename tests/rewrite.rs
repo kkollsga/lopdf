@@ -3015,3 +3015,76 @@ fn a_huge_object_named_from_every_page_is_parsed_a_bounded_number_of_times() {
     // About 400 KB of array: a few passes over it, not one for each page.
     assert!(summary.bytes_examined < 16 * 1_024 * 1_024, "{} bytes examined", summary.bytes_examined);
 }
+
+/// Smaller routes that kept a removed page's words: a direct /Outlines, which pruning skipped; a bookmark with only /SE to an element that went;
+/// a destination given as the page's position, which also pointed at the wrong page afterwards; a structure element with no /Pg of its own under
+/// one on the removed page.
+#[test]
+fn the_smaller_routes_to_a_removed_page_are_closed() {
+    let three = |catalog: &str, objects: &[Obj]| {
+        let mut builder = Builder::new(500);
+        let mut all = vec![
+            obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>")),
+            obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 200 200] >>"),
+            obj(3, "<< /Type /Page /Parent 2 0 R >>"),
+            obj(4, "<< /Type /Page /Parent 2 0 R >>"),
+            obj(5, "<< /Type /Page /Parent 2 0 R >>"),
+        ];
+        all.extend_from_slice(objects);
+        builder.place(Form::Table, &all, 100);
+        builder.finish_revision(Form::Table, "/Root 1 0 R");
+        builder.bytes
+    };
+    // A direct /Outlines.
+    let bytes = three(
+        "/Outlines << /First 10 0 R /Last 11 0 R /Count 2 >>",
+        &[
+            obj(10, "<< /Title (M_DIRECT_ROOT) /Next 11 0 R /Dest [4 0 R /Fit] >>"),
+            obj(11, "<< /Title (K_KEPT) /Prev 10 0 R /Dest [3 0 R /Fit] >>"),
+        ],
+    );
+    let (output, _, _) = rewrite(&bytes, remove_second_page);
+    assert_markers(&output, &["M_DIRECT_ROOT"], &["K_KEPT"]);
+
+    // Only /SE.
+    let bytes = three(
+        "/Outlines 10 0 R /StructTreeRoot << /K [20 0 R 21 0 R] >>",
+        &[
+            obj(10, "<< /First 11 0 R /Last 12 0 R /Count 2 >>"),
+            obj(11, "<< /Title (M_BY_ELEMENT) /Parent 10 0 R /Next 12 0 R /SE 20 0 R >>"),
+            obj(12, "<< /Title (K_BY_ELEMENT) /Parent 10 0 R /Prev 11 0 R /SE 21 0 R >>"),
+            obj(20, "<< /S /P /Pg 4 0 R /K 0 >>"),
+            obj(21, "<< /S /P /Pg 3 0 R /K 0 >>"),
+        ],
+    );
+    let (output, _, _) = rewrite(&bytes, remove_second_page);
+    assert_markers(&output, &["M_BY_ELEMENT"], &["K_BY_ELEMENT"]);
+
+    // A page's position.
+    let bytes = three(
+        "/Outlines 10 0 R",
+        &[
+            obj(10, "<< /First 11 0 R /Last 12 0 R /Count 2 >>"),
+            obj(11, "<< /Title (M_BY_POSITION) /Parent 10 0 R /Next 12 0 R /Dest [1 /Fit] >>"),
+            obj(12, "<< /Title (K_BY_POSITION) /Parent 10 0 R /Prev 11 0 R /A << /S /GoTo /D [2 /Fit] >> >>"),
+            obj(13, "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A << /S /GoToR /F (other.pdf) /D [2 /Fit] >> >>"),
+        ],
+    );
+    let (output, _, after) = rewrite(&bytes, remove_second_page);
+    assert_markers(&output, &["M_BY_POSITION"], &["K_BY_POSITION"]);
+    let kept = dict(&after, 12);
+    let destination = kept.get(b"A").unwrap().as_dict().unwrap().get(b"D").unwrap().as_array().unwrap().clone();
+    assert_eq!(destination[0], Object::Integer(1), "the third page is the second now");
+
+    // No /Pg of its own, under one on the removed page.
+    let bytes = three(
+        "/StructTreeRoot << /K [20 0 R 22 0 R] >>",
+        &[
+            obj(20, "<< /S /Sect /Pg 4 0 R /K [21 0 R] >>"),
+            obj(21, "<< /S /P /P 20 0 R /K 0 /ActualText (M_INHERITED) >>"),
+            obj(22, "<< /S /P /Pg 3 0 R /K 0 /ActualText (K_OWN) >>"),
+        ],
+    );
+    let (output, _, _) = rewrite(&bytes, remove_second_page);
+    assert_markers(&output, &["M_INHERITED"], &["K_OWN"]);
+}

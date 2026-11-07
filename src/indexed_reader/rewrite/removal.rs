@@ -75,6 +75,18 @@ impl Plan<'_> {
             }
         }
         let kept: Vec<&PageMapEntry> = map.pages.iter().filter(|entry| !self.dead.get(entry.id.0)).collect();
+        let mut position = 0_i64;
+        self.page_positions = Some(
+            map.pages
+                .iter()
+                .map(|entry| {
+                    (!self.dead.get(entry.id.0)).then(|| {
+                        position += 1;
+                        position - 1
+                    })
+                })
+                .collect(),
+        );
         if kept.is_empty() {
             return Err(RewriteError::NoPagesLeft);
         }
@@ -154,9 +166,10 @@ impl Plan<'_> {
         }
 
         self.prune_page_tree(&catalog, &held_up)?;
+        // Structure first: a bookmark can go to an element, and whether it's gone decides the bookmark.
+        self.prune_structure(&mut catalog, &parent_keys)?;
         self.prune_outlines(&mut catalog)?;
         self.prune_form(&mut catalog, &kept_annotations)?;
-        self.prune_structure(&mut catalog, &parent_keys)?;
         self.rebuild_page_labels(&mut catalog, &map)?;
         self.prune_threads(&mut catalog)?;
 
@@ -168,9 +181,16 @@ impl Plan<'_> {
     /// Whether a destination ends at a removed page. A destination that names nothing known isn't this.
     fn destination_is_gone(&mut self, value: &Object, depth: usize) -> RewriteResult<bool> {
         Ok(match value {
-            Object::Array(items) => {
-                matches!(items.first(), Some(Object::Reference((number, _))) if self.dead.get(*number))
-            }
+            Object::Array(items) => match items.first() {
+                Some(Object::Reference((number, _))) => self.dead.get(*number),
+                // A page's position, which some files use in place of a reference.
+                Some(Object::Integer(position)) => self
+                    .page_positions
+                    .as_ref()
+                    .and_then(|positions| positions.get(usize::try_from(*position).ok()?))
+                    .is_some_and(Option::is_none),
+                _ => false,
+            },
             Object::Reference(_) if depth < 8 => match self.deref(value)? {
                 Some(target) => self.destination_is_gone(&target, depth + 1)?,
                 None => false,
@@ -184,8 +204,14 @@ impl Plan<'_> {
         })
     }
 
-    /// Whether a link or a bookmark goes to a removed page, directly or by a `/GoTo`.
+    /// Whether a link or a bookmark goes to a removed page, directly or by a `/GoTo`, or, with neither, to a structure element that went.
     fn target_is_gone(&mut self, dict: &Dictionary) -> RewriteResult<bool> {
+        if !dict.has(b"Dest")
+            && !dict.has(b"A")
+            && matches!(dict.get(b"SE"), Ok(Object::Reference((element, _))) if self.dead.get(*element))
+        {
+            return Ok(true);
+        }
         if let Ok(destination) = dict.get(b"Dest")
             && self.destination_is_gone(&destination.clone(), 0)?
         {
@@ -495,6 +521,11 @@ impl Plan<'_> {
     }
 
     fn prune_outlines(&mut self, catalog: &mut Dictionary) -> RewriteResult<()> {
+        // A direct /Outlines, which isn't allowed and which hostile files have, becomes an object of its own, so it can be pruned like any other.
+        if let Ok(Object::Dictionary(direct)) = catalog.get(b"Outlines").cloned() {
+            let number = self.add_planned_object(Object::Dictionary(direct))?;
+            catalog.set("Outlines", Object::Reference((number, 0)));
+        }
         let Some(root) = reference(catalog, b"Outlines") else {
             return Ok(());
         };
@@ -645,7 +676,7 @@ impl Plan<'_> {
             first: reference(dict, b"First"),
             last: reference(dict, b"Last"),
             count: dict.get(b"Count").and_then(Object::as_i64).ok(),
-            has_target: dict.has(b"Dest") || dict.has(b"A"),
+            has_target: dict.has(b"Dest") || dict.has(b"A") || dict.has(b"SE"),
             target_gone: self.target_is_gone(dict)?,
             children: Vec::new(),
         })
@@ -850,7 +881,11 @@ impl Plan<'_> {
                 }
                 continue;
             }
-            let own_page_gone = matches!(element.get(b"Pg"), Ok(Object::Reference((page, _))) if self.dead.get(*page));
+            // An element with no /Pg of its own is taken to be on its parent's page, as viewers take it for its marked content.
+            let own_page_gone = match element.get(b"Pg") {
+                Ok(Object::Reference((page, _))) => self.dead.get(*page),
+                _ => page_gone,
+            };
             let kids = match element.get(b"K") {
                 Ok(kids) => self.deref(&kids.clone())?,
                 Err(_) => None,

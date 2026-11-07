@@ -12,6 +12,10 @@ const WORK_ALLOWANCE: u64 = 256 * 1_024 * 1_024;
 const WORK_PER_FILE_BYTE: u64 = 32;
 /// Objects in one new file. Every section is read back with the reader's limit of a million entries.
 pub(super) const MAX_REWRITE_OBJECTS: u64 = 900_000;
+/// Objects planning can add of its own.
+const PLANNED_OBJECTS: u32 = 16;
+/// The names a destination's second element can have.
+const DESTINATION_FITS: [&[u8]; 8] = [b"XYZ", b"Fit", b"FitH", b"FitV", b"FitR", b"FitB", b"FitBH", b"FitBV"];
 /// How long a chain of references a load follows.
 const DEREFERENCE_LIMIT: usize = 32;
 
@@ -66,6 +70,10 @@ impl Bits {
 
     pub(super) fn count(&self) -> u64 {
         self.count
+    }
+
+    pub(super) fn capacity(&self) -> u32 {
+        self.capacity
     }
 
     pub(super) fn unset(&mut self, number: u32) {
@@ -197,6 +205,8 @@ pub(super) struct Plan<'c> {
     header_generations: HashMap<u32, u16>,
     /// Destination names that went, which links and bookmarks may still use.
     pub(super) dead_names: HashSet<Vec<u8>>,
+    /// Where each page of the original is in the new file, when pages are removed: for a destination given as a page's position.
+    pub(super) page_positions: Option<Vec<Option<i64>>>,
     pub(super) report: RemovalReport,
     pub(super) signatures: Vec<IndexedSignature>,
     pub(super) signature_removal: SignatureRemoval,
@@ -382,7 +392,8 @@ impl<'c> Plan<'c> {
                 .map_err(|_| RewriteError::InvalidRoot)?,
         };
         let info = new_info.or_else(|| reader.index.trailer.get(b"Info").ok().cloned());
-        let capacity = next_number.min(MAX_OBJECT_NUMBER).saturating_add(1);
+        // Room for the few objects planning itself adds, such as a direct /Outlines made an object of its own.
+        let capacity = next_number.saturating_add(PLANNED_OBJECTS).min(MAX_OBJECT_NUMBER).saturating_add(1);
         let identity = objects.is_empty() && removed_pages.is_empty() && removed_objects.is_empty();
         let mut plan = Self {
             view: reader.uncached_view(),
@@ -398,6 +409,7 @@ impl<'c> Plan<'c> {
             list_arrays: HashSet::new(),
             header_generations: HashMap::new(),
             dead_names: HashSet::new(),
+            page_positions: None,
             report: RemovalReport::default(),
             unsigned: !signatures.is_empty(),
             signatures,
@@ -452,6 +464,20 @@ impl<'c> Plan<'c> {
         }
         check_signatures(&plan.signatures, policy, replaces_original)?;
         Ok(plan)
+    }
+
+    /// Add an object of planning's own, under a new number.
+    pub(super) fn add_planned_object(&mut self, object: Object) -> RewriteResult<u32> {
+        let number = self.next_number;
+        if number >= self.dead.capacity() {
+            return Err(RewriteError::ObjectNumberTooLarge {
+                number: u64::from(number),
+                limit: MAX_OBJECT_NUMBER,
+            });
+        }
+        self.next_number += 1;
+        self.objects.insert(number, Change::Object { generation: 0, object });
+        Ok(number)
     }
 
     pub(super) fn charge(&mut self, bytes: u64) -> RewriteResult<()> {
@@ -892,6 +918,8 @@ impl<'c> Plan<'c> {
             return false;
         }
         let is_goto = matches!(dict.get(b"S"), Ok(Object::Name(name)) if name == b"GoTo");
+        // A position in another file means nothing here.
+        let remote = matches!(dict.get(b"S"), Ok(Object::Name(name)) if name == b"GoToR" || name == b"GoToE" || name == b"Launch");
         let held_target = is_goto && dict.has(b"D");
         let dead_names = &self.dead_names;
         let names_gone = |value: &Object| match value {
@@ -901,6 +929,12 @@ impl<'c> Plan<'c> {
         let name_target_gone = !dead_names.is_empty();
         dict.as_hashmap_mut().retain(|key, value| {
             if name_target_gone && (key == b"Dest" || (is_goto && key == b"D")) && names_gone(value) {
+                return false;
+            }
+            if !remote
+                && let Object::Array(items) = value
+                && !self.renumber_destination(items)
+            {
                 return false;
             }
             self.scrub_entry(key, value, page_gone)
@@ -939,8 +973,35 @@ impl<'c> Plan<'c> {
         !(page_gone && (kid.has_type(b"MCR") || kid.has_type(b"OBJR")) && !kid.has(b"Pg"))
     }
 
+    /// A destination given as a page's position, `[3 /Fit]`, moved to where that page is now. False if its page is gone. Anything else is left alone.
+    fn renumber_destination(&self, items: &mut [Object]) -> bool {
+        let Some(positions) = &self.page_positions else {
+            return true;
+        };
+        let [Object::Integer(position), Object::Name(fit), ..] = items else {
+            return true;
+        };
+        if !DESTINATION_FITS.contains(&fit.as_slice()) {
+            return true;
+        }
+        match usize::try_from(*position).ok().and_then(|position| positions.get(position)) {
+            Some(Some(now)) => {
+                items[0] = Object::Integer(*now);
+                true
+            }
+            Some(None) => false,
+            None => true,
+        }
+    }
+
     fn scrub_array(&self, items: &mut [Object]) {
         for item in items {
+            if let Object::Array(inner) = item
+                && !self.renumber_destination(inner)
+            {
+                *item = Object::Null;
+                continue;
+            }
             match item {
                 Object::Reference((target, _)) if self.gone(*target) => *item = Object::Null,
                 Object::Array(inner) => {
