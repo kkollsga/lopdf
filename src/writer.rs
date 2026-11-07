@@ -706,11 +706,12 @@ impl Writer {
                     }
                 }
                 escape_indice.append(&mut parentheses);
+                escape_indice.sort_unstable();
 
                 file.write_all(b"(")?;
                 if !escape_indice.is_empty() || text.iter().any(|&byte| octal(byte)) {
                     for (index, &byte) in text.iter().enumerate() {
-                        if escape_indice.contains(&index) {
+                        if escape_indice.binary_search(&index).is_ok() {
                             file.write_all(b"\\")?;
                             file.write_all(&[if byte == b'\r' { b'r' } else { byte }])?;
                         } else if octal(byte) {

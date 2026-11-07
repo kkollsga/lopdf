@@ -77,3 +77,26 @@ fn matches_document_save_bytes() {
 
     assert_eq!(&saved[start..end], write(&object).as_slice());
 }
+
+/// A literal string full of bytes to escape taking time quadratic in its length: 4 MiB of them, which
+/// the reader's object limit lets through from a hostile file, would run for hours.
+#[test]
+fn a_long_string_of_escapes_is_written_in_reasonable_time() {
+    let unbalanced = vec![b'('; 2 * 1_024 * 1_024];
+    let written = write(&Object::String(unbalanced.clone(), StringFormat::Literal));
+    assert_eq!(written.len(), unbalanced.len() * 2 + 2);
+    assert!(written[1..written.len() - 1].chunks(2).all(|pair| pair == b"\\("));
+
+    let backslashes = vec![b'\\'; 2 * 1_024 * 1_024];
+    let written = write(&Object::String(backslashes.clone(), StringFormat::Literal));
+    assert_eq!(written.len(), backslashes.len() * 2 + 2);
+}
+
+/// The sorted lookup changing which bytes get escaped: balanced parentheses stay bare, and the rest of
+/// a mixed string is escaped where it was.
+#[test]
+fn escapes_land_on_the_same_bytes() {
+    let mixed = b"a(b)c)d(e\\f\rg".to_vec();
+    let written = write(&Object::String(mixed, StringFormat::Literal));
+    assert_eq!(written, b"(a(b)c\\)d\\(e\\\\f\\rg)".to_vec());
+}
