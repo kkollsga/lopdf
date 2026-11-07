@@ -57,14 +57,14 @@ pub use incremental_document::IncrementalDocument;
 #[cfg(any(unix, windows))]
 pub use indexed_reader::append_atomically;
 pub use indexed_reader::{
-    AppendError, AppendResult, AppendSummary, AppendWriter, AppendedObject, BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES,
-    BoundedObjectStream, EncodedStreamLength, EncodedStreamLengthUnavailableReason, EncodedStreamProtection,
-    EncodedStreamReader, IndexedObjectCacheStats, IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader,
-    IndexedReaderCacheOptions, IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats,
-    IndexedReaderOptions, IndexedReaderResult, IndexedReaderSourceCacheStats, IndexedRevision, IndexedRevisionChain,
-    IndexedStreamDescriptor, IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind,
-    InheritedPageAttributeOwners, MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry,
-    SharedIndexedReaderResult,
+    AppendError, AppendResult, AppendSummary, AppendWriter, AppendedObject,
+    BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES, BoundedObjectStream, EncodedStreamLength,
+    EncodedStreamLengthUnavailableReason, EncodedStreamProtection, EncodedStreamReader, IndexedObjectCacheStats,
+    IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
+    IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats, IndexedReaderOptions, IndexedReaderResult,
+    IndexedReaderSourceCacheStats, IndexedRevision, IndexedRevisionChain, IndexedStreamDescriptor,
+    IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind, InheritedPageAttributeOwners,
+    MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry, SharedIndexedReaderResult,
 };
 pub use linearization::Linearization;
 pub use load_options::{DEFAULT_MAX_DECOMPRESSED_SIZE, FilterFunc, LoadOptions};

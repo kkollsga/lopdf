@@ -93,9 +93,7 @@ impl XrefWalkBudget {
     }
 
     fn charge_entries(&mut self, count: usize) -> IndexedReaderResult<()> {
-        self.entries = self
-            .entries
-            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        self.entries = self.entries.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
         if self.entries > MAX_XREF_WALK_ENTRIES {
             return Err(IndexedReaderError::EntryLimitExceeded {
                 count: self.entries,
@@ -928,7 +926,9 @@ fn trailer_unsigned(dictionary: &Dictionary, key: &[u8]) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
-pub(super) fn trailer_offset(dictionary: &Dictionary, key: &[u8], name: &'static str) -> IndexedReaderResult<Option<u64>> {
+pub(super) fn trailer_offset(
+    dictionary: &Dictionary, key: &[u8], name: &'static str,
+) -> IndexedReaderResult<Option<u64>> {
     match dictionary.get(key) {
         Ok(object) => object
             .as_i64()

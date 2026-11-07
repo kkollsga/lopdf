@@ -253,9 +253,11 @@ fn round_trip(path: &Path, out: &Path) -> serde_json::Value {
     let whole_original = digest_prefix(path, original_len) == digest_prefix(&second, original_len);
     let pages_after = final_reader.page_count().ok();
     let eager = (std::fs::metadata(&second).unwrap().len() < 64 * 1_024 * 1_024).then(|| {
-        lopdf::Document::load(&second)
-            .map(|document| document.get_object((added, 0)).is_ok())
-            .unwrap_or(false)
+        // Not `Document::load`, which is async under the `async` feature.
+        std::fs::read(&second)
+            .ok()
+            .and_then(|bytes| lopdf::Document::load_mem(&bytes).ok())
+            .is_some_and(|document| document.get_object((added, 0)).is_ok())
     });
     let _ = std::fs::remove_file(&first);
 
