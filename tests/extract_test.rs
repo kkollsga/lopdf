@@ -306,3 +306,91 @@ fn decode_text_keeps_mapped_codes_outside_the_declared_codespace_width() {
         "\u{fffd}C"
     );
 }
+
+/// The codespace of a CMap that takes codes of any width, as a mixed-width font's does.
+const ANY_WIDTH: &str = "<00> <FF>\n<0000> <FFFF>\n<000000> <FFFFFF>\n<00000000> <FFFFFFFF>";
+
+/// Decode through `Document`'s route for a simple font with this CMap, with or without an `/Encoding`.
+fn decode_simple_font(codespaces: &str, mappings: &str, encoding: Option<&str>, bytes: &[u8]) -> String {
+    let cmap = tounicode_with_codespaces(codespaces, mappings);
+    let mut doc = Document::new();
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let mut font = dictionary! { "Type" => "Font", "Subtype" => "Type1", "ToUnicode" => cmap_id };
+    if let Some(encoding) = encoding {
+        font.set("Encoding", encoding);
+    }
+    let encoding = font.get_font_encoding(&doc).unwrap();
+    Document::decode_text(&encoding, bytes).unwrap()
+}
+
+/// Upstream's #661 narrowed a simple font's CMap to one-byte codes, which threw away every mapping wider than a byte. A font with a real mixed-width
+/// CMap then read as replacement characters: `ABC😀` became `A` and a string of them. Found by distillPDF on moving to this merge.
+#[test]
+fn a_simple_fonts_multi_byte_mappings_survive() {
+    let mappings = "<01> <0041>\n<0203> <0042>\n<040506> <0043>\n<0708090A> <D83DDE00>\n<0B> <0044>";
+    let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0xA, 0xFF, 0xFF, 0xFF, 0xFF, 0xC];
+    assert_eq!(
+        decode_simple_font(ANY_WIDTH, mappings, None, &bytes),
+        "ABC😀\u{fffd}\u{fffd}"
+    );
+
+    // A two-byte code to two characters, then a one-byte code, which used to read as two replacements and `C`.
+    assert_eq!(
+        decode_simple_font(ANY_WIDTH, "<0102> <00410042>\n<03> <0043>", None, &[1, 2, 3]),
+        "ABC"
+    );
+}
+
+/// `Document` losing what `OwnedEncoding` keeps. With no `/Encoding` in the way, both routes read the same CMap, so they have to agree.
+#[test]
+fn both_routes_read_a_simple_fonts_multi_byte_cmap_alike() {
+    for (mappings, bytes) in [
+        (
+            "<01> <0041>\n<0203> <0042>\n<040506> <0043>\n<0708090A> <D83DDE00>\n<0B> <0044>",
+            &[1_u8, 2, 3, 4, 5, 6, 7, 8, 9, 0xA, 0xFF, 0xFF, 0xFF, 0xFF, 0xC][..],
+        ),
+        ("<0102> <00410042>\n<03> <0043>", &[1, 2, 3][..]),
+    ] {
+        let cmap = tounicode_with_codespaces(ANY_WIDTH, mappings);
+        let owned = lopdf::OwnedEncoding::from_to_unicode_for_extraction(cmap.into_bytes()).unwrap();
+        let mut from_owned = String::new();
+        owned.write_to_string(bytes, &mut from_owned).unwrap();
+        assert_eq!(decode_simple_font(ANY_WIDTH, mappings, None, bytes), from_owned);
+    }
+}
+
+/// Keeping wide mappings costing what #661 fixed: a key like `<0041>` still means the one-byte code 0x41, beside a real two-byte key in the same CMap. Each
+/// has to work, and neither may take the other's bytes.
+#[test]
+fn padded_keys_and_real_wide_keys_work_side_by_side() {
+    let mappings = "<0041> <0391>\n<0203> <0392>\n<43> <0393>";
+    assert_eq!(
+        decode_simple_font(ANY_WIDTH, mappings, None, &[0x41, 2, 3, 0x43]),
+        "\u{0391}\u{0392}\u{0393}"
+    );
+}
+
+/// `/Encoding` taking a byte that begins a wide code, which would make that code unreachable, or wide mappings switching off the per-code fallback that
+/// ISO 32000-1 9.10.2 calls for.
+#[test]
+fn encoding_fills_only_the_codes_no_mapping_can_use() {
+    let mappings = "<41> <0391>\n<0203> <0392>";
+    assert_eq!(
+        decode_simple_font(ANY_WIDTH, mappings, Some("WinAnsiEncoding"), &[0x41, 0x42, 2, 3]),
+        "\u{0391}B\u{0392}"
+    );
+}
+
+/// A one-byte CMap, the ordinary case, staying exactly as #661 made it: the codespace is one byte and the rest comes from `/Encoding`.
+#[test]
+fn an_all_one_byte_cmap_still_falls_back_per_code() {
+    assert_eq!(
+        decode_simple_font(
+            "<0000> <FFFF>",
+            "<0041> <0391>\n<42> <0392>",
+            Some("WinAnsiEncoding"),
+            b"ABC"
+        ),
+        "\u{0391}\u{0392}C"
+    );
+}

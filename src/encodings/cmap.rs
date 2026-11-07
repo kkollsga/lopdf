@@ -115,26 +115,54 @@ impl ToUnicodeCMap {
         Ok(cmap)
     }
 
-    /// The CMap to decode a simple font with. A simple font's character codes are always
-    /// one byte (ISO 32000-1, 9.6.1), but its ToUnicode CMap is often written with a two-byte
-    /// codespace and two-byte keys such as `<0041>`; read as is, two codes would be taken
-    /// for one. Each code 0..=255 is therefore looked up as a one-byte key, then as a two-byte
-    /// key, and a code the CMap does not map is taken from `fallback` (the font's /Encoding),
-    /// since ToUnicode CMaps often cover only some of a font's codes.
+    /// The CMap to decode a simple font with. A simple font's character codes are one byte (ISO 32000-1, 9.6.1), but its
+    /// ToUnicode CMap is often written with a two-byte codespace and keys such as `<0041>`; read as is, two codes would be taken
+    /// for one. So each code 0..=255 is looked up as a one-byte key, then as a two-byte key, and a code the CMap doesn't map is
+    /// taken from `fallback` (the font's /Encoding), since ToUnicode CMaps often cover only some of a font's codes.
+    ///
+    /// A key whose leading byte isn't zero can't be one of those, so the CMap means what it says: such files do show several
+    /// bytes per code, and text is lost if they're split. Those mappings stay, with the codespace that goes with them. A byte that
+    /// begins one is left to it, unless the CMap maps that byte on its own, and takes nothing from `fallback`.
     pub(crate) fn for_simple_font(&self, mut fallback: impl FnMut(u8) -> Option<Vec<u16>>) -> ToUnicodeCMap {
         let mut cmap = Self::new();
-        for code in 0..=u8::MAX {
-            let unicode = self
-                .get(code as SourceCode, 1)
-                .or_else(|| self.get(code as SourceCode, 2))
-                .or_else(|| fallback(code));
-            if let Some(unicode) = unicode {
-                cmap.put_char(code as SourceCode, 1, unicode);
+        for (index, ranges) in self.bf_ranges.iter().enumerate().skip(1) {
+            let leading_byte_shift = 8 * index;
+            for (range, target) in ranges.iter() {
+                if range.end() >> leading_byte_shift != 0 {
+                    cmap.put(*range.start(), *range.end(), (index + 1) as CodeLen, target.clone());
+                }
             }
         }
-        cmap.codespace_ranges.push((0x00, 0xFF, 1));
+        let has_wide_codes = cmap.bf_ranges.iter().any(|ranges| !ranges.is_empty());
+        for code in 0..=u8::MAX {
+            let code = code as SourceCode;
+            let unicode = self.get(code, 1).or_else(|| {
+                if cmap.begins_a_wider_code(code) {
+                    return None;
+                }
+                self.get(code, 2).or_else(|| fallback(code as u8))
+            });
+            if let Some(unicode) = unicode {
+                cmap.put_char(code, 1, unicode);
+            }
+        }
+        if has_wide_codes {
+            cmap.codespace_ranges = self.codespace_ranges.clone();
+        } else {
+            cmap.codespace_ranges.push((0x00, 0xFF, 1));
+        }
         cmap.build_reverse_map();
         cmap
+    }
+
+    /// Whether any mapping wider than a byte starts with this byte.
+    fn begins_a_wider_code(&self, byte: SourceCode) -> bool {
+        self.bf_ranges.iter().enumerate().skip(1).any(|(index, ranges)| {
+            let shift = 8 * index as u32;
+            let first = byte << shift;
+            let last = first | ((1_u32 << shift) - 1);
+            ranges.overlaps(&(first..=last))
+        })
     }
 
     fn build_reverse_map(&mut self) {
