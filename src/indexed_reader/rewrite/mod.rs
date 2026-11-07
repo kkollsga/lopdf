@@ -123,8 +123,9 @@ pub enum RewriteError {
     AmbiguousHybrid { object: u32 },
     #[error("can't rewrite: the trailer's /Root isn't a reference to a dictionary")]
     InvalidRoot,
-    #[error("a rewrite breaks this file's {} signature(s), and that wasn't asked for", signatures.len())]
-    SignaturesWouldBreak { signatures: Vec<IndexedSignature> },
+    /// A rewritten copy of a signed file is unsigned, which needs [`RewritePolicy::remove_signatures`].
+    #[error("this file has {} signature(s), and a rewritten copy would be unsigned, which wasn't asked for", signatures.len())]
+    SignedNeedsConsent { signatures: Vec<IndexedSignature> },
     #[error("this file is signed, so its bytes never change: save a rewrite to a new file")]
     SignedFileCannotBeReplaced { signatures: Vec<IndexedSignature> },
     #[error("page index {index} is past the end of this document's {pages} pages")]
@@ -214,7 +215,7 @@ pub enum RewriteFormChoice {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[must_use]
 pub struct RewritePolicy {
-    allow_breaking_signatures: bool,
+    remove_signatures: bool,
     form: RewriteFormChoice,
 }
 
@@ -224,10 +225,14 @@ impl RewritePolicy {
         Self::default()
     }
 
-    /// Rewrite a signed file, which breaks every signature in it. For a Save As: a rewrite over the signed file itself is
-    /// refused anyway, since its bytes never change. [`RewriteSummary::broken_signatures`] lists what broke.
-    pub fn allow_breaking_signatures(mut self) -> Self {
-        self.allow_breaking_signatures = true;
+    /// Rewrite a signed file into an unsigned copy, with the caller's consent. A rewrite can't keep a signature whole, so it
+    /// doesn't keep one broken either: every signature goes, with what a viewer would show of it. That's each signature field, its value
+    /// and its widgets with their appearances, `/Perms` (certification and usage rights), the form's `/SigFlags` and the `/DSS`
+    /// security store. A signature drawn into page content isn't a field, and stays as content. [`RewriteSummary::removed_signatures`] and
+    /// [`RewriteSummary::signature_removal`] say what went. For a new file: a rewrite over the signed file itself is refused whatever this says,
+    /// since a signed file's bytes never change.
+    pub fn remove_signatures(mut self) -> Self {
+        self.remove_signatures = true;
         self
     }
 
@@ -279,6 +284,20 @@ pub struct RemovalReport {
     pub resources_left_whole: Vec<crate::ObjectId>,
 }
 
+/// What removing signatures took out.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SignatureRemoval {
+    /// Signature fields and their widgets.
+    pub fields: u64,
+    /// `/Perms` was there: certification, usage rights or both.
+    pub permissions: bool,
+    /// The form's `/SigFlags` was there.
+    pub signature_flags: bool,
+    /// The `/DSS` security store was there.
+    pub security_store: bool,
+}
+
 /// What a finished rewrite wrote.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -306,9 +325,11 @@ pub struct RewriteSummary {
     pub stream_bytes_copied: u64,
     /// What removing pages took out.
     pub removal: RemovalReport,
-    /// Every signature the rewrite broke. Empty for a file with none. A signature here wasn't checked, and this
+    /// Every signature the copy no longer has. Empty for a file with none. A signature here wasn't checked, and this
     /// doesn't say that it was ever valid.
-    pub broken_signatures: Vec<IndexedSignature>,
+    pub removed_signatures: Vec<IndexedSignature>,
+    /// What of the signatures went, besides the signatures themselves.
+    pub signature_removal: SignatureRemoval,
     /// SHA-256 of the whole new file.
     pub sha256: [u8; 32],
 }
@@ -397,7 +418,7 @@ pub(super) enum Change<'c> {
 /// ```compile_fail,E0277
 /// # use lopdf::{IndexedReader, RewriteChanges, RewritePolicy};
 /// # fn demo(reader: &IndexedReader, file: std::fs::File) {
-/// let _ = RewriteChanges::new(reader).unwrap().write_to(RewritePolicy::new(), file);
+/// let _ = RewriteChanges::new(reader).unwrap().write_unverified_to(RewritePolicy::new(), file);
 /// # }
 /// ```
 pub struct RewriteChanges<'r, 'c> {
@@ -585,17 +606,55 @@ impl<'r, 'c> RewriteChanges<'r, 'c> {
         Ok(generation)
     }
 
-    /// Write the new file to memory or nowhere, and say what it holds. For a file on disk, use
-    /// [`rewrite_atomically`]. Writing to [`std::io::sink`] gives the summary, so a caller can show what a save would do
-    /// before doing it.
+    /// Write the new file to memory or nowhere, unchecked. For a file on disk, use [`rewrite_atomically`], which checks it before anything is
+    /// replaced. What this gives back says in its type that nothing has read the result yet: [`UnverifiedRewrite::verify`] does that, from
+    /// the bytes written. Writing to [`std::io::sink`] gives the summary, so a caller can show what a save would do before doing it.
     ///
     /// # Errors
     ///
     /// Any refusal described in the [module docs](self), and any read or write failure.
-    pub fn write_to<W: AppendOutput>(self, policy: RewritePolicy, out: W) -> RewriteResult<RewriteSummary> {
+    pub fn write_unverified_to<W: AppendOutput>(self, policy: RewritePolicy, out: W) -> RewriteResult<UnverifiedRewrite> {
         let reader = self.reader;
         let plan = Plan::prepare(self, policy, false)?;
-        write_plan(reader, plan, out).map(|(summary, _)| summary)
+        let (summary, written) = write_plan(reader, plan, out)?;
+        Ok(UnverifiedRewrite { summary, written })
+    }
+}
+
+/// A rewrite that has been written and not yet read back. Use what it wrote only after [`verify`](Self::verify).
+#[must_use]
+pub struct UnverifiedRewrite {
+    summary: RewriteSummary,
+    written: Written,
+}
+
+impl std::fmt::Debug for UnverifiedRewrite {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnverifiedRewrite")
+            .field("summary", &self.summary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UnverifiedRewrite {
+    /// What was written, as the writer says.
+    pub fn summary(&self) -> &RewriteSummary {
+        &self.summary
+    }
+
+    /// Check what was written, read back from `written`, as [`rewrite_atomically`] does before it replaces anything: every byte by hash,
+    /// one cross-reference section with nothing missing or dead, the pages there should be, and no signature in a copy that was to have
+    /// none. `original` is the reader the rewrite came from. Gives back the summary and a reader of the new file.
+    ///
+    /// # Errors
+    ///
+    /// [`VerificationFailed`](RewriteError::VerificationFailed) saying what didn't match, or a reader error.
+    pub fn verify(
+        self, original: &IndexedReader, written: Arc<dyn RandomAccessSource>,
+    ) -> RewriteResult<(RewriteSummary, IndexedReader)> {
+        let reader = original.verify_rewritten(written, &self.summary, &self.written)?;
+        Ok((self.summary, reader))
     }
 }
 

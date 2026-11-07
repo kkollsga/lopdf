@@ -62,7 +62,7 @@ fn describe(summary: &RewriteSummary) -> serde_json::Value {
         "object_streams": summary.object_streams,
         "objects_dropped": summary.objects_dropped,
         "stream_bytes_copied": summary.stream_bytes_copied,
-        "broken_signatures": summary.broken_signatures.len(),
+        "removed_signatures": summary.removed_signatures.len(),
         "removal": {
             "pages": summary.removal.pages.len(),
             "page_tree_nodes": summary.removal.page_tree_nodes,
@@ -106,7 +106,7 @@ fn round_trip(path: &Path, out: &Path) -> serde_json::Value {
             Err(_) => reader.resolve_object(*id).is_err(),
         })
         .count();
-    let policy = RewritePolicy::new().allow_breaking_signatures();
+    let policy = RewritePolicy::new().remove_signatures();
 
     let identity_path = out.join(format!("{name}.identity.pdf"));
     let identity = rewrite_atomically(
@@ -183,7 +183,7 @@ fn measure(mode: &str, out: &Path, path: &Path) {
     let reader = open(path).unwrap();
     println!("open {:.1} ms", opened.elapsed().as_secs_f64() * 1e3);
     let started = Instant::now();
-    let policy = RewritePolicy::new().allow_breaking_signatures();
+    let policy = RewritePolicy::new().remove_signatures();
     let done = rewrite_atomically(
         &reader,
         AppendDestination::NewFile(&target),

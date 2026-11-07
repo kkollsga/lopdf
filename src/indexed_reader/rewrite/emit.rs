@@ -34,6 +34,7 @@ pub(super) struct Written {
     entries: Vec<WrittenEntry>,
     dead: Bits,
     expected_pages: Option<usize>,
+    unsigned: bool,
 }
 
 /// An object stream being filled.
@@ -466,13 +467,15 @@ pub(super) fn write_plan<W: AppendOutput>(
         objects_dropped: index_live.saturating_sub(kept_from_source),
         stream_bytes_copied: output.stream_bytes,
         removal: std::mem::take(&mut plan.report),
-        broken_signatures: std::mem::take(&mut plan.signatures),
+        removed_signatures: std::mem::take(&mut plan.signatures),
+        signature_removal: std::mem::take(&mut plan.signature_removal),
         sha256,
     };
     let written = Written {
         entries: output.entries,
         dead: plan.dead,
         expected_pages: plan.expected_pages,
+        unsigned: plan.unsigned,
     };
     Ok((summary, written))
 }
@@ -584,7 +587,6 @@ impl IndexedReader {
                 return failed("an object that was written can't be read back");
             }
         }
-        drop(reuse);
         if written
             .dead
             .iter()
@@ -600,14 +602,24 @@ impl IndexedReader {
         if !matches!(reader.resolve_object(root), Ok(Object::Dictionary(_))) {
             return failed("/Root no longer resolves");
         }
+        let root_number = root.0;
+        let counted = super::plan::count_pages(root_number, self.options.page_tree_depth, |number| {
+            Ok::<_, RewriteError>(match index.locations.get(&number) {
+                Some(ObjectLocation64::Free { .. }) | None => None,
+                _ => match reader.resolve_object_reusing((number, reader.generation_of(number)), &mut reuse) {
+                    Ok(Object::Stream(stream)) => Some(Object::Dictionary(stream.dict)),
+                    Ok(object) => Some(object),
+                    Err(_) => None,
+                },
+            })
+        })?;
         if let Some(expected) = written.expected_pages
-            && reader
-                .page_map_with_container_budget(RETAINED_CONTAINER_BYTES)
-                .ok()
-                .map(|map| map.len())
-                != Some(expected)
+            && counted != Some(expected)
         {
             return failed("it doesn't have the pages it should");
+        }
+        if written.unsigned && !reader.signatures()?.is_empty() {
+            return failed("a copy that was to be unsigned still holds a signature");
         }
         Ok(reader)
     }

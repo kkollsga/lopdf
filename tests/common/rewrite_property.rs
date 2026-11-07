@@ -12,16 +12,19 @@ pub fn check_rewrite_on_any_bytes(data: &[u8]) -> bool {
     let Ok(reader) = IndexedReader::open(BytesSource::from(data.to_vec())) else {
         return false;
     };
-    let policy = RewritePolicy::new().allow_breaking_signatures();
+    let policy = RewritePolicy::new().remove_signatures();
     let pages = reader.page_count().ok();
 
     let mut output = Vec::new();
-    let produced = match RewriteChanges::new(&reader) {
-        Ok(changes) => changes.write_to(policy, &mut output).is_ok(),
-        Err(_) => false,
+    let written = match RewriteChanges::new(&reader) {
+        Ok(changes) => changes.write_unverified_to(policy, &mut output).ok(),
+        Err(_) => None,
     };
-    if produced {
-        let after = IndexedReader::open(BytesSource::from(output.clone())).expect("a finished rewrite doesn't open");
+    let produced = written.is_some();
+    if let Some(written) = written {
+        // The same check a save makes, which has to pass on whatever the writer finished.
+        let source: std::sync::Arc<dyn lopdf::RandomAccessSource> = std::sync::Arc::new(BytesSource::from(output.clone()));
+        let (_, after) = written.verify(&reader, source).expect("a finished rewrite fails its own check");
         assert!(!after.index_stats().unwrap().recovered(), "a finished rewrite needs a rescan");
         assert_eq!(after.revisions().unwrap().revisions.len(), 1, "a finished rewrite has more than one revision");
         if let (Some(pages), Ok(now)) = (pages, after.page_count()) {
@@ -40,8 +43,9 @@ pub fn check_rewrite_on_any_bytes(data: &[u8]) -> bool {
         let mut output = Vec::new();
         if let Ok(mut changes) = RewriteChanges::new(&reader) {
             changes.remove_page(pages / 2);
-            if changes.write_to(policy, &mut output).is_ok() {
-                let after = IndexedReader::open(BytesSource::from(output)).expect("a finished removal doesn't open");
+            if let Ok(written) = changes.write_unverified_to(policy, &mut output) {
+                let source: std::sync::Arc<dyn lopdf::RandomAccessSource> = std::sync::Arc::new(BytesSource::from(output));
+                let (_, after) = written.verify(&reader, source).expect("a finished removal fails its own check");
                 assert!(!after.index_stats().unwrap().recovered(), "a finished removal needs a rescan");
                 if let Ok(now) = after.page_count() {
                     assert!(now < pages, "removing a page left {now} of {pages}");

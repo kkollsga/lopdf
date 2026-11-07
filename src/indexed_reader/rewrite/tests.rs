@@ -323,14 +323,14 @@ fn a_write_that_fails_at_any_point_fails_the_rewrite() {
         let policy = RewritePolicy::new().form(RewriteFormChoice::Force(form));
         let length = RewriteChanges::new(&reader)
             .unwrap()
-            .write_to(policy, std::io::sink())
+            .write_unverified_to(policy, std::io::sink())
             .unwrap()
             .new_len as usize;
         // The output buffer holds 64 KiB, so a small file only reaches its writer at the end, in one piece.
         for allowed in 0..length {
             let result = RewriteChanges::new(&reader)
                 .unwrap()
-                .write_to(policy, FailsAfter(allowed));
+                .write_unverified_to(policy, FailsAfter(allowed));
             assert!(
                 matches!(result, Err(RewriteError::Io(_))),
                 "{form:?} at {allowed}: {result:?}"
@@ -339,7 +339,7 @@ fn a_write_that_fails_at_any_point_fails_the_rewrite() {
         assert!(
             RewriteChanges::new(&reader)
                 .unwrap()
-                .write_to(policy, FailsAfter(length))
+                .write_unverified_to(policy, FailsAfter(length))
                 .is_ok()
         );
     }

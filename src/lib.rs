@@ -66,7 +66,7 @@ pub use indexed_reader::{
     IndexedStreamDescriptor, IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind,
     InheritedPageAttributeOwners, MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry,
     RemovalReport, RewriteChanges, RewriteError, RewriteForm, RewriteFormChoice, RewritePolicy, RewriteResult,
-    RewriteSummary, SharedIndexedReaderResult,
+    RewriteSummary, SharedIndexedReaderResult, SignatureRemoval, UnverifiedRewrite,
 };
 #[cfg(any(unix, windows))]
 pub use indexed_reader::{RewriteOptions, RewrittenFile, rewrite_atomically};

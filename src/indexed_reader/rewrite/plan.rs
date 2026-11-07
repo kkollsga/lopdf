@@ -68,6 +68,13 @@ impl Bits {
         self.count
     }
 
+    pub(super) fn unset(&mut self, number: u32) {
+        if self.get(number) {
+            self.words[(number / 64) as usize] &= !(1 << (number % 64));
+            self.count -= 1;
+        }
+    }
+
     pub(super) fn clear(&mut self) {
         self.words.fill(0);
         self.count = 0;
@@ -147,6 +154,9 @@ pub(super) struct Plan<'c> {
     pub(super) dead_names: HashSet<Vec<u8>>,
     pub(super) report: RemovalReport,
     pub(super) signatures: Vec<IndexedSignature>,
+    pub(super) signature_removal: SignatureRemoval,
+    /// The copy is to have no signature, which verification checks.
+    pub(super) unsigned: bool,
     pub(super) expected_pages: Option<usize>,
     containers: Containers,
     work: u64,
@@ -154,6 +164,14 @@ pub(super) struct Plan<'c> {
 }
 
 impl IndexedReader {
+    /// The generation the index gives a number: a normal entry's own, otherwise 0.
+    pub(super) fn generation_of(&self, number: u32) -> u16 {
+        match self.index.locations.get(&number) {
+            Some(ObjectLocation64::Normal { generation, .. }) => *generation,
+            _ => 0,
+        }
+    }
+
     /// Frame a normal object by its number. The cross-reference data's generation can disagree with the object's own header, and a reference
     /// matching the header still resolves, as it does in viewers. So the header is what's believed, and what's returned. Any other failure comes back as it was.
     pub(super) fn frame_at_header_generation(
@@ -165,6 +183,102 @@ impl IndexedReader {
                 ..
             }) if actual.0 == id.0 => (actual, self.resolve_normal_framed(actual)),
             other => (id, other),
+        }
+    }
+}
+
+impl Plan<'_> {
+    /// Pages a caller removed as objects: a page itself, or one under a page-tree node that was removed.
+    fn pages_under_removed_objects(&mut self) -> RewriteResult<Vec<usize>> {
+        let map = self.view.page_map_with_container_budget(RETAINED_CONTAINER_BYTES)?;
+        let mut indices = Vec::new();
+        for (index, entry) in map.pages.iter().enumerate() {
+            if self.dead.get(entry.id.0) {
+                indices.push(index);
+                continue;
+            }
+            let mut parent = self.peek_dict(entry.id.0)?.and_then(|page| page.get(b"Parent").ok().cloned());
+            let mut seen = HashSet::new();
+            while let Some(Object::Reference((number, _))) = parent {
+                if !seen.insert(number) || seen.len() > self.view.options.page_tree_depth {
+                    break;
+                }
+                if self.dead.get(number) {
+                    indices.push(index);
+                    break;
+                }
+                parent = self.peek_dict(number)?.and_then(|node| node.get(b"Parent").ok().cloned());
+            }
+        }
+        // They go through the page removal, which marks them dead again itself.
+        for index in &indices {
+            self.dead.unset(map.pages[*index].id.0);
+        }
+        Ok(indices)
+    }
+
+    /// Pages the new file will have, counted through the page tree as it'll be written, with what's gone already gone. Verification counts the
+    /// written file the same way, so the two are compared like with like. `None` where the tree loops or runs too deep to count.
+    fn planned_page_count(&mut self) -> RewriteResult<Option<usize>> {
+        let root = self.root;
+        let limit = self.view.options.page_tree_depth;
+        count_pages(root, limit, |number| {
+            Ok(self.load_for_output(number)?.map(|loaded| match loaded {
+                Loaded::Plain(object) => object,
+                Loaded::Stream(dict, _) => Object::Dictionary(dict),
+            }))
+        })
+    }
+}
+
+/// Count the leaves of a page tree, every place they're listed, from the catalog `root`, with `load` giving an object, a stream as its dictionary.
+/// The one count both the plan and the check use. `None` if the tree loops or is deeper than `limit`.
+pub(super) fn count_pages<E>(
+    root: u32, limit: usize, mut load: impl FnMut(u32) -> Result<Option<Object>, E>,
+) -> Result<Option<usize>, E> {
+    let Some(Object::Dictionary(catalog)) = load(root)? else {
+        return Ok(None);
+    };
+    let Ok(Object::Reference((pages, _))) = catalog.get(b"Pages") else {
+        return Ok(Some(0));
+    };
+    let mut count = 0_usize;
+    let mut on_path: Vec<u32> = Vec::new();
+    let mut stack: Vec<Vec<Object>> = Vec::new();
+    let mut next = Some(*pages);
+    loop {
+        if let Some(number) = next.take() {
+            if on_path.contains(&number) || on_path.len() > limit {
+                return Ok(None);
+            }
+            match load(number)? {
+                Some(Object::Dictionary(node)) if node.has_type(b"Pages") => {
+                    let mut kids = match node.get(b"Kids") {
+                        Ok(Object::Array(kids)) => kids.clone(),
+                        Ok(Object::Reference((kids, _))) => match load(*kids)? {
+                            Some(Object::Array(kids)) => kids,
+                            _ => Vec::new(),
+                        },
+                        _ => Vec::new(),
+                    };
+                    kids.reverse();
+                    on_path.push(number);
+                    stack.push(kids);
+                }
+                Some(Object::Dictionary(node)) if node.has_type(b"Page") => count += 1,
+                _ => {}
+            }
+        }
+        let Some(kids) = stack.last_mut() else {
+            return Ok(Some(count));
+        };
+        match kids.pop() {
+            Some(Object::Reference((kid, _))) => next = Some(kid),
+            Some(_) => {}
+            None => {
+                stack.pop();
+                on_path.pop();
+            }
         }
     }
 }
@@ -181,8 +295,8 @@ fn check_signatures(
             signatures: signatures.to_vec(),
         });
     }
-    if !policy.allow_breaking_signatures {
-        return Err(RewriteError::SignaturesWouldBreak {
+    if !policy.remove_signatures {
+        return Err(RewriteError::SignedNeedsConsent {
             signatures: signatures.to_vec(),
         });
     }
@@ -235,7 +349,9 @@ impl<'c> Plan<'c> {
             header_generations: HashMap::new(),
             dead_names: HashSet::new(),
             report: RemovalReport::default(),
+            unsigned: !signatures.is_empty(),
             signatures,
+            signature_removal: SignatureRemoval::default(),
             expected_pages: None,
             containers: Containers::default(),
             work: 0,
@@ -248,28 +364,30 @@ impl<'c> Plan<'c> {
         if plan.load(root)?.is_none_or(|object| object.dictionary().is_none()) {
             return Err(RewriteError::InvalidRoot);
         }
-        for number in removed_objects {
-            plan.dead.set(number);
+        for number in &removed_objects {
+            plan.dead.set(*number);
         }
         if plan.dead.get(root) {
             return Err(RewriteError::TrailerTargetMissing {
                 id: (root, root_generation),
             });
         }
+        // A page or a page-tree node removed as an object is a page removal, with all that goes with one: otherwise /Count and every
+        // other reference to it would be left as they were.
+        let mut removed_pages = removed_pages;
+        if !removed_objects.is_empty() {
+            removed_pages.extend(plan.pages_under_removed_objects()?);
+        }
         let mut removal = None;
         if !removed_pages.is_empty() {
             removal = Some(plan.plan_page_removal(&removed_pages)?);
-            if plan.objects.is_empty() {
-                plan.expected_pages = removal.as_ref().map(PageRemoval::kept_count);
-            }
-        } else if identity {
-            plan.expected_pages = plan
-                .view
-                .page_map_with_container_budget(RETAINED_CONTAINER_BYTES)
-                .ok()
-                .map(|map| map.len());
+        }
+        if !plan.signatures.is_empty() {
+            plan.plan_signature_removal()?;
         }
         plan.walk(removal)?;
+        plan.expected_pages = plan.planned_page_count()?;
+        let _ = identity;
         if plan.live.count() > MAX_REWRITE_OBJECTS {
             return Err(RewriteError::TooManyObjects {
                 objects: plan.live.count(),
@@ -630,6 +748,18 @@ impl<'c> Plan<'c> {
         let Some(mut loaded) = self.load(number)? else {
             return Ok(None);
         };
+        if self.unsigned
+            && let Some(dict) = loaded.dictionary()
+        {
+            // Whatever is left of a signature that the removal didn't reach by its field: a dictionary in an object stream, a widget
+            // somewhere else.
+            let is_signature_field = matches!(dict.get(b"FT"), Ok(Object::Name(name)) if name == b"Sig");
+            if super::signatures::is_signature_dictionary(dict).is_some() || is_signature_field {
+                let dict = dict.clone();
+                self.note_signature_dictionary(Some(number), &dict);
+                return Ok(None);
+            }
+        }
         match &mut loaded {
             Loaded::Stream(dict, _) => {
                 // An old object stream holds its neighbours as they were, and a cross-reference stream old offsets. Whatever refers to

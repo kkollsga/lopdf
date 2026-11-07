@@ -73,9 +73,11 @@ impl Plan<'_> {
         if let Some(index) = indices.iter().find(|index| **index >= pages) {
             return Err(RewriteError::PageOutOfRange { index: *index, pages });
         }
+        let mut listed = HashSet::new();
         for index in indices {
             let id = map.pages[*index].id;
-            if self.dead.set(id.0) {
+            self.dead.set(id.0);
+            if listed.insert(id) {
                 self.report.pages.push(id);
             }
         }
@@ -1054,5 +1056,92 @@ fn set_link(dict: &mut Dictionary, key: &[u8], number: Option<u32>) {
         None => {
             dict.remove(key);
         }
+    }
+}
+
+impl Plan<'_> {
+    /// Take every signature out, with what a viewer would show of one. Only called with consent, which the policy check made sure of. What a field
+    /// doesn't reach, `load_for_output` drops as it comes across it.
+    pub(super) fn plan_signature_removal(&mut self) -> RewriteResult<()> {
+        let mut catalog = self.peek_dict(self.root)?.ok_or(RewriteError::InvalidRoot)?;
+        self.signature_removal.permissions = catalog.remove(b"Perms").is_some();
+        self.signature_removal.security_store = catalog.remove(b"DSS").is_some();
+        let holder = reference(&catalog, b"AcroForm");
+        if let Some(mut form) = self.deref_dict(catalog.get(b"AcroForm").ok())? {
+            self.signature_removal.signature_flags = form.remove(b"SigFlags").is_some();
+            let fields = self.deref_array(form.get(b"Fields").ok())?;
+            let had_fields = !fields.is_empty();
+            let mut kept = Vec::new();
+            let mut seen = HashSet::new();
+            for field in fields {
+                if self.unsigned_field_stays(&field, false, 0, &mut seen)? {
+                    kept.push(field);
+                }
+            }
+            if had_fields && kept.is_empty() {
+                catalog.remove(b"AcroForm");
+                if let Some(number) = holder {
+                    self.dead.set(number);
+                }
+            } else {
+                form.set("Fields", Object::Array(kept));
+                match holder {
+                    Some(number) => self.store_edit(number, form)?,
+                    None => catalog.set("AcroForm", Object::Dictionary(form)),
+                }
+            }
+        }
+        self.store_edit(self.root, catalog)
+    }
+
+    /// Whether a field stays once signatures are gone. A signature field goes with everything under it and its value; a field left with no kids goes too.
+    fn unsigned_field_stays(
+        &mut self, field: &Object, inherited_signature: bool, depth: usize, seen: &mut HashSet<u32>,
+    ) -> RewriteResult<bool> {
+        let number = match field {
+            Object::Reference((number, _)) => Some(*number),
+            _ => None,
+        };
+        if let Some(number) = number
+            && (self.dead.get(number) || !seen.insert(number))
+        {
+            return Ok(!self.dead.get(number));
+        }
+        let Some(dict) = self.deref_dict(Some(field))? else {
+            return Ok(true);
+        };
+        let signature = match dict.get(b"FT") {
+            Ok(Object::Name(name)) => name == b"Sig",
+            _ => inherited_signature,
+        };
+        let kids = self.deref_array(dict.get(b"Kids").ok())?;
+        if signature {
+            if let Some(number) = number {
+                self.dead.set(number);
+            }
+            self.signature_removal.fields += 1;
+            for key in [&b"V"[..], b"Lock", b"SV"] {
+                if let Ok(Object::Reference((value, _))) = dict.get(key) {
+                    self.dead.set(*value);
+                }
+            }
+            for kid in kids {
+                if depth < MAX_TREE_DEPTH {
+                    self.unsigned_field_stays(&kid, true, depth + 1, seen)?;
+                }
+            }
+            return Ok(false);
+        }
+        if kids.is_empty() || depth >= MAX_TREE_DEPTH {
+            return Ok(true);
+        }
+        let mut any = false;
+        for kid in kids {
+            any |= self.unsigned_field_stays(&kid, false, depth + 1, seen)?;
+        }
+        if !any && let Some(number) = number {
+            self.dead.set(number);
+        }
+        Ok(any)
     }
 }

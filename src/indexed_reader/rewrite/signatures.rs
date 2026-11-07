@@ -15,6 +15,9 @@ pub enum IndexedSignatureKind {
     Signature,
     /// `/Type /DocTimeStamp`.
     DocumentTimestamp,
+    /// Usage rights, `/Perms /UR3` or `/UR`: a signature over the file by whoever enabled extra features in a reader, not by a person. A rewrite
+    /// breaks it like any other, so it needs the same consent and goes the same way.
+    UsageRights,
 }
 
 /// A signature found in a file. It says what's there, and never that it's valid or who really signed it.
@@ -109,13 +112,24 @@ impl IndexedReader {
         else {
             return Ok(());
         };
-        if let Some(permissions) = self.dict_at(catalog.get(b"Perms").ok()) {
-            for (_, value) in permissions.iter() {
+        let permissions = self.dict_at(catalog.get(b"Perms").ok());
+        self.collect_form_signatures(&catalog, found);
+        if let Some(permissions) = permissions {
+            for (key, value) in permissions.iter() {
+                let rights = key == b"UR" || key == b"UR3";
+                let before = found.len();
                 self.note_field_signature(value, None, found);
+                if rights && let Some(signature) = found.get_mut(before) {
+                    signature.kind = IndexedSignatureKind::UsageRights;
+                }
             }
         }
+        Ok(())
+    }
+
+    fn collect_form_signatures(&self, catalog: &Dictionary, found: &mut Vec<IndexedSignature>) {
         let Some(form) = self.dict_at(catalog.get(b"AcroForm").ok()) else {
-            return Ok(());
+            return;
         };
         let mut stack: Vec<u32> = Vec::new();
         if let Some(Object::Array(fields)) = self.value_at(form.get(b"Fields").ok()) {
@@ -149,7 +163,6 @@ impl IndexedReader {
                 );
             }
         }
-        Ok(())
     }
 
     fn note_field_signature(&self, value: &Object, field_name: Option<Vec<u8>>, found: &mut Vec<IndexedSignature>) {

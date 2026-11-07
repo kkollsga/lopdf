@@ -292,9 +292,12 @@ fn rewrite_with(
     let mut changes = RewriteChanges::new(&reader).expect("this file can be rewritten");
     change(&mut changes);
     let mut output = Vec::new();
-    let summary = changes.write_to(policy, &mut output).expect("the rewrite is written");
-    assert_eq!(summary.new_len, output.len() as u64);
-    let after = IndexedReader::open(BytesSource::from(output.clone())).expect("the result opens");
+    let unverified = changes.write_unverified_to(policy, &mut output).expect("the rewrite is written");
+    assert_eq!(unverified.summary().new_len, output.len() as u64);
+    // Every rewrite in these tests goes through the same check a save does.
+    let (summary, after) = unverified
+        .verify(&reader, std::sync::Arc::new(BytesSource::from(output.clone())))
+        .expect("the result passes its check");
     (output, summary, after)
 }
 
@@ -1308,13 +1311,13 @@ fn pages_that_cannot_be_removed_are_refused() {
     changes.remove_page(0);
     changes.remove_page(1);
     assert!(matches!(
-        changes.write_to(RewritePolicy::new(), std::io::sink()),
+        changes.write_unverified_to(RewritePolicy::new(), std::io::sink()),
         Err(RewriteError::NoPagesLeft)
     ));
     let mut changes = RewriteChanges::new(&reader).unwrap();
     changes.remove_page(2);
     assert!(matches!(
-        changes.write_to(RewritePolicy::new(), std::io::sink()),
+        changes.write_unverified_to(RewritePolicy::new(), std::io::sink()),
         Err(RewriteError::PageOutOfRange { index: 2, pages: 2 })
     ));
 }
@@ -1616,7 +1619,7 @@ fn bad_changes_are_refused() {
     let mut changes = RewriteChanges::new(&reader).unwrap();
     let id = changes.allocate().unwrap();
     assert!(matches!(
-        changes.write_to(RewritePolicy::new(), std::io::sink()),
+        changes.write_unverified_to(RewritePolicy::new(), std::io::sink()),
         Err(RewriteError::ReservedNotWritten { id: reserved }) if reserved == id
     ));
     let mut changes = RewriteChanges::new(&reader).unwrap();
@@ -1643,7 +1646,7 @@ fn bad_changes_are_refused() {
             .write_stream_from((3, 0), Dictionary::new(), declared, given)
             .unwrap();
         assert!(matches!(
-            changes.write_to(RewritePolicy::new(), std::io::sink()),
+            changes.write_unverified_to(RewritePolicy::new(), std::io::sink()),
             Err(RewriteError::StreamLengthMismatch { .. })
         ));
     }
@@ -1719,56 +1722,126 @@ fn new_objects_a_new_root_and_a_removed_object() {
 
 // ---- Refusals. ----
 
-fn signed_document(form: Form) -> Vec<u8> {
+/// A signed document with everything that makes a viewer show a signature: a signed field that is its widget, with a drawn appearance; a signed field
+/// with a widget of its own on the other page; a certification and usage rights in /Perms; the form's signature flags; a security store. And a text field
+/// that has nothing to do with any of it.
+fn signed_everywhere(form: Form) -> Vec<u8> {
     let mut builder = Builder::new(500);
+    let sig = |number: u32, extra: &str, range: &str| Obj {
+        number,
+        generation: 0,
+        body: format!(
+            "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Name (Somebody) {extra} /ByteRange [{range}] /Contents <00AABB> >>"
+        )
+        .into_bytes(),
+        // Top level, as a signature has to be.
+        is_stream: true,
+    };
     let objects = vec![
-        obj(1, "<< /Type /Catalog /Pages 2 0 R /AcroForm << /SigFlags 3 /Fields [5 0 R] >> >>"),
+        obj(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 6 0 R /UR3 7 0 R >> /DSS 8 0 R \
+             /AcroForm << /SigFlags 3 /Fields [5 0 R 9 0 R 10 0 R] /DA (/Helv 0 Tf 0 g) >> >>",
+        ),
         obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>"),
-        obj(3, "<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
-        obj(4, "<< /Type /Page /Parent 2 0 R >>"),
-        obj(5, "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /Rect [0 0 0 0] /P 3 0 R /V 6 0 R >>"),
-        Obj {
-            number: 6,
-            generation: 0,
-            body: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Name (Somebody) /ByteRange [0 100 200 300] /Contents <00AABB> >>".to_vec(),
-            is_stream: true,
-        },
+        obj(3, "<< /Type /Page /Parent 2 0 R /Annots [5 0 R 9 0 R] >>"),
+        obj(4, "<< /Type /Page /Parent 2 0 R /Annots [12 0 R] >>"),
+        obj(
+            5,
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /Rect [0 0 90 20] /P 3 0 R /V 6 0 R /AP << /N 11 0 R >> /Lock 14 0 R >>",
+        ),
+        sig(6, "/Reference [<< /TransformMethod /DocMDP /TransformParams << /P 2 >> >>]", "0 100 200 300"),
+        sig(7, "/Reference [<< /TransformMethod /UR3 >>]", "0 110 210 310"),
+        obj(8, "<< /Certs [15 0 R] >>"),
+        deflated(15, "", b"M_CERTIFICATE"),
+        obj(9, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (K_TYPED) /Rect [0 0 90 20] /P 3 0 R >>"),
+        obj(10, "<< /FT /Sig /T (Signature2) /Kids [12 0 R] /V 13 0 R >>"),
+        obj(12, "<< /Type /Annot /Subtype /Widget /Parent 10 0 R /Rect [0 0 90 20] /P 4 0 R /AP << /N 16 0 R >> >>"),
+        deflated(11, "/Type /XObject /Subtype /Form /BBox [0 0 90 20]", b"(M_SIGNED_BY_ONE) Tj"),
+        deflated(16, "/Type /XObject /Subtype /Form /BBox [0 0 90 20]", b"(M_SIGNED_BY_TWO) Tj"),
+        sig(13, "", "0 120 220 320"),
+        obj(14, "<< /Type /SigFieldLock /Action /All >>"),
     ];
     builder.place(form, &objects, 100);
     builder.finish_revision(form, "/Root 1 0 R");
     builder.bytes
 }
 
-/// A signed file being rewritten without anyone asking, which silently breaks its signature.
+/// A rewrite of a signed file without anyone asking, which would leave it broken; and with consent, a copy that still shows a signature anywhere a viewer
+/// looks: a field, its value, its drawn box, /Perms, the form's flags, the security store. The owner's rule is that a rewritten copy is unsigned, never
+/// broken. A text field next to the signatures stays.
 #[test]
-fn a_signed_file_is_refused_unless_it_is_asked_for() {
+fn a_rewritten_copy_of_a_signed_file_is_unsigned() {
     for form in ALL_FORMS {
-        let bytes = signed_document(form);
+        let bytes = signed_everywhere(form);
         let reader = open_bytes(&bytes);
         let found = reader.signatures().unwrap();
-        assert_eq!(found.len(), 1, "{form:?}: {found:?}");
-        assert_eq!(found[0].object, Some((6, 0)));
-        assert_eq!(found[0].byte_range, Some([0, 100, 200, 300]));
-        assert_eq!(found[0].sub_filter.as_deref(), Some(&b"adbe.pkcs7.detached"[..]));
-        assert_eq!(found[0].stated_name.as_deref(), Some(&b"Somebody"[..]));
-        assert_eq!(found[0].field_name.as_deref(), Some(&b"Signature1"[..]));
-        assert_eq!(found[0].kind, IndexedSignatureKind::Signature);
+        assert_eq!(found.len(), 3, "{form:?}: {found:?}");
+        let first = found.iter().find(|found| found.object == Some((6, 0))).unwrap();
+        assert_eq!(first.byte_range, Some([0, 100, 200, 300]));
+        assert_eq!(first.sub_filter.as_deref(), Some(&b"adbe.pkcs7.detached"[..]));
+        assert_eq!(first.stated_name.as_deref(), Some(&b"Somebody"[..]));
+        assert_eq!(first.field_name.as_deref(), Some(&b"Signature1"[..]));
+        assert_eq!(first.kind, IndexedSignatureKind::Signature);
+        let rights = found.iter().find(|found| found.object == Some((7, 0))).unwrap();
+        assert_eq!(rights.kind, IndexedSignatureKind::UsageRights);
 
         let changes = RewriteChanges::new(&reader).unwrap();
-        let refused = changes.write_to(RewritePolicy::new(), std::io::sink());
+        let refused = changes.write_unverified_to(RewritePolicy::new(), std::io::sink());
         assert!(
-            matches!(&refused, Err(RewriteError::SignaturesWouldBreak { signatures }) if signatures.len() == 1),
+            matches!(&refused, Err(RewriteError::SignedNeedsConsent { signatures }) if signatures.len() == 3),
             "{refused:?}"
         );
 
-        let allowed = RewritePolicy::new().allow_breaking_signatures();
-        let (output, summary, after) = rewrite_with(&bytes, allowed, |_| {});
-        assert_eq!(summary.broken_signatures.len(), 1);
-        assert_eq!(summary.broken_signatures[0].object, Some((6, 0)));
+        let consent = RewritePolicy::new().remove_signatures();
+        let (output, summary, after) = rewrite_with(&bytes, consent, |_| {});
+        dump(&format!("unsigned_{form:?}.pdf"), &output);
+        assert_eq!(summary.removed_signatures.len(), 3);
+        let parts = &summary.signature_removal;
+        assert_eq!(parts.fields, 3, "the two signature fields and the second one's widget");
+        assert!(parts.permissions && parts.signature_flags && parts.security_store);
+        assert!(after.signatures().unwrap().is_empty(), "{form:?}: the copy still holds a signature");
+        assert_markers(&output, &["M_SIGNED_BY_ONE", "M_SIGNED_BY_TWO", "M_CERTIFICATE", "ByteRange", "SigFlags"], &["K_TYPED"]);
+        let catalog = dict(&after, 1);
+        assert!(!catalog.has(b"Perms") && !catalog.has(b"DSS"));
+        let acro = catalog.get(b"AcroForm").unwrap().as_dict().unwrap();
+        assert_eq!(acro.get(b"Fields").unwrap().as_array().unwrap(), &vec![Object::Reference((9, 0))]);
+        assert_eq!(dict(&after, 3).get(b"Annots").unwrap().as_array().unwrap(), &vec![Object::Reference((9, 0))]);
+        assert!(dict(&after, 4).get(b"Annots").unwrap().as_array().unwrap().is_empty());
         assert_eq!(after.page_count().unwrap(), 2);
-        // It stays, so that a viewer sees a broken signature rather than a drawn-on "signed by" with nothing behind it.
-        assert!(output.windows(10).any(|window| window == b"/ByteRange"));
     }
+}
+
+/// Usage rights alone, as every IRS form has: not a signature anyone made, but a signature over the file all the same, which a rewrite breaks. They're
+/// classed as usage rights, need the same consent, and go the same way.
+#[test]
+fn usage_rights_are_classed_as_such_and_removed_with_consent() {
+    let mut builder = Builder::new(500);
+    let objects = vec![
+        obj(1, "<< /Type /Catalog /Pages 2 0 R /Perms << /UR3 7 0 R >> >>"),
+        obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 9 9] >>"),
+        obj(3, "<< /Type /Page /Parent 2 0 R >>"),
+        Obj {
+            number: 7,
+            generation: 0,
+            body: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Reference [<< /TransformMethod /UR3 >>] /ByteRange [0 1 2 3] /Contents <00> >>".to_vec(),
+            is_stream: true,
+        },
+    ];
+    builder.place(Form::Table, &objects, 100);
+    builder.finish_revision(Form::Table, "/Root 1 0 R");
+    let reader = open_bytes(&builder.bytes);
+    let found = reader.signatures().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].kind, IndexedSignatureKind::UsageRights);
+    assert!(matches!(
+        RewriteChanges::new(&reader).unwrap().write_unverified_to(RewritePolicy::new(), std::io::sink()),
+        Err(RewriteError::SignedNeedsConsent { .. })
+    ));
+    let (output, summary, after) = rewrite_with(&builder.bytes, RewritePolicy::new().remove_signatures(), |_| {});
+    assert!(summary.signature_removal.permissions);
+    assert!(after.signatures().unwrap().is_empty());
+    assert_markers(&output, &["UR3", "ByteRange"], &[]);
 }
 
 /// A signature the newest revision no longer mentions being missed, so that its signed bytes are replaced without a word, as they would be if
@@ -1805,9 +1878,9 @@ fn a_signature_only_an_old_revision_holds_counts() {
     builder.finish_revision(Form::Compressed, "/Root 1 0 R");
     let reader = open_bytes(&builder.bytes);
     let changes = RewriteChanges::new(&reader).unwrap();
-    let refused = changes.write_to(RewritePolicy::new(), std::io::sink());
+    let refused = changes.write_unverified_to(RewritePolicy::new(), std::io::sink());
     match refused {
-        Err(RewriteError::SignaturesWouldBreak { signatures }) => {
+        Err(RewriteError::SignedNeedsConsent { signatures }) => {
             assert_eq!(signatures.len(), 1, "{signatures:?}");
             assert_eq!(signatures[0].object, Some((6, 0)));
         }
@@ -1871,7 +1944,7 @@ fn an_object_that_can_be_reached_and_cannot_be_read_is_refused() {
     let reader = open_bytes(&builder.bytes);
     let refused = RewriteChanges::new(&reader)
         .unwrap()
-        .write_to(RewritePolicy::new(), std::io::sink());
+        .write_unverified_to(RewritePolicy::new(), std::io::sink());
     assert!(
         matches!(refused, Err(RewriteError::UnreadableObject { id: (4, 0), .. })),
         "{refused:?}"
@@ -2081,30 +2154,31 @@ fn a_prepare_step_works_as_it_does_for_an_append() {
     no_temporary_names(folder.path());
 }
 
-/// A rewrite over a signed file itself getting through because it was asked for, or by naming the same file another way. The signed bytes
-/// never change, whatever is asked. A Save As, when asked for, has to work and say what broke.
+/// A rewrite over a signed file itself getting through because consent was given, or by naming the same file another way. The signed bytes never change,
+/// whatever is asked. A Save As with consent has to work, leave the original as it was, and say what it removed.
 #[test]
-fn a_signed_file_is_never_replaced_and_a_save_as_says_what_broke() {
-    let bytes = signed_document(Form::Table);
+fn a_signed_file_is_never_replaced_and_a_save_as_says_what_it_removed() {
+    let bytes = signed_everywhere(Form::Table);
     let folder = tempfile::tempdir().unwrap();
     let (path, reader) = on_disk(folder.path(), &bytes);
-    let allow = || RewriteOptions::new().policy(RewritePolicy::new().allow_breaking_signatures());
-    let refused = rewrite_atomically(&reader, AppendDestination::SameFile(&path), allow(), |_| Ok(()));
+    let consent = || RewriteOptions::new().policy(RewritePolicy::new().remove_signatures());
+    let refused = rewrite_atomically(&reader, AppendDestination::SameFile(&path), consent(), |_| Ok(()));
     assert!(matches!(refused, Err(RewriteError::SignedFileCannotBeReplaced { .. })));
-    let refused = rewrite_atomically(&reader, AppendDestination::OverwriteOther(&path), allow(), |_| Ok(()));
+    let refused = rewrite_atomically(&reader, AppendDestination::OverwriteOther(&path), consent(), |_| Ok(()));
     assert!(matches!(refused, Err(RewriteError::SignedFileCannotBeReplaced { .. })));
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 
     let new = folder.path().join("copy.pdf");
-    let refused = rewrite_atomically(&reader, AppendDestination::NewFile(&new), RewriteOptions::new(), |_| {
-        Ok(())
-    });
-    assert!(matches!(refused, Err(RewriteError::SignaturesWouldBreak { .. })));
+    let refused = rewrite_atomically(&reader, AppendDestination::NewFile(&new), RewriteOptions::new(), |_| Ok(()));
+    assert!(matches!(refused, Err(RewriteError::SignedNeedsConsent { .. })));
     assert!(!new.exists());
 
-    let done = rewrite_atomically(&reader, AppendDestination::NewFile(&new), allow(), |_| Ok(())).unwrap();
-    assert_eq!(done.summary.broken_signatures.len(), 1);
+    let done = rewrite_atomically(&reader, AppendDestination::NewFile(&new), consent(), |_| Ok(())).unwrap();
+    assert_eq!(done.summary.removed_signatures.len(), 3);
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    // The copy isn't signed, so it can be saved over like any other file.
+    let saved = rewrite_atomically(&done.reader, AppendDestination::SameFile(&new), RewriteOptions::new(), |_| Ok(())).unwrap();
+    assert!(saved.summary.removed_signatures.is_empty());
     no_temporary_names(folder.path());
 }
 
@@ -2264,9 +2338,9 @@ fn a_million_references_to_one_object_copy_it_once() {
     let mut output = Vec::new();
     let summary = RewriteChanges::new(&reader)
         .unwrap()
-        .write_to(RewritePolicy::new(), &mut output)
+        .write_unverified_to(RewritePolicy::new(), &mut output)
         .unwrap();
-    assert_eq!(summary.objects_written, 5);
+    assert_eq!(summary.summary().objects_written, 5);
     assert!(started.elapsed().as_secs() < 60, "{:?}", started.elapsed());
     let count = output.windows(8).filter(|window| window == b"K_TARGET").count();
     assert_eq!(count, 1);
@@ -2291,16 +2365,16 @@ fn a_page_tree_loop_is_handled() {
     ]);
     let reader = open_bytes(&bytes);
     let mut output = Vec::new();
-    RewriteChanges::new(&reader)
+    let _ = RewriteChanges::new(&reader)
         .unwrap()
-        .write_to(RewritePolicy::new(), &mut output)
+        .write_unverified_to(RewritePolicy::new(), &mut output)
         .unwrap();
     assert!(IndexedReader::open(BytesSource::from(output)).is_ok());
 
     let mut changes = RewriteChanges::new(&reader).unwrap();
     changes.remove_page(0);
-    match changes.write_to(RewritePolicy::new(), Vec::new()) {
-        Ok(summary) => assert_eq!(summary.removal.pages, vec![(3, 0)]),
+    match changes.write_unverified_to(RewritePolicy::new(), Vec::new()) {
+        Ok(written) => assert_eq!(written.summary().removal.pages, vec![(3, 0)]),
         // What the reader makes of a loop is its own business: this only has to end, and say something true.
         Err(error) => assert!(
             matches!(
@@ -2582,4 +2656,60 @@ fn every_byte_range_in_the_file_is_found_wherever_it_is() {
         let found = open_bytes(&bytes).signatures().unwrap();
         assert_eq!(found.len(), 1, "{key}{value:.40}");
     }
+}
+
+/// A page removed as an object, not by its position: /Count stayed at what it was, so PDFium counted a page that isn't there, and nothing checked.
+/// It's a page removal, with everything that goes with one. So is a /Pages node removed as an object.
+#[test]
+fn removing_a_page_as_an_object_removes_it_as_a_page() {
+    let (output, summary, after) = rewrite(&rich_document(Form::Table), |changes| changes.remove_object((4, 0)));
+    assert_eq!(summary.removal.pages, vec![(4, 0)]);
+    assert_eq!(dict(&after, 2).get(b"Count").unwrap().as_i64().unwrap(), 2);
+    assert_markers(&output, &GONE, &KEPT);
+
+    let (_, summary, after) = rewrite(&nested_tree(Form::Table), |changes| changes.remove_object((10, 0)));
+    assert_eq!(summary.removal.pages.len(), 2);
+    assert_eq!(after.page_count().unwrap(), 1);
+    assert_eq!(dict(&after, 2).get(b"Count").unwrap().as_i64().unwrap(), 1);
+}
+
+/// A caller's change that leaves the page tree saying something else than it holds getting through, because the page count was only checked
+/// when nothing had changed or pages were removed by position.
+#[test]
+fn the_page_count_is_checked_whatever_changed() {
+    let bytes = two_pages("", &[], "", "");
+    let reader = open_bytes(&bytes);
+    let mut changes = RewriteChanges::new(&reader).unwrap();
+    // A new kid that the planned count sees and that the written file has too: a check that compares the two passes.
+    let page = changes
+        .add_object(Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => Object::Reference((2, 0)) }))
+        .unwrap();
+    changes
+        .write_object(
+            (2, 0),
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference((3, 0)), Object::Reference((4, 0)), Object::Reference(page)],
+                "Count" => 3,
+                "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            }),
+        )
+        .unwrap();
+    let mut output = Vec::new();
+    let written = changes.write_unverified_to(RewritePolicy::new(), &mut output).unwrap();
+    let (_, after) = written
+        .verify(&reader, std::sync::Arc::new(BytesSource::from(output.clone())))
+        .unwrap();
+    assert_eq!(after.page_count().unwrap(), 3);
+
+    // Bytes that aren't what was written fail the check.
+    let mut changes = RewriteChanges::new(&reader).unwrap();
+    changes.remove_page(1);
+    let mut output = Vec::new();
+    let written = changes.write_unverified_to(RewritePolicy::new(), &mut output).unwrap();
+    let damaged = String::from_utf8_lossy(&output).replace("/Count 1", "/Count 2").into_bytes();
+    assert!(matches!(
+        written.verify(&reader, std::sync::Arc::new(BytesSource::from(damaged))),
+        Err(RewriteError::VerificationFailed { .. })
+    ));
 }
