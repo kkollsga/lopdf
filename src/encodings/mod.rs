@@ -47,6 +47,30 @@ pub fn write_to_bytes(encoding: &CodedCharacterSet, text: &str, out: &mut Vec<u8
     }
 }
 
+/// The predefined CMaps whose character codes are Unicode values (ISO 32000-1:2008, 9.7.5.2,
+/// Table 118): names containing "UCS2" use UCS-2 and names containing "UTF16" use UTF-16BE,
+/// so both are decoded as UTF-16BE.
+const UNICODE_PREDEFINED_CMAPS: &[&[u8]] = &[
+    b"UniGB-UCS2-H",
+    b"UniGB-UCS2-V",
+    b"UniGB-UTF16-H",
+    b"UniGB-UTF16-V",
+    b"UniCNS-UCS2-H",
+    b"UniCNS-UCS2-V",
+    b"UniCNS-UTF16-H",
+    b"UniCNS-UTF16-V",
+    b"UniJIS-UCS2-H",
+    b"UniJIS-UCS2-V",
+    b"UniJIS-UCS2-HW-H",
+    b"UniJIS-UCS2-HW-V",
+    b"UniJIS-UTF16-H",
+    b"UniJIS-UTF16-V",
+    b"UniKS-UCS2-H",
+    b"UniKS-UCS2-V",
+    b"UniKS-UTF16-H",
+    b"UniKS-UTF16-V",
+];
+
 pub enum Encoding<'a> {
     OneByteEncoding(&'a CodedCharacterSet),
     SimpleEncoding(&'a [u8]),
@@ -100,8 +124,8 @@ impl OwnedEncoding {
     ///
     /// The five predefined one-byte names use the same tables as
     /// [`Dictionary::get_font_encoding`](crate::Dictionary::get_font_encoding).
-    /// Every other name is retained as a simple encoding; this includes the two
-    /// supported UniGB names and unknown names that return
+    /// Every other name is retained as a simple encoding; this includes the predefined
+    /// Unicode CMaps, which decode as UTF-16BE, and unknown names that return
     /// [`Error::CharacterEncoding`] when text is written. `Identity-H` and
     /// `Identity-V` require the already-decoded `/ToUnicode` bytes in
     /// `to_unicode`; other names ignore that argument.
@@ -232,7 +256,7 @@ fn write_glyph_to_string(glyph: Glyph, out: &mut String) {
 
 fn write_simple_to_string(name: &[u8], bytes: &[u8], out: &mut String) -> Result<()> {
     match name {
-        b"UniGB-UCS2-H" | b"UniGB-UTF16-H" => {
+        name if UNICODE_PREDEFINED_CMAPS.contains(&name) => {
             out.push_str(UTF_16BE.decode(bytes).0.as_ref());
             Ok(())
         }
@@ -656,6 +680,48 @@ mod tests {
         let result = Encoding::UnicodeMapEncoding(cmap).bytes_to_string(&bytes);
 
         assert_eq!(result.unwrap(), "\u{0024}");
+    }
+
+    #[test]
+    fn unicode_predefined_cmaps_decode_as_utf16_be() {
+        // Every name in ISO 32000-1 Table 118 that contains "UCS2" or "UTF16".
+        let names: [&[u8]; 18] = [
+            b"UniGB-UCS2-H",
+            b"UniGB-UCS2-V",
+            b"UniGB-UTF16-H",
+            b"UniGB-UTF16-V",
+            b"UniCNS-UCS2-H",
+            b"UniCNS-UCS2-V",
+            b"UniCNS-UTF16-H",
+            b"UniCNS-UTF16-V",
+            b"UniJIS-UCS2-H",
+            b"UniJIS-UCS2-V",
+            b"UniJIS-UCS2-HW-H",
+            b"UniJIS-UCS2-HW-V",
+            b"UniJIS-UTF16-H",
+            b"UniJIS-UTF16-V",
+            b"UniKS-UCS2-H",
+            b"UniKS-UCS2-V",
+            b"UniKS-UTF16-H",
+            b"UniKS-UTF16-V",
+        ];
+        for name in names {
+            let decoded = Encoding::SimpleEncoding(name).bytes_to_string(&[0x30, 0x42, 0xAC, 0x00]);
+            assert_eq!(decoded.unwrap(), "あ가", "{}", String::from_utf8_lossy(name));
+        }
+    }
+
+    #[test]
+    fn unicode_predefined_utf16_cmap_decodes_surrogate_pairs() {
+        // U+2000B, a CJK Extension B character, as a UTF-16BE surrogate pair.
+        let decoded = Encoding::SimpleEncoding(b"UniJIS-UTF16-V").bytes_to_string(&[0xD8, 0x40, 0xDC, 0x0B]);
+        assert_eq!(decoded.unwrap(), "\u{2000B}");
+    }
+
+    #[test]
+    fn non_unicode_predefined_cmap_is_still_unsupported() {
+        let decoded = Encoding::SimpleEncoding(b"90ms-RKSJ-H").bytes_to_string(&[0x82, 0xA0]);
+        assert!(matches!(decoded, Err(Error::CharacterEncoding)));
     }
 
     #[test]
