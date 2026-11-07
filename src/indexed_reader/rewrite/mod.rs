@@ -20,8 +20,8 @@
 //!   since a file that had compressed its objects would otherwise grow by all of them. Past 500,000 objects a
 //!   table can't be read back, so those files get the stream form whatever was asked.
 //! - **Memory** is a few bitsets of one bit per object number, 16 bytes for each object written, a 64 KiB
-//!   output buffer, a 64 KiB copy buffer, 1 MiB of decoded object streams (always at least the one in use),
-//!   1 MiB of recently parsed objects and the last big one. Removing pages adds what that needs: the page map,
+//!   output buffer, a 64 KiB copy buffer and 1 MiB of decoded object streams (always at least the one in use).
+//!   Removing pages adds what that needs: the page map,
 //!   the outline, and, if a `/Resources` dictionary is shared, one content stream at a time, decoded into one
 //!   reused buffer. Each is within the reader's own limits on an object and a stream.
 //! - **Work** is bounded: bytes parsed and inflated count against 256 MiB or 32 times the file, whichever is more,

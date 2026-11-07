@@ -487,7 +487,7 @@ pub(super) fn write_plan<W: AppendOutput>(
         objects_dropped: index_live.saturating_sub(kept_from_source),
         stream_bytes_copied: output.stream_bytes,
         bytes_examined: plan.work,
-        objects_found_near_their_offset: plan.relocated,
+        objects_found_near_their_offset: plan.relocated.len() as u64,
         objects_missing: plan
             .missing
             .iter()

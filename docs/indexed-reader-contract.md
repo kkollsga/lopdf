@@ -131,4 +131,4 @@ check proves the copy has none. Usage rights are classed as their own kind, and 
 pages keeps its own `/ActualText` and `/Alt`, which may describe both; it's counted. `/DPartRoot` and web-capture structures keep their shape with the removed
 page's references dropped. The check after writing is structural: bytes, cross-reference data, every object readable, the page count, no signature where there
 should be none. It doesn't render anything, so a kept page drawn differently would pass it; the corpus runs compare renders. `write_unverified_to` is
-unchecked until its `verify` is called. A hostile object costs up to about ninety times its bytes once parsed, within the reader's object limit.
+unchecked until its `verify` is called. A hostile object can cost a few hundred times its bytes of footprint while it's parsed and written, within the reader's object limit: the reviewer's 2 MB array of a million integers, named from every page, peaks at about 0.7 GB.

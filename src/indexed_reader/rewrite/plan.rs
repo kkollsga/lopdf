@@ -135,51 +135,6 @@ struct RetainedContainer {
     members: crate::object_stream::SelectedObjectStream,
 }
 
-/// Objects parsed from the file lately, so the planning steps that look at the same ones again don't parse them again: a page tree node
-/// for each of its pages, a holder of names for each name. Weighed by the bytes each was parsed from. A big object isn't kept, since a
-/// hostile one costs ten times its bytes once parsed, and parsing it again is charged.
-#[derive(Default)]
-struct ParsedCache {
-    entries: HashMap<u32, Loaded>,
-    order: VecDeque<(u32, u64)>,
-    weight: u64,
-    /// The last big one, by itself: parsing a big object again costs more than keeping one, and a hostile file names the same one from
-    /// everywhere. Freed and parsed again, its large blocks pile up in the process's footprint.
-    big: Option<(u32, Loaded)>,
-}
-
-impl ParsedCache {
-    const MAX_WEIGHT: u64 = 1_024 * 1_024;
-    const MAX_ENTRY_WEIGHT: u64 = 16 * 1_024;
-
-    fn get(&self, number: u32) -> Option<Loaded> {
-        match &self.big {
-            Some((big, loaded)) if *big == number => Some(loaded.clone()),
-            _ => self.entries.get(&number).cloned(),
-        }
-    }
-
-    fn insert(&mut self, number: u32, loaded: &Loaded, weight: u64) {
-        let weight = weight.max(64);
-        if weight > Self::MAX_ENTRY_WEIGHT {
-            self.big = Some((number, loaded.clone()));
-            return;
-        }
-        if self.entries.contains_key(&number) {
-            return;
-        }
-        while self.weight + weight > Self::MAX_WEIGHT
-            && let Some((evicted, evicted_weight)) = self.order.pop_front()
-        {
-            self.entries.remove(&evicted);
-            self.weight -= evicted_weight;
-        }
-        self.entries.insert(number, loaded.clone());
-        self.order.push_back((number, weight));
-        self.weight += weight;
-    }
-}
-
 /// Decoded object streams in use, oldest first.
 #[derive(Default)]
 struct Containers {
@@ -208,7 +163,7 @@ pub(super) struct Plan<'c> {
     /// Destination names that went, which links and bookmarks may still use.
     pub(super) dead_names: HashSet<Vec<u8>>,
     /// Objects found near where their entry said, not at it.
-    pub(super) relocated: u64,
+    pub(super) relocated: BTreeSet<u32>,
     /// Objects whose entry points at something else and that aren't nearby either: read as null.
     pub(super) missing: BTreeSet<u32>,
     /// Where each page of the original is in the new file, when pages are removed: for a destination given as a page's position.
@@ -220,7 +175,6 @@ pub(super) struct Plan<'c> {
     pub(super) unsigned: bool,
     pub(super) expected_pages: Option<usize>,
     containers: Containers,
-    parsed: ParsedCache,
     pub(super) work: u64,
     work_limit: u64,
 }
@@ -418,7 +372,7 @@ impl<'c> Plan<'c> {
             list_arrays: HashSet::new(),
             header_generations: HashMap::new(),
             dead_names: HashSet::new(),
-            relocated: 0,
+            relocated: BTreeSet::new(),
             missing: BTreeSet::new(),
             page_positions: None,
             report: RemovalReport::default(),
@@ -427,7 +381,6 @@ impl<'c> Plan<'c> {
             signature_removal: SignatureRemoval::default(),
             expected_pages: None,
             containers: Containers::default(),
-            parsed: ParsedCache::default(),
             work: 0,
             work_limit: reader
                 .index
@@ -619,19 +572,9 @@ impl<'c> Plan<'c> {
         })
     }
 
+    /// Parse an object from the file. Nothing parsed is kept: on the corpus that costs a sixth more time, and keeping even 1 MiB of source's worth
+    /// of parsed objects cost tens of MiB of footprint on real files.
     fn read_source(&mut self, number: u32) -> RewriteResult<Option<Loaded>> {
-        if let Some(loaded) = self.parsed.get(number) {
-            return Ok(Some(loaded));
-        }
-        let work_before = self.work;
-        let loaded = self.read_source_uncached(number)?;
-        if let Some(loaded) = &loaded {
-            self.parsed.insert(number, loaded, self.work - work_before);
-        }
-        Ok(loaded)
-    }
-
-    fn read_source_uncached(&mut self, number: u32) -> RewriteResult<Option<Loaded>> {
         match self.view.index.locations.get(&number).cloned() {
             Some(ObjectLocation64::Normal { generation, .. }) => self.read_normal((number, generation)),
             Some(ObjectLocation64::Compressed { container, index }) => {
@@ -659,7 +602,7 @@ impl<'c> Plan<'c> {
             // this. One that isn't near is read as null, as PDFium and MuPDF read it, and counted, so it isn't dropped without a word.
             Err(IndexedReaderError::MissingNormalObjectAtXref { .. }) => match self.frame_nearby(id)? {
                 Some(framed) => {
-                    self.relocated += 1;
+                    self.relocated.insert(id.0);
                     framed
                 }
                 None => {
