@@ -902,9 +902,7 @@ fn xref_stream_framing_matches_eager_reader() {
 #[test]
 fn the_walk_stops_at_its_limit_on_rows_listed() {
     let mut budget = XrefWalkBudget::new(MAX_XREF_REVISIONS, 0);
-    budget
-        .charge_rows(usize::try_from(MAX_XREF_WALK_ROWS).unwrap())
-        .unwrap();
+    budget.charge_rows(MAX_XREF_WALK_ROWS).unwrap();
     assert!(matches!(
         budget.charge_rows(1),
         Err(IndexedReaderError::EntryLimitExceeded {

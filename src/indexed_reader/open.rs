@@ -60,6 +60,7 @@ pub(super) struct XrefWalkBudget {
     sections: usize,
     bytes: u64,
     rows: u64,
+    inflated: u64,
 }
 
 impl XrefWalkBudget {
@@ -72,6 +73,7 @@ impl XrefWalkBudget {
             sections: 0,
             bytes: 0,
             rows: 0,
+            inflated: 0,
         }
     }
 
@@ -96,8 +98,21 @@ impl XrefWalkBudget {
         Ok(())
     }
 
-    pub(super) fn charge_rows(&mut self, count: usize) -> IndexedReaderResult<()> {
-        self.rows = self.rows.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    pub(super) fn charge_inflated(&mut self, length: usize) -> IndexedReaderResult<()> {
+        self.inflated = self.inflated.saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+        if self.inflated > MAX_XREF_WALK_INFLATED {
+            return Err(IndexedReaderError::StructureLimitExceeded {
+                structure: "inflated cross-reference data",
+                limit: MAX_XREF_WALK_INFLATED,
+            });
+        }
+        Ok(())
+    }
+
+    /// Charge rows a section declares. A stream section is charged before any are decoded, since rows of an unknown type
+    /// or repeated numbers cost the same work and leave nothing behind to count.
+    pub(super) fn charge_rows(&mut self, count: u64) -> IndexedReaderResult<()> {
+        self.rows = self.rows.saturating_add(count);
         if self.rows > MAX_XREF_WALK_ROWS {
             return Err(IndexedReaderError::EntryLimitExceeded {
                 count: self.rows,
@@ -660,15 +675,12 @@ pub(super) fn read_xref_section(
         budget.charge_read(length)?;
         let window = source.read_range(physical_offset, length, length)?;
         let result = if starts_with_token(&window, b"xref") {
-            parse_classic_xref(&window, physical_offset)
+            parse_classic_xref(&window, physical_offset, budget)
         } else {
-            parse_xref_stream(&window, physical_offset)
+            parse_xref_stream(&window, physical_offset, budget)
         };
         match result {
-            Ok(section) => {
-                budget.charge_rows(section.entries.len())?;
-                return Ok(section);
-            }
+            Ok(section) => return Ok(section),
             Err(IndexedReaderError::IncompleteXref { .. }) if length < maximum => {
                 length = length.saturating_mul(2).min(maximum);
             }
@@ -688,7 +700,7 @@ pub(super) fn read_xref_section(
     }
 }
 
-fn parse_classic_xref(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSection64> {
+fn parse_classic_xref(window: &[u8], offset: u64, budget: &mut XrefWalkBudget) -> IndexedReaderResult<XrefSection64> {
     let mut cursor = TokenCursor::new(window);
     required_xref_token(&mut cursor, b"xref", offset)?;
     let mut entries = BTreeMap::new();
@@ -710,6 +722,7 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSec
                 }
                 None => return Err(IndexedReaderError::InvalidTrailer { offset }),
             };
+            budget.charge_rows(entry_count)?;
             return Ok(XrefSection64 {
                 kind: IndexXrefType::Table,
                 entries,
@@ -757,7 +770,7 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSec
     }
 }
 
-fn parse_xref_stream(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSection64> {
+fn parse_xref_stream(window: &[u8], offset: u64, budget: &mut XrefWalkBudget) -> IndexedReaderResult<XrefSection64> {
     let mut cursor = TokenCursor::new(window);
     required_xref_unsigned(&mut cursor, offset)?;
     required_xref_unsigned(&mut cursor, offset)?;
@@ -807,8 +820,9 @@ fn parse_xref_stream(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSect
         stream
             .decompress_with_limit(XREF_DECOMPRESSED_LIMIT)
             .map_err(IndexedReaderError::XrefDecompression)?;
+        budget.charge_inflated(stream.content.len())?;
     }
-    let mut section = decode_xref_stream64(stream, offset)?;
+    let mut section = decode_xref_stream64(stream, offset, budget)?;
     section.length = length;
     Ok(section)
 }
@@ -817,7 +831,9 @@ fn consumed_length(window: &[u8], cursor: &TokenCursor<'_>) -> u64 {
     u64::try_from(window.len().saturating_sub(cursor.remaining().len())).unwrap_or(u64::MAX)
 }
 
-fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexedReaderResult<XrefSection64> {
+fn decode_xref_stream64(
+    stream: Stream, offset: u64, budget: &mut XrefWalkBudget,
+) -> IndexedReaderResult<XrefSection64> {
     let mut trailer = stream.dict;
     let size = trailer_unsigned(&trailer, b"Size").ok_or(IndexedReaderError::InvalidTrailer { offset })?;
     let widths = integer_array(&trailer, b"W").ok_or(IndexedReaderError::InvalidXref { offset })?;
@@ -840,6 +856,7 @@ fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexedReaderResult<Xref
             })?;
     }
     check_entry_limit(total)?;
+    budget.charge_rows(total)?;
 
     let entry_width = widths[..3]
         .iter()

@@ -164,6 +164,81 @@ fn a_large_file_with_many_full_updates_opens() {
     assert_eq!(reader.object_ids().len(), objects as usize);
 }
 
+/// A chain of deflated stream sections, each with its own `/W`, `/Index` and body.
+fn deflated_stream_chain(sections: u64, widths: &str, index: &str, inflated: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(inflated).unwrap();
+    let payload = encoder.finish().unwrap();
+    let mut bytes = BODY.to_vec();
+    let mut prev = None;
+    let mut last = 0;
+    for section in 0..sections {
+        last = bytes.len();
+        let chained = prev.map_or(String::new(), |prev: usize| format!("/Prev {prev}"));
+        bytes.extend_from_slice(
+            format!(
+                "{} 0 obj\n<</Type/XRef/Size 3/W[{widths}]/Index[{index}]/Root 1 0 R/Filter/FlateDecode{chained}/Length {}>>\nstream\n",
+                section + 100,
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        prev = Some(last);
+    }
+    bytes.extend_from_slice(format!("startxref\n{last}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// Rows of an unknown type being skipped at no charge. They leave nothing in the index, so a limit counted after decoding never saw them, and a
+/// walk could decode a billion rows. The limit has to stop a real walk over real rows, before any more of them are decoded.
+#[test]
+fn rows_of_an_unknown_type_are_charged_before_decoding() {
+    let bytes = deflated_stream_chain(40, "1 0 0", "1000 1000000", &vec![3_u8; 1_000_000]);
+    let result = IndexedReader::open(BytesSource::from(bytes));
+    assert!(
+        matches!(
+            result,
+            Err(IndexedReaderError::EntryLimitExceeded { limit: 33_554_432, .. })
+        ),
+        "{:?}",
+        result.err()
+    );
+}
+
+/// A section declaring one row and inflating 32 MiB. Nothing charged for it, so 1,024 of them inflated 24 GiB and more: 52 s and 1.6 GiB from a 60 MiB
+/// file. The limit on inflated bytes has to stop a real walk.
+#[test]
+fn inflating_far_more_than_a_section_declares_runs_out_of_budget() {
+    let bytes = deflated_stream_chain(12, "1 1 1", "5 1", &vec![0_u8; 30_000_000]);
+    let result = IndexedReader::open(BytesSource::from(bytes));
+    assert!(
+        matches!(
+            result,
+            Err(IndexedReaderError::StructureLimitExceeded {
+                structure: "inflated cross-reference data",
+                ..
+            })
+        ),
+        "{:?}",
+        result.err()
+    );
+}
+
+/// The inflate limit catching a real file: ordinary deflated sections, enough for a long history, have to open.
+#[test]
+fn ordinary_deflated_sections_open_within_the_limit() {
+    let mut rows = Vec::with_capacity(140_000);
+    for _ in 0..20_000 {
+        rows.extend_from_slice(&[1, 0, 0, 0, 9, 0, 0]);
+    }
+    let bytes = deflated_stream_chain(100, "1 4 2", "1 20000", &rows);
+    let reader = IndexedReader::open(BytesSource::from(bytes)).unwrap();
+    assert!(!reader.index_stats().unwrap().recovered());
+    assert_eq!(reader.object_ids().len(), 20_000);
+}
+
 /// The bound catching real files: a chain of ordinary updates has to open at any length up to the cap.
 #[test]
 fn a_chain_of_ordinary_updates_opens_at_the_cap() {
