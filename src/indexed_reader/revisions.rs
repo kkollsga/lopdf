@@ -109,7 +109,7 @@ struct SectionFacts {
     kind: IndexedXrefKind,
     prev: Option<u64>,
     entry_count: u64,
-    /// The last place this section needs a reader to reach: itself, or its `/XRefStm`.
+    /// The last place this section needs a reader to reach: past its own end, or its `/XRefStm`.
     reach: u64,
     marker: Option<EndMarker>,
 }
@@ -169,16 +169,16 @@ impl IndexedReader {
                 kind,
                 prev,
                 entry_count: u64::try_from(section.entries.len()).unwrap_or(u64::MAX),
-                reach: offset.max(supplement.unwrap_or(0)),
+                reach: offset.saturating_add(section.length).max(supplement.unwrap_or(0)),
                 marker: read_end_marker(source.as_ref(), source_len, after)?,
             });
             next = prev;
         }
 
-        let (mut revisions, mut reaches) = group_sections(&sections);
+        let (mut revisions, mut spans) = group_sections(&sections);
         revisions.reverse();
-        reaches.reverse();
-        settle_ranges(&mut revisions, &reaches, origin);
+        spans.reverse();
+        settle_ranges(&mut revisions, &spans, origin);
         let trailing_bytes = revisions
             .last()
             .and_then(|newest| newest.range.as_ref())
@@ -245,10 +245,19 @@ impl IndexedReader {
     }
 }
 
-/// Newest first, as the walk found them, with how far into the file each revision's sections reach.
-fn group_sections(sections: &[SectionFacts]) -> (Vec<IndexedRevision>, Vec<u64>) {
+/// Where one revision's sections sit in the file.
+#[derive(Clone, Copy)]
+struct SectionSpan {
+    /// The lowest offset of any of them.
+    lowest: u64,
+    /// The last place any of them needs a reader to reach.
+    reach: u64,
+}
+
+/// Newest first, as the walk found them, with where each revision's sections sit.
+fn group_sections(sections: &[SectionFacts]) -> (Vec<IndexedRevision>, Vec<SectionSpan>) {
     let mut revisions = Vec::with_capacity(sections.len());
-    let mut reaches = Vec::with_capacity(sections.len());
+    let mut spans = Vec::with_capacity(sections.len());
     let mut position = 0;
     while let Some(section) = sections.get(position) {
         let linearized_tail = sections.get(position + 1).filter(|tail| {
@@ -262,7 +271,8 @@ fn group_sections(sections: &[SectionFacts]) -> (Vec<IndexedRevision>, Vec<u64>)
             None => section.marker.filter(|marker| marker.names == section.offset),
         };
         // Sections written together and closed by one marker: the older ones have no marker of their
-        // own, so the first one after them is the one that names this section.
+        // own, so the first one after them is this very marker. Merely naming this section isn't enough, since
+        // a hostile file can give a section hidden in earlier bytes a marker of its own that names this one.
         let mut together = 0;
         let mut absorbed_entries = 0_u64;
         if linearized_tail.is_none() && marker.is_some() {
@@ -270,7 +280,7 @@ fn group_sections(sections: &[SectionFacts]) -> (Vec<IndexedRevision>, Vec<u64>)
             while let Some(older) = sections.get(position + 1 + together) {
                 let closed_by_this_marker = newer.prev == Some(older.offset)
                     && older.offset < newer.offset
-                    && older.marker.is_some_and(|marker| marker.names == section.offset);
+                    && older.marker.map(|older| older.eof_marker_end) == marker.map(|marker| marker.eof_marker_end);
                 if !closed_by_this_marker {
                     break;
                 }
@@ -296,33 +306,37 @@ fn group_sections(sections: &[SectionFacts]) -> (Vec<IndexedRevision>, Vec<u64>)
             linearized: linearized_tail.is_some(),
         });
         let used = 1 + together + usize::from(linearized_tail.is_some());
-        reaches.push(
-            sections[position..position + used]
-                .iter()
-                .map(|used| used.reach)
-                .max()
-                .unwrap_or(0),
-        );
+        let group = &sections[position..position + used];
+        spans.push(SectionSpan {
+            lowest: group.iter().map(|section| section.offset).min().unwrap_or(0),
+            reach: group.iter().map(|section| section.reach).max().unwrap_or(0),
+        });
         position += used;
     }
-    (revisions, reaches)
+    (revisions, spans)
 }
 
-/// Number the revisions and give each its start, the end of the one before. A revision has no range if its
-/// section isn't inside the bytes it would add, or if anything down its chain, a `/Prev` or a `/XRefStm`, is
-/// past its end: a reader of that prefix wouldn't find them, and a signature report must never call such a
-/// prefix whole. Only a linearized file's first revision starts its section early.
-fn settle_ranges(revisions: &mut [IndexedRevision], reaches: &[u64], origin: u64) {
+/// Number the revisions and give each its start, the end of the one before. A revision has no range if any of its
+/// sections sits inside bytes an earlier revision holds, or if anything down its chain, a whole section or a `/XRefStm`, runs
+/// past its end: a reader of that prefix wouldn't find them, and a signature report must never call such a prefix whole. When
+/// unsure, the range is absent and [`IndexedRevisionChain::is_regular`] is false. Only a linearized file's first revision starts
+/// its section early.
+fn settle_ranges(revisions: &mut [IndexedRevision], spans: &[SectionSpan], origin: u64) {
     let mut last_end = 0_u64;
     let mut chain_reach = 0_u64;
     for (index, revision) in revisions.iter_mut().enumerate() {
         revision.index = index;
         let end = revision.range.as_ref().map(|range| range.end);
         let section = origin.saturating_add(revision.startxref);
-        chain_reach = chain_reach.max(reaches.get(index).copied().unwrap_or(u64::MAX));
+        let span = spans.get(index).copied().unwrap_or(SectionSpan {
+            lowest: 0,
+            reach: u64::MAX,
+        });
+        chain_reach = chain_reach.max(span.reach);
         let reached = origin.saturating_add(chain_reach);
+        let lowest = origin.saturating_add(span.lowest);
         let provable = end.is_some_and(|end| {
-            let after_previous = index == 0 || last_end <= section;
+            let after_previous = index == 0 || last_end <= lowest;
             reached < end && end > last_end && section < end && after_previous && (!revision.linearized || index == 0)
         });
         if provable {

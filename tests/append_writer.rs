@@ -1526,6 +1526,94 @@ fn an_xref_supplement_past_the_revisions_end_gives_it_no_range() {
     assert!(chain.revision_ending_at(end).is_none());
 }
 
+/// Patch a fixed-width number, written as ten zeros after `label` at or after `from`.
+fn patch_number(bytes: &mut [u8], from: usize, label: &[u8], value: u64) {
+    let at = from
+        + bytes[from..]
+            .windows(label.len())
+            .position(|window| window == label)
+            .unwrap()
+        + label.len();
+    bytes[at..at + 10].copy_from_slice(format!("{value:010}").as_bytes());
+}
+
+/// A shadow attack's activation: `S` names `O`, a section sitting unnoticed inside bytes an earlier revision `R` already holds, and `O`'s
+/// entries go live. `O` was merged into `S` because its first marker names `S`, so the chain read as regular, with `R` signed and the update
+/// showing only new bytes. A signature report relies on this: `O`'s marker isn't `S`'s, so it's not one revision, and the chain isn't regular.
+#[test]
+fn a_section_hidden_inside_an_earlier_revision_isnt_merged_into_a_later_one() {
+    let mut pdf = Pdf::base();
+    let shadow_body = pdf.bytes.len() as u64;
+    pdf.obj(6, "<< /Shadow true >>");
+    let rows = [(6, format!("{shadow_body:010} 00000 n "))];
+    let o = pdf.table_rows(&rows, "<< /Size 7 /Root 1 0 R /Prev 0000000000 >>");
+    let o_marker = pdf.bytes.len();
+    pdf.bytes.extend_from_slice(b"startxref\n0000000000\n%%EOF\n");
+    let r = pdf.table(TRAILER);
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{r}\n%%EOF\n").as_bytes());
+    let signed_end = pdf.bytes.len() as u64;
+    let s = pdf.bytes.len() as u64;
+    let rows = [(4, format!("{:010} 00000 n ", pdf.offsets[&4]))];
+    pdf.table_rows(&rows, &format!("<< /Size 7 /Root 1 0 R /Prev {o} >>"));
+    let mut bytes = pdf.finish(s);
+    patch_number(&mut bytes, o as usize, b"/Prev ", r);
+    patch_number(&mut bytes, o_marker, b"startxref\n", s);
+
+    let reader = open(&bytes);
+    assert!(!reader.index_stats().unwrap().recovered());
+    assert!(
+        reader.resolve_object((6, 0)).is_ok(),
+        "the layout has to really activate the hidden object"
+    );
+    let chain = reader.revisions().unwrap();
+    assert_eq!(chain.revisions.len(), 3, "{chain:?}");
+    assert!(
+        !chain.is_regular(),
+        "a hidden section went live and the chain was called regular"
+    );
+    assert_eq!(chain.revisions[0].startxref, r);
+    assert_eq!(chain.revisions[0].range, Some(0..signed_end));
+    assert_eq!(chain.revisions[1].startxref, o);
+    assert_eq!(chain.revisions[1].range, None);
+    assert_eq!(chain.revisions[2].prev, Some(o));
+}
+
+/// A section and its marker written inside a string in an older section's trailer: `revision_ending_at` named a prefix that cuts the older
+/// section's trailer in half, so a report would call bytes a whole revision that no reader could open as one.
+#[test]
+fn a_section_inside_an_older_trailers_string_has_no_range() {
+    let mut pdf = Pdf::base();
+    let r = pdf.table(TRAILER);
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{r}\n%%EOF\n").as_bytes());
+    let o = pdf.bytes.len() as u64;
+    let rows = [(4, format!("{:010} 00000 n ", pdf.offsets[&4]))];
+    let head = pdf.table_rows(&rows, &format!("<< /Size 6 /Root 1 0 R /Prev {r} /Note (X)"));
+    assert_eq!(head, o);
+    // Take the placeholder back out, so that the inner section goes inside the string.
+    let cut = pdf.bytes.len() - b"X)\n".len();
+    pdf.bytes.truncate(cut);
+    let s = pdf.bytes.len() as u64;
+    let inner = format!(
+        "xref\n4 1\n{:010} 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R /Prev {o} >>\nstartxref\n{s}\n%%EOF\n",
+        pdf.offsets[&4]
+    );
+    pdf.bytes.extend_from_slice(inner.as_bytes());
+    let inner_end = pdf.bytes.len() as u64;
+    pdf.bytes.extend_from_slice(b") >>\n");
+    let bytes = pdf.finish(s);
+
+    let reader = open(&bytes);
+    assert!(!reader.index_stats().unwrap().recovered());
+    let chain = reader.revisions().unwrap();
+    assert!(!chain.is_regular(), "{chain:?}");
+    assert!(
+        chain.revision_ending_at(inner_end).is_none(),
+        "a prefix cutting a trailer in half was called a whole revision"
+    );
+}
+
 /// `open_revision` answering with a rescan and Ok, on bytes that aren't the revision they were asked to be.
 #[test]
 fn open_revision_refuses_bytes_that_need_a_rescan() {

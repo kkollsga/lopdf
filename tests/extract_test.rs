@@ -280,7 +280,6 @@ fn encoding_dictionary_entries_are_optional() {
     }
 }
 
-
 /// Regression from the #580 codespace check: a code the CMap maps must decode whatever width the
 /// codespace declares. Both shapes occur in real files: 20 of 170 files in distillPDF's corpus
 /// declare `<0000> <FFFF>` over one-byte bfchars.
@@ -297,7 +296,13 @@ fn decode_text_keeps_mapped_codes_outside_the_declared_codespace_width() {
     // A two-byte codespace over one-byte mappings.
     assert_eq!(decode("<0000> <FFFF>", "<41> <0058>\n<42> <0059>", b"AB"), "XY");
     // Overlapping widths: an unmapped first byte can still begin a wider mapped code.
-    assert_eq!(decode("<00> <FF>\n<0000> <FFFF>", "<0102> <0041>\n<03> <0043>", &[1, 2, 3]), "AC");
+    assert_eq!(
+        decode("<00> <FF>\n<0000> <FFFF>", "<0102> <0041>\n<03> <0043>", &[1, 2, 3]),
+        "AC"
+    );
     // Overlapping widths, nothing mapped: one replacement per widest code, nothing lost after it.
-    assert_eq!(decode("<00> <FF>\n<0000> <FFFF>", "<03> <0043>", &[0xFF, 0xFF, 3]), "\u{fffd}C");
+    assert_eq!(
+        decode("<00> <FF>\n<0000> <FFFF>", "<03> <0043>", &[0xFF, 0xFF, 3]),
+        "\u{fffd}C"
+    );
 }
