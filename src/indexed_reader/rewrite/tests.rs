@@ -448,7 +448,7 @@ fn resource_dictionaries_past_the_limit_are_reported() {
     }
     let xref = bytes.len();
     let size = offsets.keys().next_back().unwrap() + 1;
-    bytes.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \n").as_bytes());
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
     for (number, offset) in &offsets {
         bytes.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
     }
