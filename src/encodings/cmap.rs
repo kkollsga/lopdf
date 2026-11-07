@@ -170,22 +170,35 @@ impl ToUnicodeCMap {
     }
 
     pub(super) fn get_for_decoding(&self, code: SourceCode, code_len: CodeLen) -> Option<Vec<u16>> {
+        // A mapped code wins however the codespace is declared. Real files declare <0000> <FFFF>
+        // over one-byte bfchars, and overlapping widths over mixed-width mappings.
+        if let Some(value) = self.get(code, code_len) {
+            return Some(value);
+        }
         if self.codespace_ranges.is_empty() {
-            return self.get(code, code_len);
+            return None;
         }
 
-        // Codespace bounds apply to each byte independently (ISO 32000-1, 9.7.5.1).
-        self.codespace_ranges
-            .iter()
-            .any(|&(low, high, len)| {
-                len == code_len
-                    && (0..len).all(|i| {
-                        let shift = 8 * i;
-                        let byte = (code >> shift) as u8;
-                        (low >> shift) as u8 <= byte && byte <= (high >> shift) as u8
-                    })
+        // Codespace bounds apply to each byte independently (ISO 32000-1, 9.7.5.1), so compare
+        // from the first byte: `range_len` is the width of the range, which `code` may be a
+        // prefix of.
+        let in_range = |low: SourceCode, high: SourceCode, range_len: CodeLen| {
+            (0..code_len).all(|i| {
+                let byte = (code >> (8 * (code_len - 1 - i))) as u8;
+                let shift = 8 * (range_len - 1 - i);
+                (low >> shift) as u8 <= byte && byte <= (high >> shift) as u8
             })
-            .then(|| self.get_or_replacement_char(code, code_len))
+        };
+        let complete = self
+            .codespace_ranges
+            .iter()
+            .any(|&(low, high, len)| len == code_len && in_range(low, high, len));
+        // An unmapped code only ends here if no wider range can still extend it.
+        let extendable = self
+            .codespace_ranges
+            .iter()
+            .any(|&(low, high, len)| len > code_len && in_range(low, high, len));
+        (complete && !extendable).then(|| self.get_or_replacement_char(code, code_len))
     }
 
     pub fn get(&self, code: SourceCode, code_len: CodeLen) -> Option<Vec<u16>> {
