@@ -1143,11 +1143,12 @@ fn check_replaceable(target: &std::path::Path, allow_breaking_hard_links: bool) 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() > 1 && !allow_breaking_hard_links {
-            return Err(AppendError::TargetHasHardLinks {
-                path: path(),
-                links: metadata.nlink(),
-            });
+        if metadata.nlink() > 1 {
+            clear_leftover_links(target, &metadata);
+            let links = std::fs::metadata(target)?.nlink();
+            if links > 1 && !allow_breaking_hard_links {
+                return Err(AppendError::TargetHasHardLinks { path: path(), links });
+            }
         }
     }
     #[cfg(not(unix))]
@@ -1305,6 +1306,31 @@ fn temporary_owner(name: &str, prefix: &str) -> Option<u32> {
     }
 }
 
+/// Remove our own temporary names that are links to the target itself. A crash just after a Save As moved a file into place can
+/// leave one, and it isn't a hard link anybody made. No save could get past it otherwise, and the sweep wouldn't help for an hour.
+/// One of these is safe to remove whatever its age and whoever made it, since the name's only purpose has been served: the file it
+/// was making is in place. Only a regular file on the same device and inode, with a name that fits the pattern exactly, is touched.
+#[cfg(unix)]
+fn clear_leftover_links(target: &std::path::Path, target_metadata: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let prefix = temporary_prefix(target);
+    let Ok(entries) = std::fs::read_dir(folder_of(target)) else {
+        return;
+    };
+    for entry in entries.take(MAX_SWEEP_ENTRIES).flatten() {
+        let name = entry.file_name();
+        if name.to_str().and_then(|name| temporary_owner(name, &prefix)).is_none() {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.dev() == target_metadata.dev() && metadata.ino() == target_metadata.ino() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Remove what a crash left: temporary files for this same target, by this same user, from a process that's gone, and over
 /// an hour old. Only a regular file whose name fits the pattern exactly is ever touched, and any doubt leaves it alone,
 /// since a leftover costs some disk and a wrong removal costs a save in progress. Whether a process is alive is asked of
@@ -1399,9 +1425,20 @@ impl TemporaryFile {
     /// rename would replace what's there. Where a file system has no hard links, this falls back to a last
     /// look and a rename.
     fn commit_new(self, target: &std::path::Path) -> AppendResult<Option<std::io::Error>> {
+        self.commit_new_then(target, sync_parent)
+    }
+
+    /// The temporary name goes before the folder is synced, so that the sync records its removal too. Otherwise a power cut can
+    /// bring it back as a second link to the document, and the next save would see a hard link nobody made.
+    fn commit_new_then(
+        mut self, target: &std::path::Path, sync: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> AppendResult<Option<std::io::Error>> {
         match std::fs::hard_link(&self.path, target) {
-            // Dropping `self` removes the temporary name, and the file stays under the new one.
-            Ok(()) => Ok(sync_parent(target).err()),
+            Ok(()) => {
+                // If this fails, dropping `self` tries once more, and a later save clears what's left.
+                self.committed = std::fs::remove_file(&self.path).is_ok();
+                Ok(sync(target).err())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(AppendError::TargetExists {
                 path: target.to_path_buf(),
             }),
@@ -1445,6 +1482,26 @@ impl Drop for TemporaryFile {
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
+
+    /// The temporary name surviving a power cut because its removal came after the folder sync, which left it as a second link that
+    /// blocked every later save. By the time the folder is synced, the name has to be gone.
+    #[test]
+    fn a_new_files_temporary_name_is_gone_before_the_folder_is_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("new.pdf");
+        let (mut file, temporary) = TemporaryFile::create_beside(&target, None).unwrap();
+        file.write_all(b"whole").unwrap();
+        drop(file);
+        let name = temporary.path.clone();
+        temporary
+            .commit_new_then(&target, |synced| {
+                assert_eq!(synced, target);
+                assert!(!name.exists(), "the temporary name was still there at the sync");
+                assert_eq!(std::fs::read(&target).unwrap(), b"whole");
+                Ok(())
+            })
+            .unwrap();
+    }
 
     /// A bare file name having an empty parent, which used to skip the folder sync without a word.
     #[test]

@@ -2154,6 +2154,79 @@ mod atomic {
         assert_eq!(std::fs::read(&twin).unwrap(), bytes);
     }
 
+    /// A crash after a Save As leaving our temporary name as a second link. Every later save failed with `TargetHasHardLinks`, naming a hidden
+    /// file the person never made, and nothing would ever clear it. Other links, including another document's temporary name, still count.
+    #[cfg(unix)]
+    #[test]
+    fn our_own_leftover_link_doesnt_count_as_a_hard_link() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+
+        let seen = std::cell::RefCell::new(String::new());
+        let options = AppendOptions::new().prepare_replacement(|temporary, _| {
+            *seen.borrow_mut() = temporary.file_name().unwrap().to_string_lossy().into_owned();
+            Ok(())
+        });
+        let reader = append_atomically(&opened(&path), AppendDestination::SameFile(&path), options, add_one)
+            .unwrap()
+            .reader;
+        let name = seen.into_inner();
+        let split = name[".append-".len()..].find('-').unwrap();
+        let prefix = name[..".append-".len() + split + 1].to_string();
+
+        // What a crash leaves, fresh and from a live process: nothing about its age or owner may matter.
+        let leftover = dir.path().join(format!("{prefix}{}-0.tmp", std::process::id()));
+        std::fs::hard_link(&path, &leftover).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+        let reader = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .expect("our own leftover blocked the save")
+        .reader;
+        assert!(!leftover.exists());
+
+        // Beside a link somebody did make: the leftover goes, and the real one still refuses.
+        std::fs::hard_link(&path, &leftover).unwrap();
+        let theirs = dir.path().join("theirs.pdf");
+        std::fs::hard_link(&path, &theirs).unwrap();
+        let other_document = dir
+            .path()
+            .join(format!(".append-0123456789abcdef-{}-0.tmp", std::process::id()));
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
+        assert!(matches!(
+            result.err(),
+            Some(AppendError::TargetHasHardLinks { links: 2, .. })
+        ));
+        assert!(!leftover.exists());
+        assert!(theirs.exists());
+        std::fs::remove_file(&theirs).unwrap();
+        std::fs::hard_link(&path, &other_document).unwrap();
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
+        assert!(matches!(
+            result.err(),
+            Some(AppendError::TargetHasHardLinks { links: 2, .. })
+        ));
+        assert!(
+            other_document.exists(),
+            "another name's temporary file isn't ours to remove"
+        );
+    }
+
     /// A folder, or anything else that isn't a file, reaching the rename.
     #[test]
     fn a_target_that_isnt_a_file_is_refused() {
