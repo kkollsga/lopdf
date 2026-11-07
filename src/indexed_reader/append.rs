@@ -131,6 +131,14 @@ pub enum AppendError {
     TargetExists { path: std::path::PathBuf },
     #[error("this document wasn't opened from a whole file on disk, so it can't replace one")]
     TargetIdentityUnknown,
+    #[error("{path:?} isn't a regular file, so it can't be replaced")]
+    TargetNotAFile { path: std::path::PathBuf },
+    #[error("{path:?} is read-only")]
+    TargetReadOnly { path: std::path::PathBuf },
+    #[error("{path:?} has {links} hard links, and replacing it would leave the others with the old bytes")]
+    TargetHasHardLinks { path: std::path::PathBuf, links: u64 },
+    #[error("the step that prepares the replacement file failed")]
+    PrepareReplacement(#[source] std::io::Error),
     #[error("the written file failed its check: {reason}")]
     VerificationFailed { reason: &'static str },
     #[error(transparent)]
@@ -1056,6 +1064,97 @@ impl AppendDestination<'_> {
     }
 }
 
+/// How [`append_atomically`] treats the file it replaces.
+///
+/// **A replaced file is a new file.** It gets the old one's name and mode bits, and nothing else unless the
+/// caller carries it over: extended attributes, including Finder tags and `com.apple.quarantine`, ACLs, owner
+/// and birth time are all lost. Losing the quarantine flag on a downloaded PDF is a security loss. This crate
+/// forbids unsafe code and can't copy them, so an app that replaces people's files should do so in
+/// [`prepare_replacement`](Self::prepare_replacement).
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+#[must_use]
+pub struct AppendOptions<'h> {
+    prepare: Option<PrepareReplacement<'h>>,
+    allow_breaking_hard_links: bool,
+}
+
+#[cfg(any(unix, windows))]
+type PrepareReplacement<'h> = Box<dyn FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()> + 'h>;
+
+#[cfg(any(unix, windows))]
+impl<'h> AppendOptions<'h> {
+    /// The defaults: no extra step, and a target with other hard links is refused.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A step that runs on the finished temporary file before it's checked and moved into place, to copy what this
+    /// crate can't. It gets the temporary file's path, then the target's, where nothing may exist yet for a new file.
+    /// If it fails, the temporary file is removed, the target isn't touched, and the save fails with
+    /// [`PrepareReplacement`](AppendError::PrepareReplacement). The check after it reads every original byte again,
+    /// so a step that damages the file fails the save too.
+    pub fn prepare_replacement(
+        mut self, step: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()> + 'h,
+    ) -> Self {
+        self.prepare = Some(Box::new(step));
+        self
+    }
+
+    /// Replace a file that has other hard links. Those names keep the old bytes from then on, and this one gets the
+    /// update, which is why it's refused unless asked for.
+    pub fn allow_breaking_hard_links(mut self) -> Self {
+        self.allow_breaking_hard_links = true;
+        self
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl std::fmt::Debug for AppendOptions<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppendOptions")
+            .field("prepare_replacement", &self.prepare.is_some())
+            .field("allow_breaking_hard_links", &self.allow_breaking_hard_links)
+            .finish()
+    }
+}
+
+/// Whether the file at `target`, if any, can be replaced without surprising anyone. A rename only needs write
+/// access to the folder, so without this a read-only file would be replaced as readily as any other.
+#[cfg(any(unix, windows))]
+fn check_replaceable(target: &std::path::Path, allow_breaking_hard_links: bool) -> AppendResult<()> {
+    let Some(metadata) = if_present(std::fs::metadata(target))? else {
+        return Ok(());
+    };
+    let path = || target.to_path_buf();
+    if !metadata.is_file() {
+        return Err(AppendError::TargetNotAFile { path: path() });
+    }
+    // The open covers what the mode bits don't say: another owner's file, and an immutable one. It writes nothing.
+    let refused = metadata.permissions().readonly()
+        || matches!(
+            std::fs::OpenOptions::new().write(true).open(target),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        );
+    if refused {
+        return Err(AppendError::TargetReadOnly { path: path() });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 && !allow_breaking_hard_links {
+            return Err(AppendError::TargetHasHardLinks {
+                path: path(),
+                links: metadata.nlink(),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = allow_breaking_hard_links;
+    Ok(())
+}
+
 #[cfg(any(unix, windows))]
 fn if_present(read: std::io::Result<std::fs::Metadata>) -> std::io::Result<Option<std::fs::Metadata>> {
     match read {
@@ -1070,15 +1169,19 @@ fn if_present(read: std::io::Result<std::fs::Metadata>) -> std::io::Result<Optio
 /// anything partial. `reader` keeps reading the old bytes. Returns a reader of the new file alongside the
 /// summary, and that reader is the one to use for the next save.
 ///
+/// Only the file's name and mode bits carry over to a replaced file: see [`AppendOptions`].
+///
 /// # Errors
 ///
-/// Anything `build` returns, any refusal, write failure or failed check, and
-/// [`TargetChanged`](AppendError::TargetChanged), [`TargetExists`](AppendError::TargetExists) or
-/// [`TargetIdentityUnknown`](AppendError::TargetIdentityUnknown) from the destination. The temporary file is
-/// removed and the destination isn't touched.
+/// Anything `build` returns, any refusal, write failure or failed check. From the destination:
+/// [`TargetChanged`](AppendError::TargetChanged), [`TargetExists`](AppendError::TargetExists),
+/// [`TargetIdentityUnknown`](AppendError::TargetIdentityUnknown), [`TargetNotAFile`](AppendError::TargetNotAFile),
+/// [`TargetReadOnly`](AppendError::TargetReadOnly) or [`TargetHasHardLinks`](AppendError::TargetHasHardLinks).
+/// [`PrepareReplacement`](AppendError::PrepareReplacement) if that step fails. The temporary file is removed and
+/// the destination isn't touched.
 #[cfg(any(unix, windows))]
 pub fn append_atomically<F>(
-    reader: &IndexedReader, destination: AppendDestination<'_>, build: F,
+    reader: &IndexedReader, destination: AppendDestination<'_>, options: AppendOptions<'_>, build: F,
 ) -> AppendResult<(AppendSummary, IndexedReader)>
 where
     F: FnOnce(&mut AppendWriter<'_, &mut std::fs::File>) -> AppendResult<()>,
@@ -1087,6 +1190,7 @@ where
     let seen = destination.check(reader)?;
     let target = destination.real_path()?;
     let target = target.as_path();
+    check_replaceable(target, options.allow_breaking_hard_links)?;
     let (mut file, temporary) = TemporaryFile::create_beside(target)?;
     let summary = {
         let mut writer = AppendWriter::new(reader, &mut file)?;
@@ -1095,13 +1199,18 @@ where
     };
     file.sync_all()?;
     drop(file);
+    if let Ok(existing) = std::fs::metadata(target) {
+        std::fs::set_permissions(&temporary.path, existing.permissions())?;
+    }
+    if let Some(step) = options.prepare {
+        step(&temporary.path, target).map_err(AppendError::PrepareReplacement)?;
+        std::fs::File::open(&temporary.path)?.sync_all()?;
+    }
 
     let written = crate::source::FileSource::open(&temporary.path)?;
     let verified = reader.verify_appended(Arc::new(written), &summary)?;
     destination.check_again(reader, seen.as_ref())?;
-    if let Ok(existing) = std::fs::metadata(target) {
-        std::fs::set_permissions(&temporary.path, existing.permissions())?;
-    }
+    check_replaceable(target, options.allow_breaking_hard_links)?;
     match destination {
         AppendDestination::NewFile(_) => temporary.commit_new(target)?,
         _ => temporary.commit(target)?,

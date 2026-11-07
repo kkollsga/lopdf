@@ -1488,7 +1488,7 @@ fn a_signed_range_is_unchanged_and_named_by_its_revision() {
 #[cfg(any(unix, windows))]
 mod atomic {
     use super::*;
-    use lopdf::{AppendDestination, FileSource, append_atomically};
+    use lopdf::{AppendDestination, AppendOptions, FileSource, append_atomically};
     use std::path::Path;
 
     fn folder() -> tempfile::TempDir {
@@ -1528,7 +1528,13 @@ mod atomic {
         let bytes = classic_pdf();
         let path = file(dir.path(), "doc.pdf", &bytes);
         let reader = opened(&path);
-        let (summary, reopened) = append_atomically(&reader, AppendDestination::SameFile(&path), add_one).unwrap();
+        let (summary, reopened) = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
         let on_disk = std::fs::read(&path).unwrap();
         assert!(on_disk.starts_with(&bytes));
         assert_eq!(on_disk.len() as u64, summary.new_len);
@@ -1550,8 +1556,13 @@ mod atomic {
         let path = file(dir.path(), "doc.pdf", &classic_pdf());
         let mut reader = opened(&path);
         for round in 1..=3 {
-            let (_, next) = append_atomically(&reader, AppendDestination::SameFile(&path), add_one)
-                .unwrap_or_else(|error| panic!("save {round}: {error}"));
+            let (_, next) = append_atomically(
+                &reader,
+                AppendDestination::SameFile(&path),
+                AppendOptions::new(),
+                add_one,
+            )
+            .unwrap_or_else(|error| panic!("save {round}: {error}"));
             reader = next;
         }
         assert_eq!(opened(&path).revisions().unwrap().revisions.len(), 4);
@@ -1566,16 +1577,26 @@ mod atomic {
         let path = file(dir.path(), "doc.pdf", &bytes);
         let reader = opened(&path);
 
-        let refused = append_atomically(&reader, AppendDestination::SameFile(&path), |writer| {
-            writer.add_object(&Object::Integer(1))?;
-            writer.write_object((99, 0), &Object::Integer(2))?;
-            Ok(())
-        });
+        let refused = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            |writer| {
+                writer.add_object(&Object::Integer(1))?;
+                writer.write_object((99, 0), &Object::Integer(2))?;
+                Ok(())
+            },
+        );
         assert!(matches!(refused, Err(AppendError::UnknownObject { .. })));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(entries(dir.path()), ["doc.pdf"]);
 
-        let empty = append_atomically(&reader, AppendDestination::SameFile(&path), |_| Ok(()));
+        let empty = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            |_| Ok(()),
+        );
         assert!(matches!(empty, Err(AppendError::EmptyUpdate)));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(entries(dir.path()), ["doc.pdf"]);
@@ -1589,7 +1610,13 @@ mod atomic {
         let path = file(dir.path(), "doc.pdf", &bytes);
         let other = dir.path().join("copy.pdf");
         let reader = opened(&path);
-        append_atomically(&reader, AppendDestination::NewFile(&other), add_one).unwrap();
+        append_atomically(
+            &reader,
+            AppendDestination::NewFile(&other),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(std::fs::read(&other).unwrap().starts_with(&bytes));
         assert_eq!(
@@ -1611,7 +1638,12 @@ mod atomic {
         let side = file(dir.path(), "side.tmp", &newer);
         std::fs::rename(&side, &path).unwrap();
 
-        let result = append_atomically(&reader, AppendDestination::SameFile(&path), add_one);
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetChanged { .. })));
         assert_eq!(std::fs::read(&path).unwrap(), newer, "the newer save was lost");
         assert_eq!(entries(dir.path()), ["doc.pdf"]);
@@ -1623,9 +1655,20 @@ mod atomic {
         let dir = folder();
         let path = file(dir.path(), "doc.pdf", &classic_pdf());
         let reader = opened(&path);
-        append_atomically(&reader, AppendDestination::SameFile(&path), add_one).unwrap();
+        append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
         let after_first = std::fs::read(&path).unwrap();
-        let result = append_atomically(&reader, AppendDestination::SameFile(&path), add_one);
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetChanged { .. })));
         assert_eq!(std::fs::read(&path).unwrap(), after_first, "the first save was lost");
     }
@@ -1637,11 +1680,16 @@ mod atomic {
         let path = file(dir.path(), "doc.pdf", &classic_pdf());
         let reader = opened(&path);
         let newer = b"written while the save ran".to_vec();
-        let result = append_atomically(&reader, AppendDestination::SameFile(&path), |writer| {
-            let side = file(path.parent().unwrap(), "side.tmp", &newer);
-            std::fs::rename(&side, &path).unwrap();
-            add_one(writer)
-        });
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            |writer| {
+                let side = file(path.parent().unwrap(), "side.tmp", &newer);
+                std::fs::rename(&side, &path).unwrap();
+                add_one(writer)
+            },
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetChanged { .. })));
         assert_eq!(std::fs::read(&path).unwrap(), newer);
         assert_eq!(entries(dir.path()), ["doc.pdf"]);
@@ -1657,13 +1705,19 @@ mod atomic {
         let b = file(dir.path(), "b.pdf", b"an unrelated file");
         let reader = opened(&a);
 
-        let same = append_atomically(&reader, AppendDestination::SameFile(&b), add_one);
+        let same = append_atomically(&reader, AppendDestination::SameFile(&b), AppendOptions::new(), add_one);
         assert!(matches!(same.err(), Some(AppendError::TargetChanged { .. })));
-        let new = append_atomically(&reader, AppendDestination::NewFile(&b), add_one);
+        let new = append_atomically(&reader, AppendDestination::NewFile(&b), AppendOptions::new(), add_one);
         assert!(matches!(new.err(), Some(AppendError::TargetExists { .. })));
         assert_eq!(std::fs::read(&b).unwrap(), b"an unrelated file");
 
-        append_atomically(&reader, AppendDestination::OverwriteOther(&b), add_one).unwrap();
+        append_atomically(
+            &reader,
+            AppendDestination::OverwriteOther(&b),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
         assert!(std::fs::read(&b).unwrap().starts_with(&bytes));
         assert_eq!(std::fs::read(&a).unwrap(), bytes);
     }
@@ -1675,10 +1729,15 @@ mod atomic {
         let a = file(dir.path(), "a.pdf", &classic_pdf());
         let b = file(dir.path(), "b.pdf", b"the file they agreed to replace");
         let reader = opened(&a);
-        let result = append_atomically(&reader, AppendDestination::OverwriteOther(&b), |writer| {
-            std::fs::write(&b, b"something newer and longer than before").unwrap();
-            add_one(writer)
-        });
+        let result = append_atomically(
+            &reader,
+            AppendDestination::OverwriteOther(&b),
+            AppendOptions::new(),
+            |writer| {
+                std::fs::write(&b, b"something newer and longer than before").unwrap();
+                add_one(writer)
+            },
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetChanged { .. })));
         assert_eq!(std::fs::read(&b).unwrap(), b"something newer and longer than before");
     }
@@ -1690,10 +1749,15 @@ mod atomic {
         let a = file(dir.path(), "a.pdf", &classic_pdf());
         let b = dir.path().join("b.pdf");
         let reader = opened(&a);
-        let result = append_atomically(&reader, AppendDestination::NewFile(&b), |writer| {
-            std::fs::write(&b, b"appeared meanwhile").unwrap();
-            add_one(writer)
-        });
+        let result = append_atomically(
+            &reader,
+            AppendDestination::NewFile(&b),
+            AppendOptions::new(),
+            |writer| {
+                std::fs::write(&b, b"appeared meanwhile").unwrap();
+                add_one(writer)
+            },
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetExists { .. })));
         assert_eq!(std::fs::read(&b).unwrap(), b"appeared meanwhile");
         assert_eq!(entries(dir.path()), ["a.pdf", "b.pdf"]);
@@ -1706,7 +1770,12 @@ mod atomic {
         let path = file(dir.path(), "doc.pdf", &classic_pdf());
         let reader = opened(&path);
         std::fs::remove_file(&path).unwrap();
-        let result = append_atomically(&reader, AppendDestination::SameFile(&path), add_one);
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetChanged { .. })));
         assert!(entries(dir.path()).is_empty());
     }
@@ -1719,16 +1788,32 @@ mod atomic {
         let bytes = classic_pdf();
         let path = file(dir.path(), "doc.pdf", &bytes);
         let in_memory = open(&bytes);
-        let result = append_atomically(&in_memory, AppendDestination::SameFile(&path), add_one);
+        let result = append_atomically(
+            &in_memory,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetIdentityUnknown)));
 
-        let (_, newer) = append_atomically(&opened(&path), AppendDestination::SameFile(&path), add_one).unwrap();
+        let (_, newer) = append_atomically(
+            &opened(&path),
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
         let chain = newer.revisions().unwrap();
         let earlier = newer
             .open_revision(&chain.revisions[0], IndexedReaderOptions::default())
             .unwrap();
         let before = std::fs::read(&path).unwrap();
-        let result = append_atomically(&earlier, AppendDestination::SameFile(&path), add_one);
+        let result = append_atomically(
+            &earlier,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(matches!(result.err(), Some(AppendError::TargetIdentityUnknown)));
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
@@ -1747,7 +1832,13 @@ mod atomic {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let reader = opened(&link);
 
-        let (summary, _) = append_atomically(&reader, AppendDestination::SameFile(&link), add_one).unwrap();
+        let (summary, _) = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&link),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
         assert!(
             std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
             "the link was replaced"
@@ -1772,14 +1863,212 @@ mod atomic {
         std::os::unix::fs::symlink(dir.path().join("missing.pdf"), &link).unwrap();
         let reader = opened(&source);
 
-        let new = append_atomically(&reader, AppendDestination::NewFile(&link), add_one);
+        let new = append_atomically(
+            &reader,
+            AppendDestination::NewFile(&link),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(matches!(new.err(), Some(AppendError::TargetExists { .. })));
-        let same = append_atomically(&reader, AppendDestination::SameFile(&link), add_one);
+        let same = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&link),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(matches!(same.err(), Some(AppendError::TargetChanged { .. })));
-        let other = append_atomically(&reader, AppendDestination::OverwriteOther(&link), add_one);
+        let other = append_atomically(
+            &reader,
+            AppendDestination::OverwriteOther(&link),
+            AppendOptions::new(),
+            add_one,
+        );
         assert!(other.is_err());
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(entries(dir.path()), ["doc.pdf", "link.pdf"]);
+    }
+
+    /// A read-only file being replaced as readily as any other, since a rename needs only write access to its folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_target_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let reader = opened(&path);
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
+        assert!(matches!(result.err(), Some(AppendError::TargetReadOnly { .. })));
+
+        let source = file(dir.path(), "other.pdf", &bytes);
+        let reader = opened(&source);
+        let result = append_atomically(
+            &reader,
+            AppendDestination::OverwriteOther(&path),
+            AppendOptions::new(),
+            add_one,
+        );
+        assert!(matches!(result.err(), Some(AppendError::TargetReadOnly { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(entries(dir.path()), ["doc.pdf", "other.pdf"]);
+    }
+
+    /// A hard link silently splitting from the document: its other name would keep the old bytes for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_with_hard_links_is_refused_unless_asked_for() {
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+        let twin = dir.path().join("twin.pdf");
+        std::fs::hard_link(&path, &twin).unwrap();
+        let reader = opened(&path);
+
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
+        assert!(matches!(
+            result.err(),
+            Some(AppendError::TargetHasHardLinks { links: 2, .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let options = AppendOptions::new().allow_breaking_hard_links();
+        append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one).unwrap();
+        assert!(std::fs::read(&path).unwrap().len() > bytes.len());
+        assert_eq!(std::fs::read(&twin).unwrap(), bytes);
+    }
+
+    /// A folder, or anything else that isn't a file, reaching the rename.
+    #[test]
+    fn a_target_that_isnt_a_file_is_refused() {
+        let dir = folder();
+        let source = file(dir.path(), "doc.pdf", &classic_pdf());
+        let inner = dir.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let reader = opened(&source);
+        let result = append_atomically(
+            &reader,
+            AppendDestination::OverwriteOther(&inner),
+            AppendOptions::new(),
+            add_one,
+        );
+        assert!(matches!(result.err(), Some(AppendError::TargetNotAFile { .. })));
+    }
+
+    /// The step running too early, on an unfinished file, or after the replacement, when it's too late to fail.
+    #[test]
+    fn the_prepare_step_gets_the_finished_file_before_it_replaces_anything() {
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+        let reader = opened(&path);
+        let seen = std::cell::Cell::new(0_u64);
+        let options = AppendOptions::new().prepare_replacement(|temporary, target| {
+            let finished = std::fs::read(temporary)?;
+            assert!(finished.starts_with(&bytes));
+            assert!(
+                finished.windows(5).rev().take(8).any(|window| window == b"%%EOF"),
+                "the file isn't finished"
+            );
+            assert_eq!(std::fs::read(target)?, bytes, "the target was replaced before the step");
+            seen.set(finished.len() as u64);
+            Ok(())
+        });
+        let (summary, _) = append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one).unwrap();
+        assert_eq!(seen.get(), summary.new_len);
+    }
+
+    /// A failed attribute copy replacing the file anyway: the person would lose its tags with no warning.
+    #[test]
+    fn a_failing_prepare_step_leaves_everything_as_it_was() {
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+        let reader = opened(&path);
+        let options = AppendOptions::new().prepare_replacement(|_, _| Err(std::io::Error::other("no attributes")));
+        let result = append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one);
+        assert!(matches!(result.err(), Some(AppendError::PrepareReplacement(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(entries(dir.path()), ["doc.pdf"]);
+    }
+
+    /// A prepare step that damages the bytes passing, because the check ran before it.
+    #[test]
+    fn a_prepare_step_that_damages_the_file_fails_the_save() {
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+        let reader = opened(&path);
+        let options = AppendOptions::new().prepare_replacement(|temporary, _| {
+            let mut damaged = std::fs::read(temporary)?;
+            damaged[20] ^= 1;
+            std::fs::write(temporary, damaged)
+        });
+        let result = append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one);
+        assert!(matches!(result.err(), Some(AppendError::VerificationFailed { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// The docs being wrong in either direction: attributes are lost without the step, and the step can keep them.
+    /// Uses the real `xattr` tool and a real quarantine-shaped attribute, on the real file system.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extended_attributes_go_without_the_step_and_stay_with_it() {
+        use std::process::Command;
+        let attribute = "com.example.append-test";
+        let get = |path: &Path| {
+            let output = Command::new("/usr/bin/xattr")
+                .args(["-p", attribute])
+                .arg(path)
+                .output()
+                .unwrap();
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+        let set = |path: &Path, value: &str| {
+            let status = Command::new("/usr/bin/xattr")
+                .args(["-w", attribute, value])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        let dir = folder();
+        let path = file(dir.path(), "doc.pdf", &classic_pdf());
+        set(&path, "tagged");
+        let reader = opened(&path);
+
+        let (_, reader) = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
+        assert_eq!(get(&path), None, "the docs say an attribute is lost without the step");
+
+        set(&path, "tagged again");
+        let options = AppendOptions::new().prepare_replacement(|temporary, target| {
+            let value = get(target).expect("the target has the attribute");
+            set(temporary, &value);
+            Ok(())
+        });
+        let result = append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one);
+        // Setting an attribute changes the file's status time and not its modification time, so the save holds.
+        result.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(get(&path).as_deref(), Some("tagged again"));
     }
 
     /// An update starting from a stale view: the file changed after the reader opened it, so the
