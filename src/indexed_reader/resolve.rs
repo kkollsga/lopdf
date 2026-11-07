@@ -1699,7 +1699,9 @@ impl IndexedReader {
         results
     }
 
-    fn resolve_normal(&self, id: crate::ObjectId, state: &mut ResolutionState) -> IndexedReaderResult<Object> {
+    pub(super) fn resolve_normal(
+        &self, id: crate::ObjectId, state: &mut ResolutionState,
+    ) -> IndexedReaderResult<Object> {
         let mut object = self.resolve_normal_plain(id, state)?;
         if self.index.encrypt_object_id != Some(id)
             && let Some(encryption_state) = &self.index.encryption_state

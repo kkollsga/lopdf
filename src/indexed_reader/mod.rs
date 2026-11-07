@@ -8,7 +8,9 @@
 //! where a caller wants a few objects out of a large file and cannot afford to
 //! pay for the rest of it. It also holds the one write it can do at that cost:
 //! [`AppendWriter`] adds an incremental update and changes no earlier byte, and
-//! [`IndexedReader::revisions`] lists the updates a file already has.
+//! [`IndexedReader::revisions`] lists the updates a file already has. For the
+//! other kind of save, [`RewriteChanges`] writes a whole new file holding only
+//! what's still reachable, so old data really is gone, again without loading it.
 //!
 //! # The model
 //!
@@ -215,6 +217,7 @@ mod page_map;
 mod preflight;
 mod resolve;
 mod revisions;
+mod rewrite;
 mod stats;
 mod streams;
 
@@ -232,6 +235,7 @@ pub use self::page_map::*;
 use self::preflight::*;
 use self::resolve::*;
 pub use self::revisions::*;
+pub use self::rewrite::*;
 pub use self::stats::*;
 pub use self::streams::*;
 

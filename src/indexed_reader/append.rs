@@ -45,12 +45,12 @@ use super::*;
 use crate::writer::Writer;
 
 /// PDFium ignores object numbers above this (`CPDF_Parser::kMaxObjectNumber`).
-const MAX_OBJECT_NUMBER: u32 = 4 * 1_024 * 1_024;
+pub(super) const MAX_OBJECT_NUMBER: u32 = 4 * 1_024 * 1_024;
 /// Objects in one update. At 20 bytes each their table stays well inside the 16 MiB the reader
 /// allows one section, so an update can always be read back.
 const MAX_UPDATE_OBJECTS: usize = 500_000;
 /// A classic table's offset field is 10 digits.
-const MAX_TABLE_OFFSET: u64 = 9_999_999_999;
+pub(super) const MAX_TABLE_OFFSET: u64 = 9_999_999_999;
 /// Arrays and dictionaries one object can nest and still be read back: one less than the parser's limit,
 /// which it reaches at the 100th level.
 const MAX_OBJECT_CONTAINERS: usize = crate::reader::MAX_BRACKET - 1;
@@ -366,7 +366,7 @@ impl IndexedReader {
 
     /// Whether a reader gets a whole object back. A stream's dictionary and framing are parsed and its
     /// data isn't held, so this costs at most one object's parsing window, however large the stream.
-    fn written_object_parses(&self, id: crate::ObjectId) -> bool {
+    pub(super) fn written_object_parses(&self, id: crate::ObjectId) -> bool {
         match self.resolve_stream_descriptor(id) {
             Ok(stream) => matches!(stream.encoded_length(), EncodedStreamLength::Known(_)),
             Err(IndexedStreamReadError::NotStream { .. }) => self.resolve_object(id).is_ok(),
@@ -384,10 +384,10 @@ struct Pending {
 }
 
 /// An output that counts its bytes and hashes them, for the changing half of `/ID`.
-struct Sink<W: Write> {
-    out: BufWriter<W>,
-    position: u64,
-    hash: Sha256,
+pub(super) struct Sink<W: Write> {
+    pub(super) out: BufWriter<W>,
+    pub(super) position: u64,
+    pub(super) hash: Sha256,
 }
 
 impl<W: Write> Write for Sink<W> {
@@ -403,7 +403,7 @@ impl<W: Write> Write for Sink<W> {
     }
 }
 
-mod sealed {
+pub(super) mod sealed {
     pub trait Sealed {}
 }
 
@@ -422,7 +422,7 @@ impl AppendOutput for std::io::Sink {}
 /// The temporary file [`append_atomically`] is writing. Only it can make one.
 #[cfg(any(unix, windows))]
 pub struct TemporaryOutput<'f> {
-    file: &'f mut std::fs::File,
+    pub(super) file: &'f mut std::fs::File,
 }
 
 #[cfg(any(unix, windows))]
@@ -1013,7 +1013,7 @@ fn runs(entries: &BTreeMap<u32, Pending>) -> Vec<Run> {
 }
 
 /// Refuse what the serializer would write as something a reader takes differently, or can't read.
-fn check_object(id: crate::ObjectId, object: &Object, depth: usize, top_level: bool) -> AppendResult<()> {
+pub(super) fn check_object(id: crate::ObjectId, object: &Object, depth: usize, top_level: bool) -> AppendResult<()> {
     let invalid = |reason| Err(AppendError::InvalidObject { id, reason });
     let is_container = matches!(object, Object::Array(_) | Object::Dictionary(_) | Object::Stream(_));
     if is_container && depth >= MAX_OBJECT_CONTAINERS {
@@ -1036,7 +1036,7 @@ fn check_object(id: crate::ObjectId, object: &Object, depth: usize, top_level: b
     }
 }
 
-fn check_dictionary(id: crate::ObjectId, dict: &Dictionary, depth: usize) -> AppendResult<()> {
+pub(super) fn check_dictionary(id: crate::ObjectId, dict: &Dictionary, depth: usize) -> AppendResult<()> {
     for (key, value) in dict.iter() {
         if key.contains(&0) {
             return Err(AppendError::InvalidObject {
@@ -1077,7 +1077,7 @@ impl AppendDestination<'_> {
     /// The path to move the finished file to. A rename over a symbolic link replaces the link and leaves the
     /// real file as it was, so an existing target is followed to the file it names. A link that names nothing
     /// fails here, rather than be replaced by a file. A new file's path has nothing to follow.
-    fn real_path(&self) -> std::io::Result<std::path::PathBuf> {
+    pub(super) fn real_path(&self) -> std::io::Result<std::path::PathBuf> {
         let path = self.path();
         match self {
             Self::NewFile(_) => Ok(path.to_path_buf()),
@@ -1087,7 +1087,7 @@ impl AppendDestination<'_> {
     }
 
     /// Whether the destination is as it has to be. Returns what's at an overwrite's path now, to compare later.
-    fn check(&self, reader: &IndexedReader) -> AppendResult<Option<std::fs::Metadata>> {
+    pub(super) fn check(&self, reader: &IndexedReader) -> AppendResult<Option<std::fs::Metadata>> {
         let changed = || AppendError::TargetChanged {
             path: self.path().to_path_buf(),
         };
@@ -1112,7 +1112,7 @@ impl AppendDestination<'_> {
 
     /// The same test just before the rename, since a long write leaves plenty of time for another app to save.
     /// A very small gap remains between this and the rename, which the standard library can't close.
-    fn check_again(&self, reader: &IndexedReader, seen: Option<&std::fs::Metadata>) -> AppendResult<()> {
+    pub(super) fn check_again(&self, reader: &IndexedReader, seen: Option<&std::fs::Metadata>) -> AppendResult<()> {
         let now = self.check(reader)?;
         if let Self::OverwriteOther(path) = self {
             let same = match (seen, now.as_ref()) {
@@ -1190,7 +1190,7 @@ impl std::fmt::Debug for AppendOptions<'_> {
 /// Whether the file at `target`, if any, can be replaced without surprising anyone. A rename only needs write
 /// access to the folder, so without this a read-only file would be replaced as readily as any other.
 #[cfg(any(unix, windows))]
-fn check_replaceable(target: &std::path::Path, allow_breaking_hard_links: bool) -> AppendResult<()> {
+pub(super) fn check_replaceable(target: &std::path::Path, allow_breaking_hard_links: bool) -> AppendResult<()> {
     let Some(metadata) = if_present(std::fs::metadata(target))? else {
         return Ok(());
     };
@@ -1224,7 +1224,7 @@ fn check_replaceable(target: &std::path::Path, allow_breaking_hard_links: bool) 
 }
 
 #[cfg(any(unix, windows))]
-fn if_present(read: std::io::Result<std::fs::Metadata>) -> std::io::Result<Option<std::fs::Metadata>> {
+pub(super) fn if_present(read: std::io::Result<std::fs::Metadata>) -> std::io::Result<Option<std::fs::Metadata>> {
     match read {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1325,7 +1325,7 @@ where
 /// it's a copy of, so a private document's copy stays private. `None` if neither exists, as with a reader of bytes in
 /// memory, and then the file stays as private as it was created.
 #[cfg(any(unix, windows))]
-fn final_permissions(reader: &IndexedReader, target: &std::path::Path) -> Option<std::fs::Permissions> {
+pub(super) fn final_permissions(reader: &IndexedReader, target: &std::path::Path) -> Option<std::fs::Permissions> {
     match std::fs::metadata(target) {
         Ok(existing) => Some(existing.permissions()),
         Err(_) => reader.whole_file_source().file_permissions(),
@@ -1335,7 +1335,7 @@ fn final_permissions(reader: &IndexedReader, target: &std::path::Path) -> Option
 /// How long a dead process's temporary file stays before a later save removes it. A process with that number being gone
 /// proves little on a folder another machine can also write to, and an hour's copy of one file is far beyond any here.
 #[cfg(unix)]
-const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub(super) const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// Folder entries one sweep looks at, so a huge folder can't make a save slow.
 #[cfg(unix)]
 const MAX_SWEEP_ENTRIES: usize = 65_536;
@@ -1354,7 +1354,7 @@ fn folder_of(target: &std::path::Path) -> &std::path::Path {
 /// The start of every temporary name for this target: `.append-<16 hex digits>-`. A hash of the name rather than the name
 /// itself, because a name near the file system's 255 bytes has no room for anything more.
 #[cfg(any(unix, windows))]
-fn temporary_prefix(target: &std::path::Path) -> String {
+pub(super) fn temporary_prefix(target: &std::path::Path) -> String {
     let name = target
         .file_name()
         .map_or(&b"document"[..], std::ffi::OsStr::as_encoded_bytes);
@@ -1464,8 +1464,8 @@ fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32
 }
 
 #[cfg(any(unix, windows))]
-struct TemporaryFile {
-    path: std::path::PathBuf,
+pub(super) struct TemporaryFile {
+    pub(super) path: std::path::PathBuf,
     committed: bool,
 }
 
@@ -1473,7 +1473,7 @@ struct TemporaryFile {
 impl TemporaryFile {
     /// Create the temporary file, exclusively, and never more readable than the file it becomes: a private document's full
     /// copy sits here for the whole write, and if the process dies, after it too.
-    fn create_beside(
+    pub(super) fn create_beside(
         target: &std::path::Path, permissions: Option<&std::fs::Permissions>,
     ) -> std::io::Result<(std::fs::File, Self)> {
         let folder = folder_of(target);
@@ -1512,7 +1512,7 @@ impl TemporaryFile {
     /// Move into place at a path that has to stay empty. A hard link fails if the path has appeared, where a
     /// rename would replace what's there. Where a file system has no hard links, this falls back to a last
     /// look and a rename.
-    fn commit_new(self, target: &std::path::Path) -> AppendResult<Option<std::io::Error>> {
+    pub(super) fn commit_new(self, target: &std::path::Path) -> AppendResult<Option<std::io::Error>> {
         self.commit_new_then(target, sync_parent)
     }
 
@@ -1542,7 +1542,7 @@ impl TemporaryFile {
     }
 
     /// Move into place. A failure from here on is only about durability, since the file is already there.
-    fn commit(mut self, target: &std::path::Path) -> std::io::Result<Option<std::io::Error>> {
+    pub(super) fn commit(mut self, target: &std::path::Path) -> std::io::Result<Option<std::io::Error>> {
         std::fs::rename(&self.path, target)?;
         self.committed = true;
         Ok(sync_parent(target).err())

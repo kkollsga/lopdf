@@ -56,6 +56,8 @@ pub use error::{DecompressError, Error, ParseError, Result};
 pub use incremental_document::IncrementalDocument;
 #[cfg(any(unix, windows))]
 pub use indexed_reader::{AppendDestination, AppendOptions, AppendedFile, TemporaryOutput, append_atomically};
+#[cfg(any(unix, windows))]
+pub use indexed_reader::{RewriteOptions, RewrittenFile, rewrite_atomically};
 pub use indexed_reader::{
     AppendError, AppendOutput, AppendResult, AppendSummary, AppendWriter, AppendedObject,
     BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES, BoundedObjectStream, EncodedStreamLength,
@@ -63,8 +65,10 @@ pub use indexed_reader::{
     IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
     IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats, IndexedReaderOptions, IndexedReaderResult,
     IndexedReaderSourceCacheStats, IndexedRevision, IndexedRevisionChain, IndexedStreamDescriptor,
-    IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind, InheritedPageAttributeOwners,
-    MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry, SharedIndexedReaderResult,
+    IndexedSignature, IndexedSignatureKind, IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind,
+    InheritedPageAttributeOwners, MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry,
+    RemovalReport, RewriteChanges, RewriteError, RewriteForm, RewriteFormChoice, RewritePolicy, RewriteResult,
+    RewriteSummary, SharedIndexedReaderResult,
 };
 pub use linearization::Linearization;
 pub use load_options::{DEFAULT_MAX_DECOMPRESSED_SIZE, FilterFunc, LoadOptions};
