@@ -105,20 +105,30 @@ Any other gets a single cross-reference stream and new object streams of at most
 Past 500,000 objects a table can't be read back, so those get the stream form, and past 900,000 a rewrite is refused. Object numbers and generations stay, so references need no rewriting
 and what a caller holds stays valid. A linearized file isn't linearized any more. The trailer carries `/Root`, `/Info` and `/ID`, and nothing else.
 
-**Stream data isn't decoded,** except to look for names in a `/Resources` dictionary a removed page shared with kept pages. There, only a stream decoded to its end
-counts, since the general decoder gives what it can of a damaged one, and any doubt leaves that dictionary whole and says so in
-`RemovalReport::resources_left_whole`. A wrong `/Length` is replaced by what's found the way a viewer finds it, by looking for `endstream`.
+**Stream data isn't decoded,** except to look for names in a `/Resources` dictionary a removed page could draw from that something kept can reach. Every
+kept thing that could draw from one is searched, following names in every category, under its own resources and everything above it, since PDFium falls
+back a category at a time and other viewers a name at a time. Only a stream decoded to its end counts, since the general decoder gives what it can of a
+damaged one, and any doubt leaves that dictionary whole and says so in `RemovalReport::resources_left_whole`. A wrong `/Length` is replaced by what's
+found the way a viewer finds it, by looking for `endstream`, and an object a little off its offset is found within 4 KiB.
+
+**What stays is said.** `RewriteSummary::document_data_kept` counts what's the document's rather than a page's, which can repeat a removed page's words:
+embedded files, XMP, `/Info`, JavaScript, `/PieceInfo`, document parts, XFA, destinations by position, hidden layers. The caller has to say so, or offer to
+remove it, before saying anything is gone.
 
 **Destinations** are `AppendDestination`, with the same checks, temporary file, sync order and `prepare_replacement`. `verify_rewritten` hashes every byte of
 the finished file, opens it, and requires one section, no `/Prev`, no rescan, every object where it was written and readable, nothing dead, and the
 right pages. A failure at any step, or a kill, leaves what was at the destination byte for byte. A kill can't remove its temporary file, and a later save to that target does, once it's an hour old and its process is gone.
 
-**Signatures.** A file with one is refused unless `RewritePolicy::allow_breaking_signatures` asks for it, and even then never over the signed file itself. Signatures are
-found by form field, by `/Perms`, by every `/ByteRange` in the file's bytes, which covers old revisions, and by anything the walk comes across. They stay in the new file, so that a viewer says they're broken.
-Nothing here checks one or says one is valid.
+**Signatures.** A rewritten copy of a signed file is unsigned, never broken (RectoPDF's decision 27). A file with one is refused unless
+`RewritePolicy::remove_signatures` gives consent, and even then never over the signed file itself. Signatures are found by form field, by `/Perms`, by every
+`/ByteRange` name in the file's bytes, however it's spelled and wherever it falls, which covers old revisions, and by anything the walk comes across. With
+consent every signature goes: the field, its value, its widgets and their appearances, `/Perms` with certification and usage rights, `/SigFlags`, `/DSS`. The
+check proves the copy has none. Usage rights are classed as their own kind, and need the same consent. Nothing here checks one or says one is valid.
 
 **Refused:** encryption, a rebuilt index, a `/Prev` loop, an ambiguous hybrid, removing every page, and an object that can be reached and can't be read.
 
-**Known limits.** Reals pass through this crate's `f32`, as they do in PDFium. A structure element that spans kept and removed pages keeps its own `/ActualText` and `/Alt`, which may
-describe both. A destination that uses a page index in place of a reference isn't renumbered, or removed with its page. `/DPartRoot` and web-capture structures keep their shape with the removed page's references dropped. What's the
-document's stays: the catalog's `/Metadata` and `/PieceInfo`, `/Info`, `/Names` `/EmbeddedFiles` and `/JavaScript`, even if only a removed page used them.
+**Known limits.** Reals pass through this crate's `f32`, as they do in PDFium: `612.00001` comes back `612.0`. A structure element that spans kept and removed
+pages keeps its own `/ActualText` and `/Alt`, which may describe both; it's counted. `/DPartRoot` and web-capture structures keep their shape with the removed
+page's references dropped. The check after writing is structural: bytes, cross-reference data, every object readable, the page count, no signature where there
+should be none. It doesn't render anything, so a kept page drawn differently would pass it; the corpus runs compare renders. `write_unverified_to` is
+unchecked until its `verify` is called. A hostile object costs up to about ninety times its bytes once parsed, within the reader's object limit.

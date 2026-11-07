@@ -19,10 +19,14 @@
 //!   today may not read anything newer, and otherwise a cross-reference stream with new object streams,
 //!   since a file that had compressed its objects would otherwise grow by all of them. Past 500,000 objects a
 //!   table can't be read back, so those files get the stream form whatever was asked.
-//! - **Memory** is two bitsets of one bit per object number, 16 bytes for each object written, a 64 KiB
-//!   output buffer, a 64 KiB copy buffer, and at most `RETAINED_CONTAINER_BYTES` of decoded object
-//!   streams (always at least the one in use). Removing pages adds what that needs: the page map,
-//!   the outline, and, if a `/Resources` dictionary is shared, one content stream at a time, decoded.
+//! - **Memory** is a few bitsets of one bit per object number, 16 bytes for each object written, a 64 KiB
+//!   output buffer, a 64 KiB copy buffer, 1 MiB of decoded object streams (always at least the one in use),
+//!   1 MiB of recently parsed objects and the last big one. Removing pages adds what that needs: the page map,
+//!   the outline, and, if a `/Resources` dictionary is shared, one content stream at a time, decoded into one
+//!   reused buffer. Each is within the reader's own limits on an object and a stream.
+//! - **Work** is bounded: bytes parsed and inflated count against 256 MiB or 32 times the file, whichever is more,
+//!   and decoding to search for names against its own allowance. A file that needs more is refused, or, for the
+//!   search, its dictionaries are left whole and reported.
 //!
 //! # Removing a page
 //!
@@ -38,18 +42,20 @@
 //! - **Annotations.** Those on a removed page go with it unless a kept page lists them too, even if
 //!   `/AcroForm` or something else still pointed at them. A link on a kept page that goes to a removed
 //!   page is removed; `/Popup`, `/IRT` and `/Parent` entries that named a removed annotation go.
-//! - **`/Outlines`.** A bookmark to a removed page goes and its children take its place. A heading with
+//! - **`/Outlines`.** A bookmark to a removed page, or with only `/SE` to a structure element that went, goes and its children take its place. A heading with
 //!   no target of its own goes if nothing is left under it. `/Prev`, `/Next`, `/First`, `/Last`, `/Parent`
 //!   and `/Count` are all corrected. With no bookmarks left, `/Outlines` goes.
 //! - **`/Dests`, `/Names`.** A named destination to a removed page goes, in either the old dictionary or the
 //!   name tree, with `/Limits` recalculated, since a limit is itself a name. Links and bookmarks that used that name
 //!   go too. `/Names` `/Pages` and `/Templates` entries for a removed page go.
-//! - **Actions.** A `/GoTo` to a removed page, in `/OpenAction`, `/AA` or any `/A`, goes.
+//! - **Actions.** A `/GoTo` to a removed page, in `/OpenAction`, `/AA` or any `/A`, goes. A destination given as a page's
+//!   position, `[3 /Fit]`, goes with its page, or moves to where its page is now; one into another file is left alone.
 //! - **`/AcroForm`.** A field whose widgets are all gone goes, then a parent with no kids left, and
 //!   `/CO` loses them. `/XFA` is dropped, since it's a whole second copy of the form and its data. With no
 //!   fields left, `/AcroForm` goes.
 //! - **`/StructTreeRoot`.** An element with nothing left goes, with its `/ActualText` and `/Alt`. An
-//!   element that also has content on a kept page stays, without the marked content of the removed one.
+//!   element that also has content on a kept page stays, without the marked content of the removed one, and is counted in
+//!   [`RemovalReport::structure_text_spanning_removed_pages`] if it has text of its own. An element with no `/Pg` is taken to be on its parent's page.
 //!   `/ParentTree` entries for removed pages and annotations go, and references in the others
 //!   become `null`, keeping the marked-content numbers right. `/IDTree` loses them too.
 //! - **`/PageLabels`.** Rebuilt, so that every kept page keeps the label it had.
@@ -57,15 +63,15 @@
 //!   `/Locked`, `/RBGroups` and `/AS`.
 //! - **`/Threads`.** Beads on a removed page leave the ring, and a thread with none left goes.
 //! - **`/Thumb`, page `/Metadata`, `/PieceInfo` and the like.** Only the page reaches them.
-//! - **Shared `/Resources`.** A dictionary a removed page shared with kept pages, inherited or by reference,
-//!   would keep the removed page's images reachable although nothing kept draws them. So the content of everything kept
-//!   that uses it is searched for names, and the entries none of it can name go. That's every `/Name` in
-//!   the decoded bytes, in strings and image data too, so it can only keep too much. Whatever can't be decoded
-//!   leaves the whole dictionary as it was, and [`RemovalReport::resources_left_whole`] says so.
+//! - **Shared `/Resources`.** A dictionary a removed page could draw from, by inheriting it, by reference or through a form,
+//!   font or appearance, would keep the removed page's images reachable from a kept page although nothing kept draws them. So
+//!   everything kept that could draw from it is searched, following every name it uses into whatever that names, under its own
+//!   resources and everything above it as viewers fall back on them, and the entries none of it names go. Whatever can't be searched
+//!   leaves the dictionary whole, and [`RemovalReport::resources_left_whole`] says so. See `resources.rs` for the details.
 //!
-//! **What stays**: anything a kept page really uses, such as a font or a form XObject on both pages, and what's
-//! the document's rather than a page's: the `/Metadata` XMP, `/Info`, `/Names` `/EmbeddedFiles` and `/JavaScript`,
-//! and the catalog's own `/PieceInfo`.
+//! **What stays**: anything a kept page really uses, such as a font or a form XObject on both pages, and what's the document's rather
+//! than a page's, which can repeat a removed page's words: embedded files, XMP, `/Info`, JavaScript, `/PieceInfo`, document parts.
+//! [`RewriteSummary::document_data_kept`] counts them in every rewrite, so a caller can say so or offer to remove them.
 //!
 //! # What it refuses
 //!
@@ -78,12 +84,12 @@
 //!
 //! And while planning:
 //!
-//! - **A file with signatures,** unless [`RewritePolicy::allow_breaking_signatures`] asks for it, and even then never
-//!   over the signed file itself, because a signed file's bytes never change. A rewrite always breaks a signature, and
-//!   [`RewriteSummary::broken_signatures`] says which. Nothing here ever says one is valid. The broken signature stays
-//!   in the new file, so that a viewer says it's broken, rather than showing a drawn-on "signed by" with nothing behind it.
-//! - **An object that can be reached and can't be read,** which would otherwise be lost without a word. An entry that
-//!   points at nothing isn't that: it reads as `null` everywhere.
+//! - **A file with signatures,** usage rights among them, unless [`RewritePolicy::remove_signatures`] gives consent, and even then
+//!   never over the signed file itself, because a signed file's bytes never change. A rewritten copy is unsigned, never broken (the
+//!   owner's decision 27): every signature goes, with what a viewer would show of it, and [`RewriteSummary::removed_signatures`] says which.
+//!   Nothing here ever says one is valid.
+//! - **An object that can be reached and can't be read,** which would otherwise be lost without a word. One whose entry is a little off
+//!   is found within 4 KiB, as a viewer that rebuilds finds it. An entry the index has as missing reads as `null` everywhere.
 //! - **Removing every page,** or a page tree the reader refuses.
 
 use std::io::{Read, Write};
