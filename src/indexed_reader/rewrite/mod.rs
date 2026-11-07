@@ -390,6 +390,16 @@ pub(super) enum Change<'c> {
 /// The changes one rewrite makes, built like an [`AppendWriter`] but written all at once. New and replaced
 /// objects stay in memory until then, except what's given to [`write_stream_from`](Self::write_stream_from). For a
 /// file on disk, use [`rewrite_atomically`], which hands you one of these.
+///
+/// This has to keep failing to compile, like the same line for an [`AppendWriter`]. `File::create` would have truncated the original
+/// before this line even ran, and nothing about where the output goes would have been checked.
+///
+/// ```compile_fail,E0277
+/// # use lopdf::{IndexedReader, RewriteChanges, RewritePolicy};
+/// # fn demo(reader: &IndexedReader, file: std::fs::File) {
+/// let _ = RewriteChanges::new(reader).unwrap().write_to(RewritePolicy::new(), file);
+/// # }
+/// ```
 pub struct RewriteChanges<'r, 'c> {
     pub(super) reader: &'r IndexedReader,
     pub(super) objects: BTreeMap<u32, Change<'c>>,

@@ -394,7 +394,7 @@ pub(super) fn write_plan<W: AppendOutput>(
     let objects_written = plan.live.count();
     let objects_compressed = output.compressed;
     let mut trailer = Dictionary::new();
-    trailer.set("Root", Object::Reference((plan.root, plan.root_generation)));
+    trailer.set("Root", Object::Reference((plan.root, plan.generation(plan.root))));
     if let Some(info) = plan.info.take() {
         match info {
             Object::Reference((number, generation)) if plan.live.get(number) => {
@@ -582,7 +582,7 @@ impl IndexedReader {
             return failed("/Root no longer resolves");
         }
         if let Some(expected) = written.expected_pages
-            && reader.page_count().ok() != Some(expected)
+            && reader.page_map_with_container_budget(RETAINED_CONTAINER_BYTES).ok().map(|map| map.len()) != Some(expected)
         {
             return failed("it doesn't have the pages it should");
         }

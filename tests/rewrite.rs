@@ -491,6 +491,28 @@ fn destination_names_go_with_their_page() {
     assert!(dict(&after, 33).has(b"OldKeep"));
 }
 
+/// A link or bookmark that goes by name through an action, not /Dest, whose name went, staying with nowhere to go.
+#[test]
+fn a_go_to_by_name_counts_as_going_there() {
+    let bytes = two_pages(
+        "/Dests << /Secret [4 0 R /Fit] /Open [3 0 R /Fit] >> /Outlines 10 0 R",
+        &[
+            obj(10, "<< /First 11 0 R /Last 12 0 R /Count 2 >>"),
+            obj(11, "<< /Title (M_BY_NAME) /Parent 10 0 R /Next 12 0 R /A << /S /GoTo /D /Secret >> >>"),
+            obj(12, "<< /Title (K_BY_NAME) /Parent 10 0 R /Prev 11 0 R /A 13 0 R >>"),
+            obj(13, "<< /S /GoTo /D /Open >>"),
+            obj(14, "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A 15 0 R /Contents (M_LINK_NAMED) >>"),
+            obj(15, "<< /S /GoTo /D /Secret >>"),
+        ],
+        "/Annots [14 0 R]",
+        "",
+    );
+    let (output, summary, after) = rewrite(&bytes, remove_second_page);
+    assert_eq!(summary.removal.links, 1);
+    assert_markers(&output, &["M_BY_NAME", "M_LINK_NAMED", "Secret"], &["K_BY_NAME", "Open"]);
+    assert!(gone(&after, 15));
+}
+
 /// /Dests entries reachable as a direct /Names tree, as an /OpenAction, or by an action that isn't direct.
 #[test]
 fn an_open_action_and_named_trees_to_a_removed_page_go() {
@@ -1852,6 +1874,44 @@ fn loops_in_every_other_tree_end() {
     );
     let (_, _, after) = rewrite(&bytes, remove_second_page);
     assert_eq!(after.page_count().unwrap(), 1);
+}
+
+/// Direct objects nested as far as the parser allows overflowing a stack on the way through, in the walk or in dropping what refers to something gone.
+#[test]
+fn direct_objects_nested_to_the_limit_get_through() {
+    let open = "[".repeat(96);
+    let close = "]".repeat(96);
+    let bytes = two_pages(&format!("/Deep {open}4 0 R (K_DEEP){close}"), &[], "", "");
+    let (output, _, after) = rewrite(&bytes, remove_second_page);
+    assert_markers(&output, &[], &["K_DEEP"]);
+    assert_eq!(after.page_count().unwrap(), 1);
+}
+
+/// A great many members in one object stream making every read go through its whole header, which is quadratic and ends in a hang.
+#[test]
+fn an_object_stream_with_very_many_members_is_quick() {
+    const MEMBERS: u32 = 60_000;
+    let mut builder = Builder::new(MEMBERS + 100);
+    let mut objects = vec![
+        obj(1, "<< /Type /Catalog /Pages 2 0 R /All 4 0 R >>"),
+        obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 9 9] >>"),
+        obj(3, "<< /Type /Page /Parent 2 0 R >>"),
+    ];
+    let mut all = String::from("[");
+    for number in 0..MEMBERS {
+        all.push_str(&format!("{} 0 R ", number + 10));
+    }
+    all.push(']');
+    objects.push(obj(4, &all));
+    for number in 0..MEMBERS {
+        objects.push(obj(number + 10, "1"));
+    }
+    builder.place(Form::Compressed, &objects, MEMBERS as usize + 10);
+    builder.finish_revision(Form::Compressed, "/Root 1 0 R");
+    let started = std::time::Instant::now();
+    let (_, summary, _) = rewrite(&builder.bytes, |_| {});
+    assert_eq!(summary.objects_written, u64::from(MEMBERS) + 4);
+    assert!(started.elapsed().as_secs() < 120, "{:?}", started.elapsed());
 }
 
 /// A very deep chain of structure elements or fields overflowing the stack, which is how a recursive walk dies on a small hostile file.

@@ -68,7 +68,7 @@ fn reference(dict: &Dictionary, key: &[u8]) -> Option<u32> {
 
 impl Plan<'_> {
     pub(super) fn plan_page_removal(&mut self, indices: &[usize]) -> RewriteResult<PageRemoval> {
-        let map = self.view.page_map()?;
+        let map = self.view.page_map_with_container_budget(RETAINED_CONTAINER_BYTES)?;
         let pages = map.len();
         if let Some(index) = indices.iter().find(|index| **index >= pages) {
             return Err(RewriteError::PageOutOfRange { index: *index, pages });
@@ -436,7 +436,10 @@ impl Plan<'_> {
                 } else {
                     match self.peek_dict(number)? {
                         None => finished = Some(0),
-                        Some(node) if !node.has_type(b"Pages") => finished = Some(1),
+                        Some(node) if !node.has_type(b"Pages") && !(node.has(b"Kids") && !node.has_type(b"Page")) => {
+                            // A page, or something with no business in a page tree.
+                            finished = Some(i64::from(node.has_type(b"Page") || !node.has(b"Type")));
+                        }
                         Some(node) => {
                             let mut kids = self.deref_array(node.get(b"Kids").ok())?;
                             kids.reverse();

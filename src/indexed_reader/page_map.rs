@@ -161,6 +161,12 @@ impl PageMap {
     pub(super) fn from_reader_with_work_budget_and_stats(
         reader: &IndexedReader, limits: PageMapLimits, work_budget: usize,
     ) -> IndexedReaderResult<(Self, PageMapWork)> {
+        Self::walk_with_container_budget(reader, limits, work_budget, PAGE_TREE_CONTAINER_REUSE_BYTES)
+    }
+
+    fn walk_with_container_budget(
+        reader: &IndexedReader, limits: PageMapLimits, work_budget: usize, container_budget: usize,
+    ) -> IndexedReaderResult<(Self, PageMapWork)> {
         let Some(root_id) = reader
             .index
             .trailer
@@ -170,7 +176,7 @@ impl PageMap {
         else {
             return Ok((Self::default(), PageMapWork::default()));
         };
-        let mut reuse = ContainerReuse::with_budget(PAGE_TREE_CONTAINER_REUSE_BYTES);
+        let mut reuse = ContainerReuse::with_budget(container_budget);
         let Some(catalog) = reader.resolve_dictionary_deref(root_id, &mut reuse)? else {
             return Ok((Self::default(), PageMapWork::default()));
         };
@@ -288,6 +294,22 @@ impl IndexedReader {
     /// Derive the actual ordered leaf-page map by walking `/Kids`.
     pub fn page_map(&self) -> IndexedReaderResult<PageMap> {
         PageMap::from_reader(self)
+    }
+
+    /// [`Self::page_map`] holding at most this many decoded object-stream bytes between nodes, for a caller that cares more
+    /// about memory than the time of inflating a container again.
+    pub(super) fn page_map_with_container_budget(&self, container_budget: usize) -> IndexedReaderResult<PageMap> {
+        let work_budget = self
+            .index
+            .locations
+            .values()
+            .filter(|location| !matches!(location, ObjectLocation64::Free { .. }))
+            .count();
+        let limits = PageMapLimits {
+            max_depth: self.options.page_tree_depth,
+            max_pages: self.options.max_pages,
+        };
+        PageMap::walk_with_container_budget(self, limits, work_budget, container_budget).map(|(page_map, _)| page_map)
     }
 
     /// Derive one owned page map and its conservative index residency snapshot.

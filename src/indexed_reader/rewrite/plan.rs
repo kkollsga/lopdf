@@ -5,7 +5,7 @@ use super::resources::Pruner;
 use super::*;
 
 /// Decoded object streams kept between members. One is kept whatever its size, since the one in use has to be somewhere.
-pub(super) const RETAINED_CONTAINER_BYTES: usize = 4 * 1_024 * 1_024;
+pub(super) const RETAINED_CONTAINER_BYTES: usize = 1_024 * 1_024;
 /// Bytes one rewrite may parse and inflate at the least, however small the file is. Above that it's a multiple of the file,
 /// which an honest file doesn't reach in the few passes a rewrite makes.
 const WORK_ALLOWANCE: u64 = 2 * 1_024 * 1_024 * 1_024;
@@ -115,8 +115,7 @@ impl Loaded {
 
 struct RetainedContainer {
     number: u32,
-    dictionary: Dictionary,
-    decoded: Vec<u8>,
+    members: crate::object_stream::SelectedObjectStream,
 }
 
 /// Decoded object streams in use, oldest first.
@@ -227,6 +226,11 @@ impl<'c> Plan<'c> {
         for number in removed_objects {
             plan.dead.set(number);
         }
+        if plan.dead.get(root) {
+            return Err(RewriteError::TrailerTargetMissing {
+                id: (root, root_generation),
+            });
+        }
         let mut removal = None;
         if !removed_pages.is_empty() {
             removal = Some(plan.plan_page_removal(&removed_pages)?);
@@ -234,7 +238,7 @@ impl<'c> Plan<'c> {
                 plan.expected_pages = removal.as_ref().map(PageRemoval::kept_count);
             }
         } else if identity {
-            plan.expected_pages = reader.page_count().ok();
+            plan.expected_pages = plan.view.page_map_with_container_budget(RETAINED_CONTAINER_BYTES).ok().map(|map| map.len());
         }
         plan.walk(removal)?;
         if plan.live.count() > MAX_REWRITE_OBJECTS {
@@ -503,27 +507,42 @@ impl<'c> Plan<'c> {
                     container: container_id,
                 }));
             };
+            let member_error = |source| {
+                unreadable(IndexedReaderError::ObjectStreamMember {
+                    id,
+                    container: container_id,
+                    index,
+                    source,
+                })
+            };
             let limit = usize::try_from(self.view.limits.max_stream_bytes).unwrap_or(usize::MAX);
             let decoded = ObjectStream::decode_selected_member_source(&stream, Some(limit))
-                .map_err(|source| {
-                    unreadable(IndexedReaderError::ObjectStreamMember {
-                        id,
-                        container: container_id,
-                        index,
-                        source,
-                    })
-                })?
+                .map_err(member_error)?
                 .into_owned();
             self.charge((stream.content.len() + decoded.len()) as u64)?;
-            self.containers.bytes += decoded.len();
+            let first = stream
+                .dict
+                .get(b"First")
+                .and_then(Object::as_i64)
+                .ok()
+                .and_then(|first| usize::try_from(first).ok());
+            let count = stream.dict.get(b"N").and_then(Object::as_i64).ok();
+            let (Some(first), Some(count)) = (first, count) else {
+                return Err(member_error(crate::Error::InvalidObjectStream(
+                    "invalid object stream /First or /N".to_string(),
+                )));
+            };
+            // Indexed once, since a stream can hold a million members and reading through its header for each would be quadratic.
+            let members = crate::object_stream::SelectedObjectStream::from_decoded_parts(first, count, decoded)
+                .map_err(member_error)?;
+            self.containers.bytes += members.retained_bytes();
             self.containers.retained.push_back(RetainedContainer {
                 number: container,
-                dictionary: stream.dict,
-                decoded,
+                members,
             });
             while self.containers.bytes > RETAINED_CONTAINER_BYTES && self.containers.retained.len() > 1 {
                 if let Some(evicted) = self.containers.retained.pop_front() {
-                    self.containers.bytes -= evicted.decoded.len();
+                    self.containers.bytes -= evicted.members.retained_bytes();
                 }
             }
         }
@@ -533,15 +552,21 @@ impl<'c> Plan<'c> {
             .iter()
             .find(|entry| entry.number == container)
             .expect("the container was just made sure of");
-        let object = ObjectStream::parse_selected_member_from_decoded(&entry.dictionary, &entry.decoded, id, index)
-            .map_err(|source| {
-                unreadable(IndexedReaderError::ObjectStreamMember {
-                    id,
-                    container: container_id,
-                    index,
-                    source,
-                })
-            })?;
+        let member_error = |source| {
+            unreadable(IndexedReaderError::ObjectStreamMember {
+                id,
+                container: container_id,
+                index,
+                source,
+            })
+        };
+        let member = entry.members.member_slice(id, index).map_err(member_error)?;
+        self.work = self.work.saturating_add(member.len() as u64);
+        let object = crate::parser::direct_object(member).ok_or_else(|| {
+            member_error(crate::Error::InvalidObjectStream(
+                "selected object stream member is truncated or invalid".to_string(),
+            ))
+        })?;
         Ok(Loaded::Plain(object))
     }
 
