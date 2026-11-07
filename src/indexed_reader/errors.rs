@@ -204,6 +204,10 @@ pub enum IndexedReaderError {
     PageCountLimitExceeded { limit: usize },
     #[error("page tree nests deeper than the {limit}-level limit")]
     PageTreeDepthLimitExceeded { limit: usize },
+    #[error("this file's revisions can't be listed: its cross-reference data was rebuilt by a scan")]
+    RevisionsUnavailable,
+    #[error("revision {index} has no provable byte range, so it can't be extracted")]
+    RevisionRangeUnavailable { index: usize },
 }
 
 /// Typed proof for an [`IndexedReaderError::ObjectLimitExceeded`] result.

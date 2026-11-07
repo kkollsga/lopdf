@@ -1,0 +1,1481 @@
+//! The append writer, reopening after it, and the revision chain. Every test says in its doc comment what
+//! failure it catches.
+
+use lopdf::{
+    AppendError, AppendSummary, AppendWriter, BytesSource, Dictionary, Document, IndexedReader, IndexedReaderError,
+    IndexedReaderOptions, IndexedXrefKind, Object, ObjectId, RandomAccessSource, SourceError, SourceResult, Stream,
+    StringFormat, dictionary,
+};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+mod property {
+    include!("common/append_property.rs");
+}
+use property::check_append_on_any_bytes;
+
+// ---- Fixtures, built from their bytes so the expected values don't come from a reader. ----
+
+struct Pdf {
+    bytes: Vec<u8>,
+    offsets: BTreeMap<u32, u64>,
+}
+
+impl Pdf {
+    fn new() -> Self {
+        Self {
+            bytes: b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec(),
+            offsets: BTreeMap::new(),
+        }
+    }
+
+    fn base() -> Self {
+        let mut pdf = Self::new();
+        pdf.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        pdf.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pdf.obj(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R >>",
+        );
+        pdf.obj(4, "<< /Title (base) >>");
+        pdf.obj(5, "<< /Length 3 >>\nstream\nq Q\nendstream");
+        pdf
+    }
+
+    fn obj(&mut self, id: u32, body: &str) -> u64 {
+        let offset = self.bytes.len() as u64;
+        self.offsets.insert(id, offset);
+        self.bytes
+            .extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
+        offset
+    }
+
+    /// A classic section listing `entries`, `(id, row)`, as one-row subsections.
+    fn table_rows(&mut self, entries: &[(u32, String)], trailer: &str) -> u64 {
+        let start = self.bytes.len() as u64;
+        self.bytes.extend_from_slice(b"xref\n");
+        for (id, row) in entries {
+            self.bytes.extend_from_slice(format!("{id} 1\n{row}\n").as_bytes());
+        }
+        self.bytes.extend_from_slice(format!("trailer\n{trailer}\n").as_bytes());
+        start
+    }
+
+    fn table(&mut self, trailer: &str) -> u64 {
+        let mut rows = vec![(0, "0000000000 65535 f ".to_string())];
+        rows.extend(
+            self.offsets
+                .iter()
+                .map(|(id, offset)| (*id, format!("{offset:010} 00000 n "))),
+        );
+        self.table_rows(&rows, trailer)
+    }
+
+    fn finish(mut self, xref: u64) -> Vec<u8> {
+        self.bytes
+            .extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+        self.bytes
+    }
+
+    /// A cross-reference stream at the next offset, as object `id`, naming every object so far.
+    fn xref_stream(&mut self, id: u32, extras: &str) -> u64 {
+        let start = self.bytes.len() as u64;
+        self.offsets.insert(id, start);
+        let mut content = Vec::new();
+        let mut index = String::new();
+        for (number, offset) in &self.offsets {
+            index.push_str(&format!("{number} 1 "));
+            content.push(1_u8);
+            content.extend_from_slice(&(*offset as u32).to_be_bytes());
+            content.extend_from_slice(&[0, 0]);
+        }
+        let size = self.offsets.keys().next_back().unwrap() + 1;
+        self.bytes.extend_from_slice(
+            format!(
+                "{id} 0 obj\n<< /Type /XRef /Size {size} /W [1 4 2] /Index [{index}] /Length {} {extras} >>\nstream\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        self.bytes.extend_from_slice(&content);
+        self.bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        start
+    }
+}
+
+const TRAILER: &str = "<< /Size 6 /Root 1 0 R /Info 4 0 R /ID [<AABB> <CCDD>] >>";
+
+fn classic_pdf() -> Vec<u8> {
+    let mut pdf = Pdf::base();
+    let xref = pdf.table(TRAILER);
+    pdf.finish(xref)
+}
+
+fn xref_stream_pdf() -> Vec<u8> {
+    let mut pdf = Pdf::base();
+    let xref = pdf.xref_stream(6, "/Root 1 0 R /Info 4 0 R /ID [<AABB> <CCDD>]");
+    pdf.finish(xref)
+}
+
+/// Written by the crate's own eager writer: object streams and a cross-reference stream.
+fn object_stream_pdf() -> Vec<u8> {
+    let mut document = Document::with_version("1.7");
+    let pages = document.new_object_id();
+    let page = document.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+    });
+    document.objects.insert(
+        pages,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }),
+    );
+    let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    document.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    document.save_modern(&mut bytes).unwrap();
+    bytes
+}
+
+/// Object 5 lives in object stream 6, and the table hides it as free, which is what a hybrid file is
+/// for. With `shown`, the table also lists 5 as live, so the two kinds of reader disagree.
+fn hybrid_pdf(shown: bool) -> Vec<u8> {
+    let mut pdf = Pdf::new();
+    pdf.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    pdf.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    pdf.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>");
+    pdf.obj(4, "<< /Title (base) >>");
+    let member = "<< /Hidden true >>";
+    let container = format!(
+        "<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n5 0 {member}\nendstream",
+        member.len() + 4
+    );
+    pdf.obj(6, &container);
+    let xref_stream = pdf.bytes.len() as u64;
+    let content = [2_u8, 0, 0, 0, 6, 0, 0];
+    pdf.bytes
+        .extend_from_slice(b"7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Index [5 1] /Length 7 >>\nstream\n");
+    pdf.bytes.extend_from_slice(&content);
+    pdf.bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    pdf.offsets.insert(7, xref_stream);
+
+    let mut rows = vec![(0, "0000000000 65535 f ".to_string())];
+    rows.extend(
+        pdf.offsets
+            .iter()
+            .map(|(id, offset)| (*id, format!("{offset:010} 00000 n "))),
+    );
+    rows.push((
+        5,
+        if shown {
+            format!("{:010} 00000 n ", pdf.offsets[&4])
+        } else {
+            "0000000000 00001 f ".to_string()
+        },
+    ));
+    rows.sort();
+    let trailer = format!("<< /Size 8 /Root 1 0 R /Info 4 0 R /XRefStm {xref_stream} >>");
+    let xref = pdf.table_rows(&rows, &trailer);
+    pdf.finish(xref)
+}
+
+fn all_forms() -> Vec<(&'static str, Vec<u8>)> {
+    let mut no_final_newline = classic_pdf();
+    assert_eq!(no_final_newline.pop(), Some(b'\n'));
+    let mut trailing_junk = classic_pdf();
+    trailing_junk.extend_from_slice(&[0; 300]);
+    vec![
+        ("classic", classic_pdf()),
+        ("xref stream", xref_stream_pdf()),
+        ("object streams", object_stream_pdf()),
+        ("hybrid", hybrid_pdf(false)),
+        ("no final newline", no_final_newline),
+        ("trailing junk", trailing_junk),
+    ]
+}
+
+fn open(bytes: &[u8]) -> IndexedReader {
+    IndexedReader::open(BytesSource::from(bytes.to_vec())).unwrap()
+}
+
+/// Add one object and change the catalog, on whichever file form.
+fn small_update(reader: &IndexedReader) -> (Vec<u8>, AppendSummary, ObjectId) {
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(reader, &mut output).unwrap();
+    let added = writer
+        .add_object(&Object::Dictionary(dictionary! { "Added" => true }))
+        .unwrap()
+        .id;
+    let root = reader.trailer_entry_raw_owned(b"Root").unwrap().as_reference().unwrap();
+    let mut catalog = reader.resolve_object(root).unwrap().as_dict().unwrap().clone();
+    catalog.set("Changed", true);
+    writer.write_object(root, &Object::Dictionary(catalog)).unwrap();
+    let summary = writer.finish().unwrap();
+    (output, summary, added)
+}
+
+// ---- The promises. ----
+
+/// The original bytes changing at all, which voids every signature in the file.
+#[test]
+fn the_original_bytes_are_a_prefix_of_the_output_for_every_form() {
+    for (name, bytes) in all_forms() {
+        let reader = open(&bytes);
+        let (output, summary, _) = small_update(&reader);
+        assert!(output.starts_with(&bytes), "{name}");
+        assert_eq!(summary.previous_len, bytes.len() as u64, "{name}");
+        assert_eq!(summary.new_len, output.len() as u64, "{name}");
+    }
+}
+
+/// An update whose section or trailer a reader can't follow, or which leaves old objects behind.
+#[test]
+fn every_object_reads_back_through_both_readers_for_every_form() {
+    for (name, bytes) in all_forms() {
+        let before = open(&bytes);
+        let (output, summary, added) = small_update(&before);
+        let after = before
+            .verify_appended(Arc::new(BytesSource::from(output.clone())), &summary)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(!after.index_stats().unwrap().recovered(), "{name} needed a rescan");
+        assert_eq!(
+            after
+                .resolve_object(added)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Added")
+                .unwrap(),
+            &Object::Boolean(true)
+        );
+
+        let root = before.trailer_entry_raw_owned(b"Root").unwrap().as_reference().unwrap();
+        assert_eq!(
+            after.trailer_entry_raw_owned(b"Root").unwrap().as_reference().unwrap(),
+            root,
+            "{name}"
+        );
+        let new_catalog = after.resolve_object(root).unwrap();
+        assert!(
+            new_catalog.as_dict().unwrap().has(b"Changed"),
+            "{name}: the new catalog isn't what's read"
+        );
+        for id in before.object_ids() {
+            if id != root {
+                assert_eq!(
+                    format!("{:?}", before.resolve_object(id)),
+                    format!("{:?}", after.resolve_object(id)),
+                    "{name} {id:?}"
+                );
+            }
+        }
+
+        // The eager reader is a second, separate opinion on the same bytes.
+        let eager = Document::load_mem(&output).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(
+            eager.get_object(added).is_ok(),
+            "{name}: the eager reader misses the new object"
+        );
+        assert!(
+            eager.get_object(root).unwrap().as_dict().unwrap().has(b"Changed"),
+            "{name}"
+        );
+    }
+}
+
+/// A new section in the wrong form, which readers that follow one kind of section fail on.
+#[test]
+fn the_new_section_matches_the_files_own_form() {
+    for (form, expected) in [
+        (classic_pdf(), IndexedXrefKind::Table),
+        (hybrid_pdf(false), IndexedXrefKind::Table),
+        (xref_stream_pdf(), IndexedXrefKind::Stream),
+        (object_stream_pdf(), IndexedXrefKind::Stream),
+    ] {
+        let reader = open(&form);
+        let (output, summary, _) = small_update(&reader);
+        let chain = open(&output).revisions().unwrap();
+        let newest = chain.revisions.last().unwrap();
+        assert_eq!(newest.xref_kind, expected);
+        assert_eq!(newest.startxref, summary.xref_offset);
+        assert_eq!(newest.prev, Some(summary.prev));
+    }
+}
+
+/// A trailer that loses `/Root` or `/Info`, shrinks `/Size`, repoints `/Prev`, changes the permanent
+/// `/ID` or keeps a stale `/XRefStm`, each of which readers are known to get wrong.
+#[test]
+fn the_new_trailer_is_right() {
+    let reader = open(&classic_pdf());
+    let (output, summary, added) = small_update(&reader);
+    let after = open(&output);
+    assert_eq!(after.trailer_entry_raw_owned(b"Root"), Some(Object::Reference((1, 0))));
+    assert_eq!(after.trailer_entry_raw_owned(b"Info"), Some(Object::Reference((4, 0))));
+    assert_eq!(after.trailer_entry_raw_owned(b"Size"), Some(Object::Integer(7)));
+    assert_eq!(added, (6, 0));
+    assert_eq!(
+        after.trailer_entry_raw_owned(b"Prev"),
+        Some(Object::Integer(summary.prev as i64))
+    );
+    let id = after.trailer_entry_raw_owned(b"ID").unwrap();
+    let id = id.as_array().unwrap();
+    assert_eq!(
+        id[0].as_str().unwrap(),
+        [0xAA, 0xBB],
+        "the permanent identifier changed"
+    );
+    assert_ne!(id[1].as_str().unwrap(), [0xCC, 0xDD], "the changing identifier didn't");
+
+    let hybrid = open(&hybrid_pdf(false));
+    let (output, _, _) = small_update(&hybrid);
+    let after = open(&output);
+    assert!(
+        after.trailer_entry_raw_owned(b"XRefStm").is_none(),
+        "a stale /XRefStm came along"
+    );
+    assert_eq!(
+        after
+            .resolve_object((5, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Hidden")
+            .unwrap(),
+        &Object::Boolean(true)
+    );
+
+    let stream = open(&xref_stream_pdf());
+    let (output, summary, added) = small_update(&stream);
+    let after = open(&output);
+    assert!(after.trailer_entry_raw_owned(b"Length").is_none());
+    assert_eq!(added, (7, 0));
+    assert_eq!(summary.size, 9, "the section's own object has to count in /Size");
+    assert_eq!(
+        after.object_location((8, 0)),
+        Some(lopdf::IndexedObjectLocation::Normal),
+        "the section lists itself"
+    );
+    assert!(
+        summary.objects.iter().all(|object| object.id != (8, 0)),
+        "the section's object isn't the caller's"
+    );
+}
+
+/// A file with no `/ID` staying without one, or an `/ID` of some other shape being rewritten on a guess.
+#[test]
+fn an_id_is_added_when_missing_and_left_alone_when_strange() {
+    let mut pdf = Pdf::base();
+    let xref = pdf.table("<< /Size 6 /Root 1 0 R >>");
+    let reader = open(&pdf.finish(xref));
+    let (output, _, _) = small_update(&reader);
+    let id = open(&output).trailer_entry_raw_owned(b"ID").unwrap();
+    let id = id.as_array().unwrap();
+    assert_eq!(id.len(), 2);
+    assert_eq!(id[0], id[1], "both strings start the same on a file that never had one");
+
+    let mut pdf = Pdf::base();
+    let xref = pdf.table("<< /Size 6 /Root 1 0 R /ID 4 0 R >>");
+    let reader = open(&pdf.finish(xref));
+    let (output, _, _) = small_update(&reader);
+    assert_eq!(
+        open(&output).trailer_entry_raw_owned(b"ID"),
+        Some(Object::Reference((4, 0)))
+    );
+}
+
+/// Two different updates to the same file ending up with the same file identifier.
+#[test]
+fn the_changing_identifier_depends_on_what_was_written() {
+    let reader = open(&classic_pdf());
+    let identifier = |value: i64| {
+        let mut output = Vec::new();
+        let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+        writer.add_object(&Object::Integer(value)).unwrap();
+        writer.finish().unwrap();
+        open(&output)
+            .trailer_entry_raw_owned(b"ID")
+            .unwrap()
+            .as_array()
+            .unwrap()[1]
+            .clone()
+    };
+    assert_ne!(identifier(100), identifier(200));
+    assert_eq!(
+        identifier(100),
+        identifier(100),
+        "the same update should give the same bytes"
+    );
+}
+
+/// Sections that stop chaining after a few rounds, new numbers colliding with old ones, or a revision
+/// that can't be got back later. Random rounds across every form, each checked against the one before.
+#[test]
+fn repeated_appends_stay_valid_and_every_earlier_revision_comes_back_whole() {
+    for (name, original) in all_forms() {
+        let mut random = Random(0x5EED ^ original.len() as u64);
+        let mut history = vec![original.clone()];
+        let mut expected: BTreeMap<ObjectId, i64> = BTreeMap::new();
+        for round in 0..24_i64 {
+            let current = history.last().unwrap().clone();
+            let reader = open(&current);
+            let mut output = Vec::new();
+            let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+            for _ in 0..1 + random.below(4) {
+                let replaceable: Vec<ObjectId> = expected.keys().copied().collect();
+                let replace = !replaceable.is_empty() && random.below(2) == 0;
+                let value = round * 1_000 + random.below(1_000) as i64;
+                if replace {
+                    let id = replaceable[random.below(replaceable.len() as u64) as usize];
+                    match writer.write_object(id, &Object::Integer(value)) {
+                        Ok(_) => {
+                            expected.insert(id, value);
+                        }
+                        Err(AppendError::AlreadyWritten { .. }) => {}
+                        Err(error) => panic!("{name}: {error}"),
+                    }
+                } else {
+                    let added = writer.add_object(&Object::Integer(value)).unwrap();
+                    expected.insert(added.id, value);
+                }
+            }
+            let summary = writer.finish().unwrap();
+            let after = reader
+                .verify_appended(Arc::new(BytesSource::from(output.clone())), &summary)
+                .unwrap_or_else(|error| panic!("{name} round {round}: {error}"));
+            assert!(output.starts_with(&current));
+            for (id, value) in &expected {
+                assert_eq!(
+                    after.resolve_object(*id).unwrap(),
+                    Object::Integer(*value),
+                    "{name} {id:?}"
+                );
+            }
+            assert!(
+                Document::load_mem(&output).is_ok(),
+                "{name}: the eager reader gave up at round {round}"
+            );
+            history.push(output);
+        }
+
+        let newest = open(history.last().unwrap());
+        let chain = newest.revisions().unwrap();
+        let updates = chain.revisions.len() - open(&original).revisions().unwrap().revisions.len();
+        assert_eq!(updates, 24, "{name}");
+        assert!(
+            chain.revisions.iter().skip(1).all(|revision| revision.range.is_some()),
+            "{name}"
+        );
+        for (rounds_back, revision) in chain.revisions.iter().rev().take(24).enumerate() {
+            let earlier = &history[history.len() - 1 - rounds_back];
+            let mut copy = Vec::new();
+            assert_eq!(
+                newest.copy_revision_to(revision, &mut copy).unwrap(),
+                earlier.len() as u64,
+                "{name}"
+            );
+            assert_eq!(&copy, earlier, "{name}: revision {} isn't byte-exact", revision.index);
+            let opened = newest.open_revision(revision, IndexedReaderOptions::default()).unwrap();
+            assert_eq!(opened.object_ids(), open(earlier).object_ids(), "{name}");
+        }
+    }
+}
+
+/// A stream written with the wrong `/Length`, which a reader takes as the end of the data.
+#[test]
+fn a_stream_is_given_its_true_length() {
+    let reader = open(&classic_pdf());
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    let mut stream = Stream::new(
+        dictionary! { "Length" => 1, "Extra" => 2 },
+        b"endstream inside the data".to_vec(),
+    );
+    stream.dict.set("Length", 1);
+    let added = writer.add_object(&Object::Stream(stream)).unwrap();
+    let id = writer.allocate().unwrap();
+    let body = vec![7_u8; 300_000];
+    let piped = writer
+        .write_stream_from(
+            id,
+            &dictionary! { "Length" => Object::Reference((1, 0)) },
+            300_000,
+            &mut body.as_slice(),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    let after = open(&output);
+    let read = after.resolve_object(added.id).unwrap();
+    assert_eq!(read.as_stream().unwrap().content, b"endstream inside the data");
+    let read = after.resolve_object(piped.id).unwrap();
+    assert_eq!(read.as_stream().unwrap().content, body);
+    assert_eq!(
+        read.as_stream().unwrap().dict.get(b"Length").unwrap(),
+        &Object::Integer(300_000)
+    );
+}
+
+/// A stream cut short or running long, which would otherwise end in a file whose offsets are wrong.
+#[test]
+fn a_stream_reader_that_lies_about_its_length_abandons_the_update() {
+    let reader = open(&classic_pdf());
+    for (declared, actual) in [(10_u64, 5_usize), (5, 10), (0, 1)] {
+        let mut output = Vec::new();
+        let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+        let id = writer.allocate().unwrap();
+        let body = vec![1_u8; actual];
+        let result = writer.write_stream_from(id, &Dictionary::new(), declared, &mut body.as_slice());
+        assert!(
+            matches!(result, Err(AppendError::StreamLengthMismatch { .. })),
+            "{declared}/{actual}"
+        );
+        assert!(
+            matches!(writer.finish(), Err(AppendError::Abandoned)),
+            "{declared}/{actual}"
+        );
+    }
+}
+
+/// A string or name in document text escaping its token, which would turn data into PDF structure.
+#[test]
+fn hostile_text_stays_inside_its_token() {
+    let reader = open(&classic_pdf());
+    let nasty = b") /Root 99 0 R >> endobj 1 0 obj ( \\ \r\n %%EOF startxref".to_vec();
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    let mut dict = Dictionary::new();
+    dict.set("Literal", Object::String(nasty.clone(), StringFormat::Literal));
+    dict.set("Hex", Object::String(nasty.clone(), StringFormat::Hexadecimal));
+    dict.set("Name", Object::Name(nasty.clone()));
+    dict.set(nasty.clone(), 1);
+    let added = writer.add_object(&Object::Dictionary(dict)).unwrap();
+    let summary = writer.finish().unwrap();
+    let after = reader
+        .verify_appended(Arc::new(BytesSource::from(output)), &summary)
+        .unwrap();
+    let read = after.resolve_object(added.id).unwrap();
+    let read = read.as_dict().unwrap();
+    assert_eq!(read.get(b"Literal").unwrap().as_str().unwrap(), nasty);
+    assert_eq!(read.get(b"Hex").unwrap().as_str().unwrap(), nasty);
+    assert_eq!(read.get(b"Name").unwrap().as_name().unwrap(), nasty);
+    assert!(read.has(&nasty));
+    assert_eq!(after.trailer_entry_raw_owned(b"Root"), Some(Object::Reference((1, 0))));
+}
+
+/// Objects with no valid PDF spelling reaching the file, or bad numbers quietly shadowing real objects.
+#[test]
+fn a_caller_mistake_is_refused_before_it_reaches_the_file() {
+    let bytes = {
+        let mut pdf = Pdf::base();
+        let rows = [
+            (0, "0000000000 65535 f ".to_string()),
+            (1, format!("{:010} 00000 n ", pdf.offsets[&1])),
+            (2, format!("{:010} 00000 n ", pdf.offsets[&2])),
+            (3, format!("{:010} 00000 n ", pdf.offsets[&3])),
+            (4, format!("{:010} 00000 n ", pdf.offsets[&4])),
+            (5, "0000000000 00002 f ".to_string()),
+        ];
+        let xref = pdf.table_rows(&rows, "<< /Size 7 /Root 1 0 R >>");
+        pdf.finish(xref)
+    };
+    let reader = open(&bytes);
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+
+    let one = Object::Integer(1);
+    assert!(matches!(
+        writer.write_object((6, 0), &one),
+        Err(AppendError::UnknownObject { .. })
+    ));
+    assert!(matches!(
+        writer.write_object((0, 0), &one),
+        Err(AppendError::UnknownObject { .. })
+    ));
+    assert!(matches!(
+        writer.write_object((5, 2), &one),
+        Err(AppendError::ObjectIsFree { .. })
+    ));
+    assert!(matches!(
+        writer.write_object((4, 1), &one),
+        Err(AppendError::GenerationMismatch { expected: 0, .. })
+    ));
+
+    let id = writer.allocate().unwrap();
+    assert!(matches!(
+        writer.write_object(id, &Object::Real(f32::NAN)),
+        Err(AppendError::InvalidObject { .. })
+    ));
+    assert!(matches!(
+        writer.write_object(id, &Object::Name(vec![b'a', 0])),
+        Err(AppendError::InvalidObject { .. })
+    ));
+    let nested = Object::Array(vec![Object::Stream(Stream::new(Dictionary::new(), Vec::new()))]);
+    assert!(matches!(
+        writer.write_object(id, &nested),
+        Err(AppendError::InvalidObject { .. })
+    ));
+    let mut deep = Object::Integer(0);
+    for _ in 0..1_000 {
+        deep = Object::Array(vec![deep]);
+    }
+    assert!(matches!(
+        writer.write_object(id, &deep),
+        Err(AppendError::InvalidObject { .. })
+    ));
+    assert!(matches!(
+        writer.set_info(Object::Integer(1)),
+        Err(AppendError::InvalidObject { .. })
+    ));
+    let position = writer.position();
+    assert_eq!(position, bytes.len() as u64, "a refused object wrote something");
+
+    writer.write_object(id, &one).unwrap();
+    assert!(matches!(
+        writer.write_object(id, &one),
+        Err(AppendError::AlreadyWritten { .. })
+    ));
+    writer
+        .write_object((4, 0), &Object::Dictionary(dictionary! { "Title" => "x" }))
+        .unwrap();
+    assert!(matches!(
+        writer.write_object((4, 0), &one),
+        Err(AppendError::AlreadyWritten { .. })
+    ));
+
+    let unwritten = writer.allocate().unwrap();
+    assert!(matches!(writer.finish(), Err(AppendError::ReservedNotWritten { id }) if id == unwritten));
+
+    let writer = AppendWriter::new(&reader, Vec::new()).unwrap();
+    assert!(matches!(writer.finish(), Err(AppendError::EmptyUpdate)));
+
+    let mut writer = AppendWriter::new(&reader, Vec::new()).unwrap();
+    writer.add_object(&one).unwrap();
+    writer.set_root((99, 0));
+    assert!(matches!(writer.finish(), Err(AppendError::TrailerTargetMissing { .. })));
+}
+
+/// Replacing an object stream, which would take every object in it away with no sign of a problem.
+#[test]
+fn an_object_stream_with_live_members_cant_be_replaced() {
+    let bytes = hybrid_pdf(false);
+    let reader = open(&bytes);
+    let mut writer = AppendWriter::new(&reader, Vec::new()).unwrap();
+    assert!(matches!(
+        writer.write_object((6, 0), &Object::Integer(1)),
+        Err(AppendError::ObjectStreamContainer { .. })
+    ));
+    // A member can be replaced: the new version wins, and the container stays.
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    writer.write_object((5, 0), &Object::Integer(55)).unwrap();
+    writer.finish().unwrap();
+    assert_eq!(open(&output).resolve_object((5, 0)).unwrap(), Object::Integer(55));
+}
+
+/// A new `/Info` or `/Root` not reaching the trailer, which would make an `/Info` edit silently vanish.
+#[test]
+fn info_and_root_can_be_repointed() {
+    let reader = open(&classic_pdf());
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    let info = writer
+        .add_object(&Object::Dictionary(
+            dictionary! { "Title" => Object::string_literal("new") },
+        ))
+        .unwrap();
+    let catalog = writer
+        .add_object(&Object::Dictionary(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference((2, 0)) },
+        ))
+        .unwrap();
+    writer.set_info(Object::Reference(info.id)).unwrap();
+    writer.set_root(catalog.id);
+    writer.finish().unwrap();
+    let after = open(&output);
+    assert_eq!(after.trailer_entry_raw_owned(b"Info"), Some(Object::Reference(info.id)));
+    assert_eq!(
+        after.trailer_entry_raw_owned(b"Root"),
+        Some(Object::Reference(catalog.id))
+    );
+    assert_eq!(after.page_count().unwrap(), 1);
+}
+
+// ---- What it refuses. ----
+
+/// An update on a rebuilt index, which has no `/Prev`, so readers would lose every older object.
+#[test]
+fn a_rebuilt_index_is_refused() {
+    let mut bytes = classic_pdf();
+    let cut = bytes.windows(9).rposition(|window| window == b"startxref").unwrap();
+    bytes.truncate(cut);
+    let reader = open(&bytes);
+    assert!(reader.index_stats().unwrap().recovered());
+    assert!(matches!(reader.check_appendable(), Err(AppendError::RecoveredIndex)));
+    assert!(matches!(
+        AppendWriter::new(&reader, Vec::new()).err(),
+        Some(AppendError::RecoveredIndex)
+    ));
+    assert!(matches!(
+        reader.revisions(),
+        Err(IndexedReaderError::RevisionsUnavailable)
+    ));
+}
+
+/// New objects going into an encrypted file in the clear, where they'd read back as garbage.
+#[test]
+fn an_encrypted_file_is_refused() {
+    let bytes = std::fs::read("assets/encrypted.pdf").unwrap();
+    let reader = IndexedReader::open(BytesSource::from(bytes)).unwrap();
+    assert!(reader.is_encrypted());
+    assert!(matches!(reader.check_appendable(), Err(AppendError::Encrypted)));
+}
+
+/// Offsets written from byte 0 in a file whose readers count from its header, which lost the new
+/// objects when measured in the signing research (E5).
+#[test]
+fn a_header_not_at_byte_zero_is_refused() {
+    let mut bytes = b"junk before the header\n".to_vec();
+    bytes.extend_from_slice(&classic_pdf());
+    let reader = open(&bytes);
+    assert!(matches!(
+        reader.check_appendable(),
+        Err(AppendError::HeaderNotAtStart { offset: 23 })
+    ));
+}
+
+/// Chaining onto a `/Prev` loop, where older sections were never read and can't be vouched for.
+#[test]
+fn a_prev_loop_is_refused_and_reported() {
+    let mut pdf = Pdf::base();
+    let xref = pdf.bytes.len() as u64;
+    let trailer = format!("<< /Size 6 /Root 1 0 R /Prev {xref} >>");
+    let at = pdf.table(&trailer);
+    assert_eq!(at, xref);
+    let reader = open(&pdf.finish(xref));
+    assert!(matches!(reader.check_appendable(), Err(AppendError::PrevLoop)));
+    let chain = reader.revisions().unwrap();
+    assert!(chain.has_loop);
+    assert!(!chain.is_regular());
+}
+
+/// A hybrid whose table and supplement disagree: a later signature checker could read a different
+/// document from the one this writer saw.
+#[test]
+fn an_ambiguous_hybrid_is_refused() {
+    assert!(open(&hybrid_pdf(false)).check_appendable().is_ok());
+    let reader = open(&hybrid_pdf(true));
+    assert!(matches!(
+        reader.check_appendable(),
+        Err(AppendError::AmbiguousHybrid { object: 5 })
+    ));
+}
+
+/// A `/Root` that goes nowhere, which would produce a well-formed file that isn't a document.
+#[test]
+fn a_root_that_goes_nowhere_is_refused() {
+    for trailer in [
+        "<< /Size 6 >>",
+        "<< /Size 6 /Root 99 0 R >>",
+        "<< /Size 6 /Root 5 0 R >>",
+        "<< /Size 6 /Root (x) >>",
+    ] {
+        let mut pdf = Pdf::base();
+        let xref = pdf.table(trailer);
+        let bytes = pdf.finish(xref);
+        let reader = open(&bytes);
+        assert!(
+            matches!(reader.check_appendable(), Err(AppendError::InvalidRoot)),
+            "{trailer}"
+        );
+    }
+}
+
+/// Filling the chain to the reader's own limit, which would write a file that then can't be opened.
+#[test]
+fn a_full_chain_is_refused() {
+    let bytes = classic_pdf();
+    let options = IndexedReaderOptions {
+        max_xref_sections: 1,
+        ..IndexedReaderOptions::default()
+    };
+    let reader = IndexedReader::open_with_options(BytesSource::from(bytes), options).unwrap();
+    assert!(matches!(
+        reader.check_appendable(),
+        Err(AppendError::ChainFull { sections: 1 })
+    ));
+}
+
+/// Numbers past what PDFium reads, where the new object would exist for one engine and not the other.
+#[test]
+fn a_huge_size_refuses_new_numbers_and_still_allows_changes() {
+    let mut pdf = Pdf::base();
+    let xref = pdf.table("<< /Size 900000000000 /Root 1 0 R >>");
+    let bytes = pdf.finish(xref);
+    let reader = open(&bytes);
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    assert!(matches!(
+        writer.allocate(),
+        Err(AppendError::ObjectNumberTooLarge { .. })
+    ));
+    writer.write_object((4, 0), &Object::Integer(1)).unwrap();
+    let summary = writer.finish().unwrap();
+    assert_eq!(summary.size, 900_000_000_000, "/Size must not shrink");
+    assert_eq!(open(&output).resolve_object((4, 0)).unwrap(), Object::Integer(1));
+}
+
+/// A write failure being swallowed, which would leave a file with a gap under offsets that assume none.
+#[test]
+fn a_failed_write_abandons_the_update() {
+    struct FailsAfter(usize);
+    impl Write for FailsAfter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0 < bytes.len() {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = classic_pdf();
+    let reader = open(&bytes);
+    let mut writer = AppendWriter::new(&reader, FailsAfter(bytes.len())).unwrap();
+    let big = Object::Stream(Stream::new(Dictionary::new(), vec![0; 256 * 1_024]));
+    assert!(matches!(writer.add_object(&big), Err(AppendError::Io(_))));
+    assert!(matches!(
+        writer.add_object(&Object::Integer(1)),
+        Err(AppendError::Abandoned)
+    ));
+    assert!(matches!(writer.finish(), Err(AppendError::Abandoned)));
+}
+
+// ---- Truncated and hostile input. ----
+
+/// A panic, or a wrong file, on any cut of a real structure. Every length of every form.
+#[test]
+fn every_truncation_of_every_form_is_safe() {
+    let mut appended = 0;
+    for (_, bytes) in all_forms() {
+        for cut in 0..bytes.len() {
+            appended += usize::from(check_append_on_any_bytes(&bytes[..cut]));
+        }
+    }
+    assert!(appended > 0, "no cut reached the writer, so this checked nothing");
+}
+
+/// A panic, or a wrong file, on structure damaged at random. Seeded, so a failure reproduces.
+#[test]
+fn seeded_damage_is_safe() {
+    let forms = all_forms();
+    let mut random = Random(0xA11CE);
+    let mut appended = 0;
+    let rounds = 6_000;
+    for _ in 0..rounds {
+        let (_, form) = &forms[random.below(forms.len() as u64) as usize];
+        let mut bytes = form.clone();
+        // Mostly damage in place. A cut or an insert moves every offset after it, which only ever reaches the rescan.
+        for _ in 0..1 + random.below(3) {
+            let at = random.below(bytes.len() as u64) as usize;
+            match random.below(16) {
+                0..=4 => bytes[at] = random.below(256) as u8,
+                5..=9 => bytes[at] ^= 1 << random.below(8),
+                10..=13 => bytes[at] = b"0123456789 /<>[]()"[random.below(18) as usize],
+                14 => {
+                    let length = (random.below(64) as usize).min(bytes.len() - at);
+                    bytes.drain(at..at + length);
+                    if bytes.is_empty() {
+                        bytes.push(0);
+                    }
+                }
+                _ => {
+                    let (_, other) = &forms[random.below(forms.len() as u64) as usize];
+                    let from = random.below(other.len() as u64) as usize;
+                    let length = (random.below(128) as usize).min(other.len() - from);
+                    let tail = bytes.split_off(at);
+                    bytes.extend_from_slice(&other[from..from + length]);
+                    bytes.extend_from_slice(&tail);
+                }
+            }
+        }
+        appended += usize::from(check_append_on_any_bytes(&bytes));
+    }
+    assert!(
+        appended > rounds / 5,
+        "only {appended} of {rounds} reached the writer, so this checks too little"
+    );
+}
+
+// ---- Memory: what it reads. ----
+
+struct CountingSource {
+    inner: BytesSource,
+    largest_read: AtomicU64,
+    total_read: AtomicU64,
+}
+
+impl RandomAccessSource for CountingSource {
+    fn len(&self) -> SourceResult<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+        self.largest_read.fetch_max(out.len() as u64, Ordering::Relaxed);
+        let read = self.inner.read_at(offset, out)?;
+        self.total_read.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
+fn padded_pdf(padding: usize) -> Vec<u8> {
+    let mut pdf = Pdf::base();
+    pdf.bytes.extend_from_slice(b"%");
+    pdf.bytes.resize(pdf.bytes.len() + padding, b'x');
+    pdf.bytes.push(b'\n');
+    let xref = pdf.table(TRAILER);
+    pdf.finish(xref)
+}
+
+/// The writer loading the whole file, on a path where 330 MiB inputs exist. With the file's bytes at
+/// 8 MiB, an append to the file itself has to read about as little as an open does, and a copy has to
+/// read in small pieces only.
+#[test]
+fn the_original_is_read_in_small_pieces_and_not_at_all_for_a_tail() {
+    let bytes = padded_pdf(8 * 1_024 * 1_024);
+    let source = Arc::new(CountingSource {
+        inner: BytesSource::from(bytes.clone()),
+        largest_read: AtomicU64::new(0),
+        total_read: AtomicU64::new(0),
+    });
+    let reader = IndexedReader::open_shared(source.clone(), IndexedReaderOptions::default()).unwrap();
+    let opened = source.total_read.load(Ordering::Relaxed);
+    let opened_largest = source.largest_read.load(Ordering::Relaxed);
+    assert!(opened < 256 * 1_024, "open read {opened} bytes");
+
+    let mut tail = Vec::new();
+    let mut writer = AppendWriter::tail_only(&reader, &mut tail).unwrap();
+    writer.add_object(&Object::Integer(1)).unwrap();
+    writer.finish().unwrap();
+    let appended = source.total_read.load(Ordering::Relaxed) - opened;
+    assert!(appended < 64 * 1_024, "a tail-only update read {appended} bytes");
+    assert_eq!(source.largest_read.load(Ordering::Relaxed), opened_largest);
+    assert!(tail.len() < 1_024, "a one-object update wrote {} bytes", tail.len());
+
+    let mut whole = bytes.clone();
+    whole.extend_from_slice(&tail);
+    assert!(!open(&whole).index_stats().unwrap().recovered());
+    assert_eq!(open(&whole).resolve_object((6, 0)).unwrap(), Object::Integer(1));
+
+    source.largest_read.store(0, Ordering::Relaxed);
+    let mut copy = std::io::sink();
+    let mut writer = AppendWriter::new(&reader, &mut copy).unwrap();
+    writer.add_object(&Object::Integer(1)).unwrap();
+    writer.finish().unwrap();
+    let largest = source.largest_read.load(Ordering::Relaxed);
+    assert!(largest <= 64 * 1_024, "the prefix copy made a {largest}-byte read");
+}
+
+/// A cached reader's copy passing through its cache, which would empty it for nothing.
+#[test]
+fn a_copy_leaves_the_readers_cache_alone() {
+    let bytes = padded_pdf(4 * 1_024 * 1_024);
+    let reader = IndexedReader::open_cached(
+        BytesSource::from(bytes.clone()),
+        IndexedReaderOptions::default(),
+        lopdf::IndexedReaderCacheOptions::new(16 * 1_024 * 1_024, 4_096),
+    )
+    .unwrap();
+    let before = reader.cache_stats().source().loads();
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    writer.add_object(&Object::Integer(1)).unwrap();
+    writer.finish().unwrap();
+    assert!(output.starts_with(&bytes));
+    let loads = reader.cache_stats().source().loads() - before;
+    assert!(loads <= 2, "the copy loaded {loads} chunks through the cache");
+}
+
+// ---- Revisions. ----
+
+/// Revision ranges that don't meet end to end, so a signature's coverage can't be read off them.
+#[test]
+fn revisions_list_their_byte_ranges() {
+    let original = classic_pdf();
+    let first = open(&original);
+    let (second, _, _) = small_update(&first);
+    let (third, summary, _) = small_update(&open(&second));
+    let chain = open(&third).revisions().unwrap();
+    assert!(chain.is_regular());
+    assert_eq!(chain.trailing_bytes, Some(0));
+    let ranges: Vec<_> = chain
+        .revisions
+        .iter()
+        .map(|revision| revision.range.clone().unwrap())
+        .collect();
+    assert_eq!(
+        ranges,
+        [
+            0..original.len() as u64,
+            original.len() as u64..second.len() as u64,
+            second.len() as u64..third.len() as u64
+        ]
+    );
+    assert_eq!(chain.revisions[2].startxref, summary.xref_offset);
+    assert_eq!(chain.revisions[0].prev, None);
+    assert_eq!(chain.revisions[0].entry_count, 6);
+    assert_eq!(chain.revisions[1].entry_count, 2);
+    assert_eq!(
+        chain
+            .revisions
+            .iter()
+            .map(|revision| revision.index)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+}
+
+/// Trailing junk being counted as part of the last revision, which would hide bytes added after a
+/// signature.
+#[test]
+fn bytes_after_the_last_marker_are_reported() {
+    let mut bytes = classic_pdf();
+    let end = bytes.len() as u64;
+    bytes.extend_from_slice(b"\n\n\0\0trailing");
+    let chain = open(&bytes).revisions().unwrap();
+    assert_eq!(chain.revisions[0].range, Some(0..end));
+    assert_eq!(chain.trailing_bytes, Some(bytes.len() as u64 - end));
+}
+
+/// The revision list ignoring the cap the reader was opened with, which would give a hostile file back the long walk
+/// the cap exists to prevent. The list is only asked for after an open that passed, so the same cap gives the same chain.
+#[test]
+fn the_revision_list_walks_the_same_chain_under_the_same_cap() {
+    let options = IndexedReaderOptions {
+        max_xref_sections: 3,
+        ..IndexedReaderOptions::default()
+    };
+    let (once, _, _) = small_update(&open(&classic_pdf()));
+    let (twice, _, _) = small_update(&open(&once));
+    let reader = IndexedReader::open_with_options(BytesSource::from(twice), options).unwrap();
+    assert_eq!(reader.revisions().unwrap().revisions.len(), 3);
+}
+
+/// A CRLF or a missing line ending landing on the wrong side of a revision's end, or a signature that
+/// ends at `%%EOF` not matching one that ends after its newline.
+#[test]
+fn a_revision_ends_after_its_line_ending_and_can_be_found_either_way() {
+    for (eol, length) in [(&b"\r\n"[..], 2_u64), (b"\n", 1), (b"\r", 1), (b"", 0)] {
+        let mut bytes = classic_pdf();
+        bytes.pop();
+        let marker_end = bytes.len() as u64;
+        bytes.extend_from_slice(eol);
+        let reader = open(&bytes);
+        let chain = reader.revisions().unwrap();
+        let revision = &chain.revisions[0];
+        assert_eq!(revision.eof_marker_end, Some(marker_end));
+        assert_eq!(revision.range, Some(0..marker_end + length));
+        assert_eq!(chain.revision_ending_at(marker_end).map(|found| found.index), Some(0));
+        assert_eq!(
+            chain.revision_ending_at(marker_end + length).map(|found| found.index),
+            Some(0)
+        );
+        assert!(chain.revision_ending_at(marker_end - 1).is_none());
+    }
+}
+
+/// The line ending the writer adds to a file that has none coming back as part of the original, which
+/// made an extracted revision one byte longer than the file it was. Found on 5 of 141 real files.
+#[test]
+fn a_file_without_a_final_line_ending_comes_back_exact() {
+    let mut original = classic_pdf();
+    assert_eq!(original.pop(), Some(b'\n'));
+    let (once, _, _) = small_update(&open(&original));
+    let (twice, _, _) = small_update(&open(&once));
+    let reader = open(&twice);
+    let chain = reader.revisions().unwrap();
+    assert!(chain.is_regular());
+    assert_eq!(chain.revisions[0].range, Some(0..original.len() as u64));
+    assert_eq!(chain.revisions[1].range, Some(original.len() as u64..once.len() as u64));
+    let mut copy = Vec::new();
+    reader.copy_revision_to(&chain.revisions[0], &mut copy).unwrap();
+    assert_eq!(copy, original);
+    let mut copy = Vec::new();
+    reader.copy_revision_to(&chain.revisions[1], &mut copy).unwrap();
+    assert_eq!(copy, once);
+}
+
+/// A linearized file reported as two revisions, the first of which would be a prefix that isn't a
+/// document, or an update on one chaining to the wrong section.
+#[test]
+fn a_linearized_files_two_sections_are_one_revision() {
+    // Laid out as a linearizer does: the first-page section comes first, says `startxref 0`, and points
+    // ahead with /Prev. The main section is last, and its startxref names the first-page section.
+    let mut pdf = Pdf::new();
+    pdf.obj(7, "<< /Linearized 1 /L 0 /O 3 /E 0 /N 1 /T 0 >>");
+    let head = pdf.bytes.len() as u64;
+    let reserve = "0000000000";
+    let head_section = format!(
+        "xref\n7 1\n{:010} 00000 n \ntrailer\n<< /Size 8 /Root 1 0 R /Prev {reserve} >>\nstartxref\n0\n%%EOF\n",
+        pdf.offsets[&7]
+    );
+    pdf.bytes.extend_from_slice(head_section.as_bytes());
+    pdf.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    pdf.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    pdf.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>");
+    let main = pdf.bytes.len() as u64;
+    let rows = [
+        (0, "0000000000 65535 f ".to_string()),
+        (1, format!("{:010} 00000 n ", pdf.offsets[&1])),
+        (2, format!("{:010} 00000 n ", pdf.offsets[&2])),
+        (3, format!("{:010} 00000 n ", pdf.offsets[&3])),
+    ];
+    pdf.table_rows(&rows, "<< /Size 8 /Root 1 0 R >>");
+    let mut bytes = pdf.finish(head);
+    let located = head as usize + head_section.find(reserve).unwrap();
+    bytes[located..located + 10].copy_from_slice(format!("{main:010}").as_bytes());
+
+    let reader = open(&bytes);
+    assert!(!reader.index_stats().unwrap().recovered());
+    let chain = reader.revisions().unwrap();
+    assert_eq!(chain.revisions.len(), 1);
+    let revision = &chain.revisions[0];
+    assert!(revision.linearized);
+    assert_eq!(revision.range, Some(0..bytes.len() as u64));
+    assert_eq!(revision.startxref, head);
+    assert_eq!(revision.entry_count, 5);
+    assert_eq!(
+        revision.prev, None,
+        "the main section is part of this revision, not the one before it"
+    );
+
+    let (output, summary, added) = small_update(&reader);
+    assert_eq!(summary.prev, head, "an update chains to what startxref named");
+    let chain = open(&output).revisions().unwrap();
+    assert!(chain.is_regular());
+    assert_eq!(chain.revisions.len(), 2);
+    assert!(chain.revisions[0].linearized);
+    assert_eq!(chain.revisions[0].range, Some(0..bytes.len() as u64));
+    assert_eq!(
+        open(&output)
+            .resolve_object(added)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Added")
+            .unwrap(),
+        &Object::Boolean(true)
+    );
+    assert_eq!(open(&output).page_count().unwrap(), 1);
+}
+
+/// Two sections closed by one `startxref`, as one real file in the corpus has, being reported as a revision with no
+/// provable end. The older section's first marker names the newer section, so they end together.
+#[test]
+fn sections_closed_by_one_marker_are_one_revision() {
+    let mut pdf = Pdf::base();
+    let first = pdf.table(TRAILER);
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{first}\n%%EOF\n").as_bytes());
+    let boundary = pdf.bytes.len() as u64;
+    pdf.obj(6, "<< /Newer 1 >>");
+    let rows = [(6, format!("{:010} 00000 n ", pdf.offsets[&6]))];
+    let older = pdf.table_rows(&rows, &format!("<< /Size 8 /Root 1 0 R /Prev {first} >>"));
+    pdf.obj(7, "<< /Newer 2 >>");
+    let rows = [(7, format!("{:010} 00000 n ", pdf.offsets[&7]))];
+    let newer = pdf.table_rows(&rows, &format!("<< /Size 8 /Root 1 0 R /Prev {older} >>"));
+    let bytes = pdf.finish(newer);
+    let reader = open(&bytes);
+    let chain = reader.revisions().unwrap();
+    assert!(chain.is_regular());
+    assert_eq!(chain.revisions.len(), 2);
+    assert_eq!(chain.revisions[0].range, Some(0..boundary));
+    assert_eq!(chain.revisions[1].range, Some(boundary..bytes.len() as u64));
+    assert_eq!(chain.revisions[1].startxref, newer);
+    assert_eq!(chain.revisions[1].prev, Some(first));
+    assert_eq!(chain.revisions[1].entry_count, 2);
+    assert_eq!(chain.revisions[1].index, 1);
+    assert_eq!(
+        reader
+            .open_revision(&chain.revisions[0], IndexedReaderOptions::default())
+            .unwrap()
+            .object_ids()
+            .len(),
+        5
+    );
+}
+
+/// A guessed range: when an older section has no marker of its own, or the chain runs backwards, a
+/// guess would claim bytes for a revision that a reader of that prefix wouldn't see.
+#[test]
+fn a_revision_with_no_marker_or_out_of_order_has_no_range() {
+    // An older section with no startxref after it within the window.
+    let mut pdf = Pdf::base();
+    let older = pdf.table(TRAILER);
+    pdf.bytes.extend_from_slice(b"%");
+    pdf.bytes.resize(pdf.bytes.len() + 8 * 1_024, b'x');
+    pdf.bytes.push(b'\n');
+    pdf.obj(6, "<< /Newer true >>");
+    let rows = [(6, format!("{:010} 00000 n ", pdf.offsets[&6]))];
+    let newer = pdf.table_rows(&rows, &format!("<< /Size 7 /Root 1 0 R /Prev {older} >>"));
+    let reader = open(&pdf.finish(newer));
+    let chain = reader.revisions().unwrap();
+    assert_eq!(chain.revisions.len(), 2);
+    assert!(!chain.is_regular());
+    assert_eq!(chain.revisions[0].range, None);
+    assert!(chain.revisions[1].range.is_some());
+    let oldest = &chain.revisions[0];
+    assert!(matches!(
+        reader.copy_revision_to(oldest, &mut Vec::new()),
+        Err(IndexedReaderError::RevisionRangeUnavailable { index: 0 })
+    ));
+    assert!(matches!(
+        reader.open_revision(oldest, IndexedReaderOptions::default()),
+        Err(IndexedReaderError::RevisionRangeUnavailable { index: 0 })
+    ));
+
+    // The file's last startxref names a section whose /Prev points forward, to a section that a prefix
+    // ending at the newer section's own marker can't contain.
+    let mut pdf = Pdf::base();
+    let newest = pdf.table(&format!("<< /Size 6 /Root 1 0 R /Prev {:010} >>", 0));
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{newest}\n%%EOF\n").as_bytes());
+    let older = pdf.table(TRAILER);
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{older}\n%%EOF\n").as_bytes());
+    let mut bytes = pdf.finish(newest);
+    let prev_at = find_last(&bytes[..older as usize], b"/Prev ") + b"/Prev ".len();
+    bytes[prev_at..prev_at + 10].copy_from_slice(format!("{older:010}").as_bytes());
+    let chain = open(&bytes).revisions().unwrap();
+    assert_eq!(chain.revisions.len(), 2);
+    assert!(!chain.is_regular());
+    assert_eq!(chain.revisions[1].startxref, newest);
+    assert_eq!(
+        chain.revisions[1].range, None,
+        "the newest section sits inside the older one's bytes"
+    );
+}
+
+fn find_last(bytes: &[u8], pattern: &[u8]) -> usize {
+    bytes
+        .windows(pattern.len())
+        .rposition(|window| window == pattern)
+        .unwrap()
+}
+
+/// A signed range changing, or the signature no longer being traceable to a whole revision. The
+/// signature here is a stand-in with the real layout: nothing is checked but the bytes.
+#[test]
+fn a_signed_range_is_unchanged_and_named_by_its_revision() {
+    let mut pdf = Pdf::base();
+    let placeholder = "0".repeat(64);
+    let dict_at = pdf.bytes.len();
+    pdf.obj(
+        6,
+        &format!("<< /Type /Sig /ByteRange [0 0000000000 0000000000 0000000000] /Contents <{placeholder}> >>"),
+    );
+    let trailer = "<< /Size 7 /Root 1 0 R /Info 4 0 R >>";
+    let xref = pdf.table(trailer);
+    let mut bytes = pdf.finish(xref);
+    let hole_start = dict_at + find_last(&bytes[dict_at..], b"/Contents <") + b"/Contents ".len();
+    let hole_end = hole_start + placeholder.len() + 2;
+    let byte_range = format!("[0 {hole_start:010} {hole_end:010} {:010}]", bytes.len() - hole_end);
+    let range_at = dict_at + find_last(&bytes[dict_at..], b"/ByteRange ") + b"/ByteRange ".len();
+    bytes[range_at..range_at + byte_range.len()].copy_from_slice(byte_range.as_bytes());
+
+    let signed_first = bytes[..hole_start].to_vec();
+    let signed_second = bytes[hole_end..].to_vec();
+    let reader = open(&bytes);
+    let (output, summary, _) = small_update(&reader);
+    assert_eq!(output[..hole_start], signed_first);
+    assert_eq!(output[hole_end..bytes.len()], signed_second);
+    assert_eq!(output[hole_start..hole_end], bytes[hole_start..hole_end]);
+    assert_eq!(summary.previous_len, bytes.len() as u64);
+
+    let chain = open(&output).revisions().unwrap();
+    let covered = chain
+        .revision_ending_at(bytes.len() as u64)
+        .expect("the signature ends at a revision");
+    assert_eq!(covered.index, 0);
+    assert_eq!(chain.revisions.len(), 2);
+    let mut copy = Vec::new();
+    open(&output).copy_revision_to(covered, &mut copy).unwrap();
+    assert_eq!(copy, bytes);
+}
+
+// ---- The atomic path. ----
+
+#[cfg(any(unix, windows))]
+mod atomic {
+    use super::*;
+    use lopdf::{FileSource, append_atomically};
+
+    fn folder() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn entries(folder: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// An update replacing the file it read, with a reader still open on the old one: the classic case of
+    /// saving over yourself. The old reader has to keep answering, and the new file has to be whole.
+    #[test]
+    fn it_replaces_the_file_the_reader_has_open() {
+        let dir = folder();
+        let path = dir.path().join("doc.pdf");
+        let bytes = classic_pdf();
+        std::fs::write(&path, &bytes).unwrap();
+        let reader = IndexedReader::open(FileSource::open(&path).unwrap()).unwrap();
+        let (summary, reopened) = append_atomically(&reader, &path, |writer| {
+            writer.add_object(&Object::Integer(9))?;
+            Ok(())
+        })
+        .unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(on_disk.starts_with(&bytes));
+        assert_eq!(on_disk.len() as u64, summary.new_len);
+        assert_eq!(entries(dir.path()), ["doc.pdf"], "the temporary file was left behind");
+        assert_eq!(
+            reopened.resolve_object(summary.objects[0].id).unwrap(),
+            Object::Integer(9)
+        );
+        assert_eq!(reader.object_ids().len(), 5, "the old reader lost its view");
+        assert!(reader.resolve_object((1, 0)).is_ok(), "the old reader stopped reading");
+        assert!(reader.resolve_object(summary.objects[0].id).is_err());
+    }
+
+    /// A failed save leaving the target changed, or a partial temporary file behind. "Save never leaves
+    /// a partly written file" is a promise from the spec.
+    #[test]
+    fn a_failed_build_leaves_everything_as_it_was() {
+        let dir = folder();
+        let path = dir.path().join("doc.pdf");
+        let bytes = classic_pdf();
+        std::fs::write(&path, &bytes).unwrap();
+        let reader = IndexedReader::open(FileSource::open(&path).unwrap()).unwrap();
+
+        let refused = append_atomically(&reader, &path, |writer| {
+            writer.add_object(&Object::Integer(1))?;
+            writer.write_object((99, 0), &Object::Integer(2))?;
+            Ok(())
+        });
+        assert!(matches!(refused, Err(AppendError::UnknownObject { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(entries(dir.path()), ["doc.pdf"]);
+
+        let empty = append_atomically(&reader, &path, |_| Ok(()));
+        assert!(matches!(empty, Err(AppendError::EmptyUpdate)));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(entries(dir.path()), ["doc.pdf"]);
+    }
+
+    /// Saving as a new file touching the original, or a save-over losing the file's permissions.
+    #[test]
+    fn save_as_leaves_the_original_and_permissions_carry_over() {
+        let dir = folder();
+        let path = dir.path().join("doc.pdf");
+        let other = dir.path().join("copy.pdf");
+        let bytes = classic_pdf();
+        std::fs::write(&path, &bytes).unwrap();
+        let reader = IndexedReader::open(FileSource::open(&path).unwrap()).unwrap();
+        append_atomically(&reader, &other, |writer| {
+            writer.add_object(&Object::Integer(1))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(std::fs::read(&other).unwrap().starts_with(&bytes));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            append_atomically(&reader, &path, |writer| {
+                writer.add_object(&Object::Integer(1))?;
+                Ok(())
+            })
+            .unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640);
+        }
+    }
+
+    /// An update starting from a stale view: the file changed after the reader opened it, so the
+    /// offsets it would write are wrong for what's there now.
+    #[test]
+    fn a_file_changed_under_the_reader_is_refused() {
+        let dir = folder();
+        let path = dir.path().join("doc.pdf");
+        std::fs::write(&path, classic_pdf()).unwrap();
+        let reader = IndexedReader::open(FileSource::open(&path).unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"more\n").unwrap();
+        drop(file);
+        let result = AppendWriter::new(&reader, Vec::new());
+        assert!(matches!(
+            result.err(),
+            Some(AppendError::Source(SourceError::SourceChanged))
+        ));
+    }
+
+    /// The verifier passing a file it should fail: one flipped byte in the original part, a bad length, or a
+    /// lying summary.
+    #[test]
+    fn the_verifier_catches_a_damaged_result() {
+        let bytes = classic_pdf();
+        let reader = open(&bytes);
+        let (output, summary, _) = small_update(&reader);
+        assert!(
+            reader
+                .verify_appended(Arc::new(BytesSource::from(output.clone())), &summary)
+                .is_ok()
+        );
+
+        let mut flipped = output.clone();
+        flipped[20] ^= 1;
+        let result = reader.verify_appended(Arc::new(BytesSource::from(flipped)), &summary);
+        assert!(
+            matches!(result.err(), Some(AppendError::VerificationFailed { reason }) if reason.contains("original"))
+        );
+
+        let mut longer = output.clone();
+        longer.push(b'\n');
+        assert!(matches!(
+            reader
+                .verify_appended(Arc::new(BytesSource::from(longer)), &summary)
+                .err(),
+            Some(AppendError::VerificationFailed { .. })
+        ));
+
+        let mut lying = summary.clone();
+        lying.objects[0].offset += 1;
+        assert!(matches!(
+            reader
+                .verify_appended(Arc::new(BytesSource::from(output)), &lying)
+                .err(),
+            Some(AppendError::VerificationFailed { .. })
+        ));
+    }
+}
+
+/// A small generator, so a failing seed fails the same way everywhere.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound.max(1)
+    }
+}

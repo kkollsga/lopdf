@@ -1,0 +1,22 @@
+[package]
+name = "lopdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lopdf = { path = "..", default-features = false }
+
+# Kept out of any parent workspace, and out of the crate's own dependencies.
+[workspace]
+
+[[bin]]
+name = "append"
+path = "fuzz_targets/append.rs"
+test = false
+doc = false
+bench = false

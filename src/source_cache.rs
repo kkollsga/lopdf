@@ -319,6 +319,12 @@ impl CachedSource {
         })
     }
 
+    /// The source behind the cache, for a whole-file pass that shouldn't evict the
+    /// chunks a reader is using.
+    pub(crate) fn backing(&self) -> &Arc<dyn RandomAccessSource> {
+        &self.source
+    }
+
     pub(crate) fn stats(&self) -> IndexedReaderSourceCacheStats {
         let state = lock_unpoisoned(&self.cache);
         IndexedReaderSourceCacheStats {

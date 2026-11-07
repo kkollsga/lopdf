@@ -6,7 +6,9 @@
 //! [`Document`](crate::Document), not a replacement: `Document` still owns
 //! whole-file loading, mutation and writing. This module exists for the case
 //! where a caller wants a few objects out of a large file and cannot afford to
-//! pay for the rest of it.
+//! pay for the rest of it. It also holds the one write it can do at that cost:
+//! [`AppendWriter`] adds an incremental update and changes no earlier byte, and
+//! [`IndexedReader::revisions`] lists the updates a file already has.
 //!
 //! # The model
 //!
@@ -201,6 +203,7 @@ use crate::{Dictionary, Object, ObjectStream, Stream};
 
 pub use crate::source_cache::{IndexedReaderCacheOptions, IndexedReaderSourceCacheStats};
 
+mod append;
 mod cache;
 mod errors;
 mod framing;
@@ -210,12 +213,14 @@ mod options;
 mod page_map;
 mod preflight;
 mod resolve;
+mod revisions;
 mod stats;
 mod streams;
 
 #[cfg(test)]
 mod tests;
 
+pub use self::append::*;
 use self::cache::*;
 pub use self::errors::*;
 use self::framing::*;
@@ -225,6 +230,7 @@ pub use self::options::*;
 pub use self::page_map::*;
 use self::preflight::*;
 use self::resolve::*;
+pub use self::revisions::*;
 pub use self::stats::*;
 pub use self::streams::*;
 

@@ -30,3 +30,27 @@ The currently pinned divergences are:
   left out of the indexed page map;
 - a string that cannot be decrypted leaves the eager object partly decrypted with a warning, while
   the indexed reader refuses the whole object with `ObjectDecryption`.
+
+# Append writer contract
+
+`AppendWriter` writes an incremental update from an open `IndexedReader` and a streaming output. The
+bytes before the update never change. Tests build their inputs from bytes and check the output with
+the indexed reader and, separately, the eager loader, in `tests/append_writer.rs`.
+
+The new section takes the form of the file's newest section: a table for a table or a hybrid, a stream
+for a stream. A hybrid's new table carries no `/XRefStm`; its old supplement is still reached through
+`/Prev`. The new trailer keeps every entry of the old one except those that describe the old section
+(`/Size`, `/Prev`, `/XRefStm`, and a stream section's own `/Type`, `/W`, `/Index`, `/Length`, filters).
+The first string of `/ID` never changes and the second does. A file with no `/ID` gets one, and an `/ID`
+that isn't two direct strings is left alone.
+
+It refuses, before writing anything: an index rebuilt by a scan, encryption, a header not at byte 0, a
+`/Prev` loop, a chain already at `max_xref_sections`, a `/XRefStm` that redefines a live entry of its own
+table or sits on a stream section, and a `/Root` that isn't a reference to a dictionary. New object numbers
+stop at PDFium's limit of 4,194,304, and a table's offsets at 10 digits.
+
+A file whose last byte isn't a line ending gets `\n%line-ending-added\n` before the first object, so that
+the revision list can give back the original's exact length. A revision's range ends past the line ending
+after its `%%EOF`, and `eof_marker_end` gives the end before it. A range exists only if a `startxref` names
+the section and the sections run forward through the file. A linearized file's two sections count as one
+revision. Revisions are listed on request and nothing about them is held open.

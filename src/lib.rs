@@ -54,12 +54,15 @@ pub use encodings::{Encoding, OwnedEncoding, encode_utf8, encode_utf16_be};
 pub use encryption::{EncryptionState, EncryptionVersion, Permissions};
 pub use error::{DecompressError, Error, ParseError, Result};
 pub use incremental_document::IncrementalDocument;
+#[cfg(any(unix, windows))]
+pub use indexed_reader::append_atomically;
 pub use indexed_reader::{
-    BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES, BoundedObjectStream, EncodedStreamLength,
-    EncodedStreamLengthUnavailableReason, EncodedStreamProtection, EncodedStreamReader, IndexedObjectCacheStats,
-    IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
-    IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats, IndexedReaderOptions, IndexedReaderResult,
-    IndexedReaderSourceCacheStats, IndexedStreamDescriptor, IndexedStreamReadError, IndexedStreamReadResult,
+    AppendError, AppendResult, AppendSummary, AppendWriter, AppendedObject, BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES,
+    BoundedObjectStream, EncodedStreamLength, EncodedStreamLengthUnavailableReason, EncodedStreamProtection,
+    EncodedStreamReader, IndexedObjectCacheStats, IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader,
+    IndexedReaderCacheOptions, IndexedReaderCacheStats, IndexedReaderError, IndexedReaderIndexStats,
+    IndexedReaderOptions, IndexedReaderResult, IndexedReaderSourceCacheStats, IndexedRevision, IndexedRevisionChain,
+    IndexedStreamDescriptor, IndexedStreamReadError, IndexedStreamReadResult, IndexedXrefKind,
     InheritedPageAttributeOwners, MissingNormalObjectReason, ObjectLimitProvenance, PageMap, PageMapEntry,
     SharedIndexedReaderResult,
 };
