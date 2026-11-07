@@ -682,6 +682,20 @@ mod tests {
         assert_eq!(result.unwrap(), "\u{0024}");
     }
 
+    /// The fork's owned encoding, which the indexed route uses, refusing the predefined Unicode CMaps that `Encoding` decodes:
+    /// a font using one would fail text extraction on one route and work on the other.
+    #[test]
+    fn owned_encoding_decodes_every_predefined_unicode_cmap() {
+        for name in UNICODE_PREDEFINED_CMAPS {
+            let encoding = OwnedEncoding::from_named(name, None).unwrap();
+            let mut decoded = String::new();
+            encoding
+                .write_to_string(&[0x30, 0x42, 0xAC, 0x00], &mut decoded)
+                .unwrap();
+            assert_eq!(decoded, "あ가", "{}", String::from_utf8_lossy(name));
+        }
+    }
+
     #[test]
     fn unicode_predefined_cmaps_decode_as_utf16_be() {
         // Every name in ISO 32000-1 Table 118 that contains "UCS2" or "UTF16".
