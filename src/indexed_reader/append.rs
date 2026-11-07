@@ -655,7 +655,8 @@ impl<'r, W: AppendOutput> AppendWriter<'r, W> {
                 reason: "/Info has to be a reference or a dictionary",
             });
         }
-        check_object((0, 0), &info, 0, false)?;
+        // A direct `/Info` sits one level inside the trailer.
+        check_object((0, 0), &info, 1, false)?;
         self.new_info = Some(info);
         Ok(())
     }

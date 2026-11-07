@@ -695,6 +695,40 @@ fn an_object_nested_near_the_limit_is_refused_or_reads_back() {
     }
 }
 
+/// A direct `/Info` nested just under the limit for an object, one level further down in the trailer than the check thought. The trailer then couldn't
+/// be parsed and the file couldn't be opened, and a bare `finish` returned Ok.
+#[test]
+fn a_direct_info_near_the_limit_is_refused_or_reads_back() {
+    for form in [classic_pdf(), xref_stream_pdf()] {
+        let reader = open(&form);
+        let (mut accepted, mut refused) = (0, 0);
+        for depth in 90..=105 {
+            let mut info = Object::Integer(1);
+            for _ in 0..depth {
+                info = Object::Dictionary(dictionary! { "K" => info });
+            }
+            let mut output = Vec::new();
+            let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+            writer.add_object(&Object::Integer(1)).unwrap();
+            if writer.set_info(info.clone()).is_err() {
+                refused += 1;
+                continue;
+            }
+            writer.finish().unwrap();
+            let after = IndexedReader::open(BytesSource::from(output)).unwrap_or_else(|error| {
+                panic!("depth {depth}: finish returned Ok, and the file doesn't open: {error}")
+            });
+            assert!(!after.index_stats().unwrap().recovered(), "depth {depth}");
+            assert_eq!(after.trailer_entry_raw_owned(b"Info"), Some(info), "depth {depth}");
+            accepted += 1;
+        }
+        assert!(
+            accepted > 0 && refused > 0,
+            "the limit isn't in the range tested, so this checked nothing"
+        );
+    }
+}
+
 /// A check that only looks at headers: an object whose header is fine and whose body can't be parsed has to fail
 /// it, or a bad update replaces a good file.
 #[test]
