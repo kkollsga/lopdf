@@ -24,10 +24,11 @@ pub fn check_rewrite_on_any_bytes(data: &[u8]) -> bool {
     if let Some(written) = written {
         // The same check a save makes, which has to pass on whatever the writer finished.
         let source: std::sync::Arc<dyn lopdf::RandomAccessSource> = std::sync::Arc::new(BytesSource::from(output.clone()));
-        let (_, after) = written.verify(&reader, source).expect("a finished rewrite fails its own check");
+        let (summary, after) = written.verify(&reader, source).expect("a finished rewrite fails its own check");
         assert!(!after.index_stats().unwrap().recovered(), "a finished rewrite needs a rescan");
         assert_eq!(after.revisions().unwrap().revisions.len(), 1, "a finished rewrite has more than one revision");
-        if let (Some(pages), Ok(now)) = (pages, after.page_count()) {
+        // An object found a little off its offset can be a page this reader didn't see, as a viewer that rebuilds sees it.
+        if let (Some(pages), Ok(now), 0) = (pages, after.page_count(), summary.objects_found_near_their_offset) {
             assert_eq!(now, pages, "a rewrite with no changes changed the page count");
         }
         // What went in has to come back out. A limit can stop it, on a hostile file, and not what was written being unreadable.

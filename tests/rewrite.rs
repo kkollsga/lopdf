@@ -3209,3 +3209,11 @@ fn an_object_a_little_off_its_offset_is_found_and_one_nowhere_is_refused() {
         "{refused:?}"
     );
 }
+
+/// From the fuzz target: a page whose entry is a little off, which this reader doesn't see and a viewer that rebuilds does. The rewrite finds it, so the
+/// copy has a page more than the reader counted, which the property check took for a page appearing from nowhere.
+#[test]
+fn a_page_found_near_its_offset_counts() {
+    let bytes = include_bytes!("../assets/rewrite/page_found_nearby.pdf");
+    assert!(property::check_rewrite_on_any_bytes(bytes));
+}
