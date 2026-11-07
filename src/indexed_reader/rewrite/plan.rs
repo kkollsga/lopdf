@@ -6,10 +6,10 @@ use super::*;
 
 /// Decoded object streams kept between members. One is kept whatever its size, since the one in use has to be somewhere.
 pub(super) const RETAINED_CONTAINER_BYTES: usize = 1_024 * 1_024;
-/// Bytes one rewrite may parse and inflate at the least, however small the file is. Above that it's a multiple of the file,
-/// which an honest file doesn't reach in the few passes a rewrite makes.
-const WORK_ALLOWANCE: u64 = 2 * 1_024 * 1_024 * 1_024;
-const WORK_PER_FILE_BYTE: u64 = 16;
+/// Bytes one rewrite may parse and inflate at the least, however small the file is. Above that it's a multiple of the file. On the
+/// 141-file corpus the most any rewrite needed was 11 times its file, 205 MB to remove a page from an 18 MB file.
+const WORK_ALLOWANCE: u64 = 256 * 1_024 * 1_024;
+const WORK_PER_FILE_BYTE: u64 = 32;
 /// Objects in one new file. Every section is read back with the reader's limit of a million entries.
 pub(super) const MAX_REWRITE_OBJECTS: u64 = 900_000;
 /// How long a chain of references a load follows.
@@ -125,6 +125,41 @@ struct RetainedContainer {
     members: crate::object_stream::SelectedObjectStream,
 }
 
+/// Objects parsed from the file lately, so the planning steps that look at the same ones again don't parse them again: a page tree node
+/// for each of its pages, a holder of names for each name. Weighed by the bytes each was parsed from. A big object isn't kept, since a
+/// hostile one costs ten times its bytes once parsed, and parsing it again is charged.
+#[derive(Default)]
+struct ParsedCache {
+    entries: HashMap<u32, Loaded>,
+    order: VecDeque<(u32, u64)>,
+    weight: u64,
+}
+
+impl ParsedCache {
+    const MAX_WEIGHT: u64 = 1_024 * 1_024;
+    const MAX_ENTRY_WEIGHT: u64 = 16 * 1_024;
+
+    fn get(&self, number: u32) -> Option<Loaded> {
+        self.entries.get(&number).cloned()
+    }
+
+    fn insert(&mut self, number: u32, loaded: &Loaded, weight: u64) {
+        let weight = weight.max(64);
+        if weight > Self::MAX_ENTRY_WEIGHT || self.entries.contains_key(&number) {
+            return;
+        }
+        while self.weight + weight > Self::MAX_WEIGHT
+            && let Some((evicted, evicted_weight)) = self.order.pop_front()
+        {
+            self.entries.remove(&evicted);
+            self.weight -= evicted_weight;
+        }
+        self.entries.insert(number, loaded.clone());
+        self.order.push_back((number, weight));
+        self.weight += weight;
+    }
+}
+
 /// Decoded object streams in use, oldest first.
 #[derive(Default)]
 struct Containers {
@@ -159,7 +194,8 @@ pub(super) struct Plan<'c> {
     pub(super) unsigned: bool,
     pub(super) expected_pages: Option<usize>,
     containers: Containers,
-    work: u64,
+    parsed: ParsedCache,
+    pub(super) work: u64,
     work_limit: u64,
 }
 
@@ -358,6 +394,7 @@ impl<'c> Plan<'c> {
             signature_removal: SignatureRemoval::default(),
             expected_pages: None,
             containers: Containers::default(),
+            parsed: ParsedCache::default(),
             work: 0,
             work_limit: reader
                 .index
@@ -514,6 +551,17 @@ impl<'c> Plan<'c> {
         })
     }
 
+    /// A page's annotations, unless they're an array object already looked at for another page: a hostile file can give every page the same huge
+    /// one, and what's learnt from it the first time is all there is to learn.
+    pub(super) fn page_annotations(
+        &mut self, page: &Dictionary, seen: &mut HashSet<u32>,
+    ) -> RewriteResult<Vec<Object>> {
+        match page.get(b"Annots") {
+            Ok(Object::Reference((number, _))) if !seen.insert(*number) => Ok(Vec::new()),
+            other => self.deref_array(other.ok()),
+        }
+    }
+
     pub(super) fn deref_array(&mut self, value: Option<&Object>) -> RewriteResult<Vec<Object>> {
         let Some(value) = value else {
             return Ok(Vec::new());
@@ -525,6 +573,18 @@ impl<'c> Plan<'c> {
     }
 
     fn read_source(&mut self, number: u32) -> RewriteResult<Option<Loaded>> {
+        if let Some(loaded) = self.parsed.get(number) {
+            return Ok(Some(loaded));
+        }
+        let work_before = self.work;
+        let loaded = self.read_source_uncached(number)?;
+        if let Some(loaded) = &loaded {
+            self.parsed.insert(number, loaded, self.work - work_before);
+        }
+        Ok(loaded)
+    }
+
+    fn read_source_uncached(&mut self, number: u32) -> RewriteResult<Option<Loaded>> {
         match self.view.index.locations.get(&number).cloned() {
             Some(ObjectLocation64::Normal { generation, .. }) => self.read_normal((number, generation)),
             Some(ObjectLocation64::Compressed { container, index }) => {
@@ -737,8 +797,18 @@ impl<'c> Plan<'c> {
             })
         };
         let member = entry.members.member_slice(id, index).map_err(member_error)?;
-        self.work = self.work.saturating_add(member.len() as u64);
-        let object = crate::parser::direct_object(member).ok_or_else(|| {
+        // Charged for what the parse went through, which is where a hostile file's cost is: the same huge member reached a thousand
+        // times. The slice runs to the end of the stream, so its length would charge for every member after this one too.
+        let parsed = crate::parser::direct_object_with_consumed(member);
+        let consumed = parsed.as_ref().map_or(member.len(), |(consumed, _)| *consumed) as u64;
+        self.work = self.work.saturating_add(consumed);
+        if self.work > self.work_limit {
+            return Err(RewriteError::WorkLimitExceeded {
+                what: "bytes parsed and inflated",
+                limit: self.work_limit,
+            });
+        }
+        let object = parsed.map(|(_, object)| object).ok_or_else(|| {
             member_error(crate::Error::InvalidObjectStream(
                 "selected object stream member is truncated or invalid".to_string(),
             ))

@@ -326,6 +326,9 @@ pub struct RewriteSummary {
     pub objects_dropped: u64,
     /// Stream data copied without being decoded, in bytes.
     pub stream_bytes_copied: u64,
+    /// Bytes parsed and inflated to plan the file, which the rewrite's work allowance is counted in. Content decoded to search for names
+    /// counts separately, against its own.
+    pub bytes_examined: u64,
     /// What removing pages took out.
     pub removal: RemovalReport,
     /// Every signature the copy no longer has. Empty for a file with none. A signature here wasn't checked, and this

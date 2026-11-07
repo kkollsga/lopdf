@@ -32,10 +32,8 @@ const MAX_LISTED_HOLDERS: usize = if cfg!(test) { 64 } else { 100_000 };
 const MAX_LISTING_VISITS: usize = 1_000_000;
 /// Distinct names kept from decoded streams, so that each is decoded once. Past it a stream is decoded again when it comes up again.
 const MAX_REMEMBERED_NAMES: usize = 1_000_000;
-/// Searches one round makes: one stream under one chain of scopes.
+/// Searches one round makes: one stream, each time its context grows.
 const MAX_SEARCHES: usize = 1_000_000;
-/// Scopes one search looks through: its own and those above it. Past it the dictionaries in it stay whole.
-const MAX_CHAIN: usize = 64;
 /// Rounds of pruning and walking.
 const MAX_ROUNDS: usize = 4;
 /// Resource categories whose names content can use.
@@ -119,22 +117,30 @@ impl SharedResources {
     }
 }
 
-/// A chain of scopes: a stream's own holders first, then those of whatever uses it.
-type Chain = Rc<Vec<Holder>>;
-
-struct Search {
-    stream: u32,
-    chain: Chain,
-}
+/// Holders a stream's names are looked up in: its own and those of everything that uses it.
+type Context = BTreeSet<Holder>;
 
 /// One round's findings.
 #[derive(Default)]
 struct Round {
     used: HashMap<Holder, BTreeSet<Vec<u8>>>,
     whole: BTreeSet<Holder>,
-    searched: HashSet<(u32, Vec<Holder>)>,
-    pending: Vec<Search>,
+    /// Every stream found so far, with the union of every context it's used in. A stream is searched again only when that grows, so content
+    /// that reaches itself through a shared dictionary, or a form used from a thousand pages, costs a search for each holder it gains, not
+    /// for each path to it.
+    contexts: HashMap<u32, Context>,
+    pending: Vec<u32>,
+    queued: HashSet<u32>,
+    held: usize,
+    /// Each holder's names, looked up once a round.
+    names_of: HashMap<Holder, Option<Rc<Dictionary>>>,
+    /// Each annotation array, read once a round, with only its references kept.
+    annotations: HashMap<u32, Rc<Vec<Object>>>,
+    searches: usize,
 }
+
+/// Holders in all contexts together, past which the search gives up.
+const MAX_CONTEXT_ENTRIES: usize = 4_000_000;
 
 /// The state of the search across rounds.
 pub(super) struct Pruner {
@@ -411,7 +417,11 @@ impl Plan<'_> {
             queue.push((resources.clone(), owner.0));
         }
         if let Some(dict) = self.peek_dict(page.0)? {
-            for annotation in self.deref_array(dict.get(b"Annots").ok())? {
+            let annotations = match dict.get(b"Annots") {
+                Ok(Object::Reference((number, _))) if !shared.visited.insert(*number) => Vec::new(),
+                other => self.deref_array(other.ok())?,
+            };
+            for annotation in annotations {
                 if let Some(annotation) = self.deref_dict(Some(&annotation))?
                     && let Ok(appearance) = annotation.get(b"AP")
                 {
@@ -593,15 +603,14 @@ impl Plan<'_> {
             let Ok(resources) = dict.get(b"Resources") else {
                 continue;
             };
-            let chain = self.holders_of(&resources.clone(), owner)?;
-            if !chain.iter().any(|holder| pruner.listed.contains(holder)) {
+            let context: Context = self.holders_of(&resources.clone(), owner)?.into_iter().collect();
+            if !context.iter().any(|holder| pruner.listed.contains(holder)) {
                 continue;
             }
-            let chain = Rc::new(chain);
             let Some(page_dict) = self.peek_dict(page)? else {
                 continue;
             };
-            self.queue_page(&page_dict, &chain, &mut round)?;
+            self.queue_page(&page_dict, &context, &mut round)?;
         }
         // Whatever else reachable has resources of its own that include one.
         for number in std::mem::take(&mut pruner.found) {
@@ -612,20 +621,19 @@ impl Plan<'_> {
             let Ok(resources) = dict.get(b"Resources").cloned() else {
                 continue;
             };
-            let own = self.holders_of(&resources, number)?;
-            if !own.iter().any(|holder| pruner.listed.contains(holder)) {
+            let context: Context = self.holders_of(&resources, number)?.into_iter().collect();
+            if !context.iter().any(|holder| pruner.listed.contains(holder)) {
                 continue;
             }
-            let chain = Rc::new(own);
             match loaded {
-                Loaded::Stream(..) => round.pending.push(Search { stream: number, chain }),
-                Loaded::Plain(_) if dict.has_type(b"Page") => self.queue_page(&dict, &chain, &mut round)?,
+                Loaded::Stream(..) => self.queue(number, &context, &mut round),
+                Loaded::Plain(_) if dict.has_type(b"Page") => self.queue_page(&dict, &context, &mut round)?,
                 Loaded::Plain(_) if matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Type3") => {
-                    self.queue_glyphs(&dict, &chain, &mut round)?;
+                    self.queue_glyphs(&dict, &context, &mut round)?;
                 }
                 // Something with /Resources that isn't known to draw. No telling what it uses.
                 Loaded::Plain(_) => {
-                    for holder in chain.iter() {
+                    for holder in &context {
                         if pruner.listed.contains(holder) {
                             pruner.whole.insert(*holder);
                         }
@@ -647,7 +655,21 @@ impl Plan<'_> {
         Ok(wanted)
     }
 
-    fn queue_page(&mut self, page: &Dictionary, chain: &Chain, round: &mut Round) -> RewriteResult<()> {
+    /// Add holders to a stream's context, and queue it to be searched again if that grew it.
+    fn queue(&mut self, stream: u32, context: &Context, round: &mut Round) {
+        let known = round.contexts.entry(stream).or_default();
+        let before = known.len();
+        known.extend(context.iter().copied());
+        let grew = known.len() - before;
+        if grew > 0 {
+            round.held += grew;
+            if round.queued.insert(stream) {
+                round.pending.push(stream);
+            }
+        }
+    }
+
+    fn queue_page(&mut self, page: &Dictionary, context: &Context, round: &mut Round) -> RewriteResult<()> {
         let contents = match page.get(b"Contents") {
             Ok(Object::Reference((number, _))) => match self.peek(*number)? {
                 Some(Loaded::Plain(Object::Array(items))) => items,
@@ -658,59 +680,58 @@ impl Plan<'_> {
         };
         for item in contents {
             if let Object::Reference((stream, _)) = item {
-                round.pending.push(Search {
-                    stream,
-                    chain: Rc::clone(chain),
-                });
+                self.queue(stream, context, round);
             }
         }
         // An appearance falls back on the page's resources in PDFium.
-        for annotation in self.deref_array(page.get(b"Annots").ok())? {
-            if let Some(annotation) = self.deref_dict(Some(&annotation))?
+        let annotations = match page.get(b"Annots") {
+            Ok(Object::Reference((number, _))) => match round.annotations.get(number) {
+                Some(known) => Rc::clone(known),
+                None => {
+                    let list: Vec<Object> = self
+                        .deref_array(page.get(b"Annots").ok())?
+                        .into_iter()
+                        .filter(|item| matches!(item, Object::Reference(_) | Object::Dictionary(_)))
+                        .collect();
+                    let list = Rc::new(list);
+                    round.annotations.insert(*number, Rc::clone(&list));
+                    list
+                }
+            },
+            other => Rc::new(self.deref_array(other.ok())?),
+        };
+        for annotation in annotations.iter() {
+            if let Some(annotation) = self.deref_dict(Some(annotation))?
                 && let Ok(appearance) = annotation.get(b"AP")
             {
-                self.follow(&appearance.clone(), chain, round, 0)?;
+                self.follow(&appearance.clone(), context, round, 0)?;
             }
         }
         Ok(())
     }
 
-    fn queue_glyphs(&mut self, font: &Dictionary, chain: &Chain, round: &mut Round) -> RewriteResult<()> {
+    fn queue_glyphs(&mut self, font: &Dictionary, context: &Context, round: &mut Round) -> RewriteResult<()> {
         if let Some(procs) = self.deref_dict(font.get(b"CharProcs").ok())? {
             for (_, value) in procs.iter() {
                 if let Object::Reference((stream, _)) = value {
-                    round.pending.push(Search {
-                        stream: *stream,
-                        chain: Rc::clone(chain),
-                    });
+                    self.queue(*stream, context, round);
                 }
             }
         }
         Ok(())
     }
 
-    /// A chain for something with these resources of its own, used under `chain`: its own first, then everything above.
-    fn chain_below(
-        &mut self, resources: Option<&Object>, number: u32, chain: &Chain, round: &mut Round,
-    ) -> RewriteResult<Chain> {
-        let Some(resources) = resources else {
-            return Ok(Rc::clone(chain));
-        };
-        let mut own = self.holders_of(&resources.clone(), number)?;
-        for holder in chain.iter() {
-            if !own.contains(holder) {
-                own.push(*holder);
-            }
+    /// The context for something with these resources of its own, used in `context`: its own and everything above, as viewers fall back on.
+    fn context_below(&mut self, resources: Option<&Object>, number: u32, context: &Context) -> RewriteResult<Context> {
+        let mut below = context.clone();
+        if let Some(resources) = resources {
+            below.extend(self.holders_of(&resources.clone(), number)?);
         }
-        if own.len() > MAX_CHAIN {
-            round.whole.extend(own.iter().copied());
-            own.truncate(MAX_CHAIN);
-        }
-        Ok(Rc::new(own))
+        Ok(below)
     }
 
-    /// Something a used name led to: queue whatever content it has, under its own resources and then `chain`.
-    fn follow(&mut self, value: &Object, chain: &Chain, round: &mut Round, depth: usize) -> RewriteResult<()> {
+    /// Something a used name led to: queue whatever content it has, in its own resources and then `context`.
+    fn follow(&mut self, value: &Object, context: &Context, round: &mut Round, depth: usize) -> RewriteResult<()> {
         if depth > 8 {
             return Ok(());
         }
@@ -726,7 +747,7 @@ impl Plan<'_> {
             Object::Array(items) => {
                 // An ExtGState's /Font is [font size].
                 if let Some(first) = items.first() {
-                    self.follow(&first.clone(), chain, round, depth + 1)?;
+                    self.follow(&first.clone(), context, round, depth + 1)?;
                 }
                 return Ok(());
             }
@@ -741,28 +762,25 @@ impl Plan<'_> {
                 if (is_form || is_pattern || dict.has(b"BBox"))
                     && let Some(number) = number
                 {
-                    let inner = self.chain_below(dict.get(b"Resources").ok(), number, chain, round)?;
-                    round.pending.push(Search {
-                        stream: number,
-                        chain: inner,
-                    });
+                    let below = self.context_below(dict.get(b"Resources").ok(), number, context)?;
+                    self.queue(number, &below, round);
                 }
             }
             Loaded::Plain(Object::Dictionary(dict)) => {
                 if matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Type3") {
-                    let inner = self.chain_below(dict.get(b"Resources").ok(), owner, chain, round)?;
-                    self.queue_glyphs(&dict, &inner, round)?;
+                    let below = self.context_below(dict.get(b"Resources").ok(), owner, context)?;
+                    self.queue_glyphs(&dict, &below, round)?;
                     return Ok(());
                 }
                 for key in [&b"SMask"[..], b"G", b"Font"] {
                     if let Ok(inner) = dict.get(key) {
-                        self.follow(&inner.clone(), chain, round, depth + 1)?;
+                        self.follow(&inner.clone(), context, round, depth + 1)?;
                     }
                 }
                 if !dict.has(b"Type") && !dict.has(b"Subtype") {
                     // An appearance's states.
                     for inner in dict.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>() {
-                        self.follow(&inner, chain, round, depth + 1)?;
+                        self.follow(&inner, context, round, depth + 1)?;
                     }
                 }
             }
@@ -771,52 +789,63 @@ impl Plan<'_> {
         Ok(())
     }
 
-    /// Search everything queued, and whatever the names it finds lead to.
+    /// Search everything queued, and whatever the names it finds lead to, until no context grows.
     fn run_searches(&mut self, pruner: &mut Pruner, round: &mut Round) -> RewriteResult<()> {
-        while let Some(search) = round.pending.pop() {
+        while let Some(stream) = round.pending.pop() {
+            round.queued.remove(&stream);
             if pruner.gave_up {
                 return Ok(());
             }
-            if round.searched.len() >= MAX_SEARCHES {
+            round.searches += 1;
+            if round.searches >= MAX_SEARCHES || round.held >= MAX_CONTEXT_ENTRIES {
                 pruner.give_up();
                 return Ok(());
             }
-            if !round.searched.insert((search.stream, search.chain.as_ref().clone())) {
-                continue;
-            }
-            let Some(names) = self.stream_names(search.stream, pruner)? else {
-                round.whole.extend(search.chain.iter().copied());
+            let context = round.contexts.get(&stream).cloned().unwrap_or_default();
+            let Some(names) = self.stream_names(stream, pruner)? else {
+                round.whole.extend(context.iter().copied());
                 continue;
             };
             let mut followed = Vec::new();
-            for name in names.iter() {
-                for holder in search.chain.iter() {
-                    let current;
-                    let base = match pruner.bases.get(&holder.object()) {
-                        Some(base) => base.dictionary(),
-                        None => {
-                            current = self.peek(holder.object())?;
-                            current.as_ref().and_then(Loaded::dictionary)
-                        }
-                    };
-                    let Some(value) = base
-                        .and_then(|base| holder.names(base))
-                        .and_then(|names| names.get(name).ok())
-                    else {
-                        continue;
-                    };
-                    let value = value.clone();
+            for holder in &context {
+                let Some(dictionary) = self.holder_names(*holder, pruner, round)? else {
+                    continue;
+                };
+                for name in names.iter() {
+                    let Ok(value) = dictionary.get(name) else { continue };
                     if pruner.listed.contains(holder) {
                         round.used.entry(*holder).or_default().insert(name.clone());
                     }
-                    followed.push(value);
+                    followed.push(value.clone());
                 }
             }
             for value in followed {
-                self.follow(&value, &search.chain, round, 0)?;
+                self.follow(&value, &context, round, 0)?;
             }
         }
         Ok(())
+    }
+
+    /// A holder's dictionary of names, as it was before any pruning, looked up once a round.
+    fn holder_names(
+        &mut self, holder: Holder, pruner: &Pruner, round: &mut Round,
+    ) -> RewriteResult<Option<Rc<Dictionary>>> {
+        if let Some(known) = round.names_of.get(&holder) {
+            return Ok(known.clone());
+        }
+        let current;
+        let base = match pruner.bases.get(&holder.object()) {
+            Some(base) => base.dictionary(),
+            None => {
+                current = self.peek(holder.object())?;
+                current.as_ref().and_then(Loaded::dictionary)
+            }
+        };
+        let names = base
+            .and_then(|base| holder.names(base))
+            .map(|names| Rc::new(names.clone()));
+        round.names_of.insert(holder, names.clone());
+        Ok(names)
     }
 
     /// The names in a stream's decoded bytes, decoded at most once while there's room to remember them. `None` if it can't be decoded to its end.

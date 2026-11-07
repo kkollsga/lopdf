@@ -87,6 +87,7 @@ impl Plan<'_> {
         let mut kept_annotations = Bits::new(capacity);
         let mut held_up = Bits::new(capacity);
         let mut dead_links = Vec::new();
+        let mut seen_annotations = HashSet::new();
         for entry in &kept {
             let Some(page) = self.peek_dict(entry.id.0)? else {
                 continue;
@@ -98,7 +99,7 @@ impl Plan<'_> {
                 }
                 parent = self.peek_dict(number)?.and_then(|dict| reference(&dict, b"Parent"));
             }
-            for annotation in self.deref_array(page.get(b"Annots").ok())? {
+            for annotation in self.page_annotations(&page, &mut seen_annotations)? {
                 let Object::Reference((number, _)) = annotation else {
                     continue;
                 };
@@ -121,6 +122,7 @@ impl Plan<'_> {
         let mut parent_keys = HashSet::new();
         let mut shared = SharedResources::default();
         let removed: Vec<crate::ObjectId> = self.report.pages.clone();
+        let mut seen_annotations = HashSet::new();
         for id in &removed {
             let Some(page) = self.peek_dict(id.0)? else {
                 continue;
@@ -128,7 +130,7 @@ impl Plan<'_> {
             if let Ok(Object::Integer(key)) = page.get(b"StructParents") {
                 parent_keys.insert(*key);
             }
-            for annotation in self.deref_array(page.get(b"Annots").ok())? {
+            for annotation in self.page_annotations(&page, &mut seen_annotations)? {
                 let Object::Reference((number, _)) = annotation else {
                     continue;
                 };

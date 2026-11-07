@@ -466,6 +466,7 @@ pub(super) fn write_plan<W: AppendOutput>(
         object_streams: output.object_streams,
         objects_dropped: index_live.saturating_sub(kept_from_source),
         stream_bytes_copied: output.stream_bytes,
+        bytes_examined: plan.work,
         removal: std::mem::take(&mut plan.report),
         removed_signatures: std::mem::take(&mut plan.signatures),
         signature_removal: std::mem::take(&mut plan.signature_removal),

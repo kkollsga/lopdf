@@ -62,6 +62,7 @@ fn describe(summary: &RewriteSummary) -> serde_json::Value {
         "object_streams": summary.object_streams,
         "objects_dropped": summary.objects_dropped,
         "stream_bytes_copied": summary.stream_bytes_copied,
+        "bytes_examined": summary.bytes_examined,
         "removed_signatures": summary.removed_signatures.len(),
         "removal": {
             "pages": summary.removal.pages.len(),
