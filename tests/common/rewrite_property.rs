@@ -46,9 +46,10 @@ pub fn check_rewrite_on_any_bytes(data: &[u8]) -> bool {
             changes.remove_page(pages / 2);
             if let Ok(written) = changes.write_unverified_to(policy, &mut output) {
                 let source: std::sync::Arc<dyn lopdf::RandomAccessSource> = std::sync::Arc::new(BytesSource::from(output));
-                let (_, after) = written.verify(&reader, source).expect("a finished removal fails its own check");
+                let (summary, after) = written.verify(&reader, source).expect("a finished removal fails its own check");
                 assert!(!after.index_stats().unwrap().recovered(), "a finished removal needs a rescan");
-                if let Ok(now) = after.page_count() {
+                assert_eq!(summary.removal.pages.len(), 1, "removing one page removed {:?}", summary.removal.pages);
+                if let (Ok(now), 0) = (after.page_count(), summary.objects_found_near_their_offset) {
                     assert!(now < pages, "removing a page left {now} of {pages}");
                 }
             }
