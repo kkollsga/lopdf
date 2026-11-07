@@ -1,24 +1,43 @@
 //! Shared `/Resources`: taking out what only a removed page used.
 //!
-//! A kept page and a removed page can share one resource dictionary, by inheriting it or by reference, and some
-//! producers put every image in the file in one. Everything in it stays reachable from the kept page, drawn or not, so
-//! reachability alone would keep the removed page's images.
+//! A kept page and a removed page can share a resource dictionary, by inheriting it, by reference, or through a form or font they both use, and some
+//! producers put every image in the file in one. Everything in it stays reachable from the kept page, drawn or not, so reachability alone would keep
+//! the removed page's images.
 //!
-//! So every name the kept content could use is found by searching its decoded bytes, and the other entries go. The search takes
-//! every `/Name` in the bytes, wherever it is, with no attempt to tell a string or an inline image from an operator. That can
-//! only find too many, which keeps too much, and never too few, which would break a kept page. Anything that can't be decoded
-//! gives up on that dictionary, and it's reported. Forms, patterns, Type 3 fonts and soft masks with no `/Resources` of their
-//! own are searched under the dictionary of whatever uses them, as viewers fall back to it.
+//! So first everything the removed pages could have drawn from is listed, structurally and without decoding anything: every resource dictionary
+//! their pages, their annotations' appearances and whatever those name can reach. Those are the dictionaries that may need pruning. Then everything
+//! kept that could draw from one of them is searched: each kept page whose own or inherited resources include one, with its annotations'
+//! appearances, and anything the walk reaches that has its own `/Resources` including one. A search follows every name it finds, in every category,
+//! shared or not, into forms, patterns, Type 3 glyphs, soft masks and appearance states. What it follows is searched under its own resources *and*
+//! everything above it, since viewers fall back to the page's, PDFium a category at a time and others a name at a time, and the union covers both.
+//! The entries of a listed dictionary that no search found go. A listed dictionary that something reachable holds and nothing kept draws from keeps
+//! only what viewers look up by themselves.
+//!
+//! The search takes every `/Name` in the decoded bytes, wherever it is, with no attempt to tell a string or an inline image from an operator. That
+//! can only find too many, which keeps too much, and never too few, which would break a kept page. Anything that can't be decoded to its end, a
+//! `/DR` (fields use those by a name in a string), `/Resources` inside something direct, or anything else with `/Resources` that isn't known to
+//! draw leaves the dictionaries it touches whole, and they're reported. Pruning makes less reachable, which can only make less kept content need
+//! searching, so it's repeated until it settles, and stopping early is safe: each round keeps at least what the next one needs.
 
 use std::collections::BTreeSet;
 
 use super::*;
 
-/// The most content one rewrite decodes to search for names, at the least. Past it what's shared stays whole.
-const SCAN_ALLOWANCE: u64 = 4 * 1_024 * 1_024 * 1_024;
-const SCAN_PER_FILE_BYTE: u64 = 32;
-/// Holders of shared names one rewrite keeps track of. Past it the rest stay whole.
-const MAX_SHARED_HOLDERS: usize = 4_096;
+/// The most content one rewrite decodes to search for names, at the least. Past it the search stops and every listed dictionary stays whole.
+const SCAN_ALLOWANCE: u64 = 1_024 * 1_024 * 1_024;
+const SCAN_PER_FILE_BYTE: u64 = 8;
+/// Dictionaries one rewrite lists. Past it the rest aren't listed, and the report says how many weren't.
+const MAX_LISTED_HOLDERS: usize = if cfg!(test) { 64 } else { 100_000 };
+/// Objects looked at while listing.
+const MAX_LISTING_VISITS: usize = 1_000_000;
+/// Distinct names kept from decoded streams, so that each is decoded once. Past it a stream is decoded again when it comes up again.
+const MAX_REMEMBERED_NAMES: usize = 1_000_000;
+/// Searches one round makes: one stream under one chain of scopes.
+const MAX_SEARCHES: usize = 1_000_000;
+/// Scopes one search looks through: its own and those above it. Past it the dictionaries in it stay whole.
+const MAX_CHAIN: usize = 64;
+/// Rounds of pruning and walking.
+const MAX_ROUNDS: usize = 4;
 /// Resource categories whose names content can use.
 const CATEGORIES: [&[u8]; 7] = [
     b"XObject",
@@ -39,7 +58,7 @@ pub(super) enum Holder {
     Category(u32),
     /// `/Category << ... >>` directly in this object, which is a resource dictionary.
     InResources(u32, usize),
-    /// `/Resources << /Category << ... >> >>` directly in this object, a page or a `/Pages` node.
+    /// `/Resources << /Category << ... >> >>` directly in this object, such as a page, a `/Pages` node or a form.
     InOwner(u32, usize),
 }
 
@@ -79,10 +98,13 @@ impl Holder {
     }
 }
 
-/// What removed pages used, gathered before anything is known about who else uses it.
+/// What removed pages could draw from, listed before anything is known about who else uses it.
 #[derive(Default)]
 pub(super) struct SharedResources {
     holders: BTreeSet<Holder>,
+    /// Dictionaries past the limit, which weren't listed.
+    unlisted: u64,
+    visited: HashSet<u32>,
     /// Each kept page, and the object its resources came from.
     kept_pages: Vec<(u32, Option<u32>)>,
 }
@@ -93,44 +115,57 @@ impl SharedResources {
             .iter()
             .map(|entry| (entry.id.0, entry.inherited.resources.map(|owner| owner.0)))
             .collect();
+        self.visited = HashSet::new();
     }
 }
 
-struct HolderState {
-    /// As it was, from which what's kept is worked out again each time.
-    used: HashSet<Vec<u8>>,
-    /// Something kept uses it, and that was searched.
-    has_user: bool,
-    /// Something kept uses it, and that couldn't be searched.
-    whole: bool,
-}
+/// A chain of scopes: a stream's own holders first, then those of whatever uses it.
+type Chain = Rc<Vec<Holder>>;
 
-/// One content stream to search, and the holders whose names it can use.
 struct Search {
     stream: u32,
-    scope: Rc<Vec<Holder>>,
+    chain: Chain,
 }
 
-/// The state of the search.
-pub(super) struct Pruner {
-    holders: BTreeMap<Holder, HolderState>,
-    /// The objects holding holders, as they were before any pruning.
-    bases: BTreeMap<u32, Loaded>,
+/// One round's findings.
+#[derive(Default)]
+struct Round {
+    used: HashMap<Holder, BTreeSet<Vec<u8>>>,
+    whole: BTreeSet<Holder>,
     searched: HashSet<(u32, Vec<Holder>)>,
     pending: Vec<Search>,
-    /// Objects the walk reached that have `/Resources`, to look at next.
+}
+
+/// The state of the search across rounds.
+pub(super) struct Pruner {
+    /// What removed pages could draw from.
+    listed: BTreeSet<Holder>,
+    unlisted: u64,
+    kept_pages: Vec<(u32, Option<u32>)>,
+    /// The objects holding listed holders, as they were before any pruning.
+    bases: BTreeMap<u32, Loaded>,
+    /// Names in each stream decoded so far, or `None` for one that can't be decoded.
+    names: HashMap<u32, Option<Rc<[Vec<u8>]>>>,
+    remembered_names: usize,
+    /// Reachable objects with `/Resources`, and `/DR` and nested `/Resources`, that the last walk found.
     found: BTreeSet<u32>,
-    /// `/DR` anywhere, or `/Resources` inside something that isn't an object of its own, with the object it's in. None of that says what it uses,
-    /// so what it holds has to stay.
     opaque: Vec<(u32, Object)>,
+    /// What's pruned now: each pruned holder, with the names it keeps.
+    applied: BTreeMap<Holder, BTreeSet<Vec<u8>>>,
+    /// Holders that stay whole, whatever later rounds find.
+    whole: BTreeSet<Holder>,
     decoded: u64,
     decoded_limit: u64,
+    gave_up: bool,
+    /// One buffer for reading and one for inflating, reused, so that large streams don't leave large freed blocks behind.
+    raw: Vec<u8>,
+    inflated: Vec<u8>,
 }
 
 impl Pruner {
-    /// A dictionary the walk reached. If it has `/Resources` in a shared holder, it uses them, which is looked at after the walk.
+    /// A dictionary the walk reached. If it has `/Resources`, it may use a listed holder, which is looked at after the walk.
     pub(super) fn note_reached(&mut self, number: u32, dict: &Dictionary) {
-        if self.holders.is_empty() {
+        if self.listed.is_empty() {
             return;
         }
         if dict.has(b"Resources") && !dict.has_type(b"Pages") {
@@ -164,10 +199,8 @@ impl Pruner {
         }
     }
 
-    pub(super) fn give_up(&mut self) {
-        for holder in self.holders.values_mut() {
-            holder.whole = true;
-        }
+    fn give_up(&mut self) {
+        self.gave_up = true;
     }
 }
 
@@ -231,10 +264,11 @@ pub(super) fn every_name(bytes: &[u8], mut found: impl FnMut(&[u8])) {
 }
 
 /// A stream's decoded bytes, all of them or none. The general decoder gives what it can of a damaged stream, which is right for showing
-/// it and wrong here: names past the damage wouldn't be seen, a viewer might get further, and a page would lose what it uses.
-fn decode_all_or_nothing(dict: Dictionary, content: Vec<u8>, limit: usize) -> Option<Vec<u8>> {
+/// it and wrong here: names past the damage wouldn't be seen, a viewer might get further, and a page would lose what it uses. Nothing past
+/// `limit` is ever produced.
+fn decode_all_or_nothing(dict: &Dictionary, content: &[u8], limit: usize, inflated: &mut Vec<u8>) -> Option<Vec<u8>> {
     if !dict.has(b"Filter") {
-        return Some(content);
+        return (content.len() <= limit).then(|| content.to_vec());
     }
     let flate = |name: &[u8]| name == b"FlateDecode" || name == b"Fl";
     let filters: Vec<Vec<u8>> = Stream::new(dict.clone(), Vec::new())
@@ -247,10 +281,12 @@ fn decode_all_or_nothing(dict: Dictionary, content: Vec<u8>, limit: usize) -> Op
         // Predictors aren't something content streams use. Whatever this is, it isn't looked into.
         return None;
     }
-    let mut bytes = content;
+    let mut bytes: Option<Vec<u8>> = None;
     for filter in &filters {
-        bytes = if flate(filter) {
-            inflate_whole(&bytes, limit)?
+        let input = bytes.as_deref().unwrap_or(content);
+        let output = if flate(filter) {
+            inflate_whole_into(input, limit, inflated)?;
+            inflated.clone()
         } else {
             let mut stage = Dictionary::new();
             stage.set("Filter", Object::Name(filter.clone()));
@@ -259,30 +295,48 @@ fn decode_all_or_nothing(dict: Dictionary, content: Vec<u8>, limit: usize) -> Op
             {
                 stage.set("DecodeParms", parameters.clone());
             }
-            Stream::new(stage, bytes).decompressed_content_with_limit(limit).ok()?
+            Stream::new(stage, input.to_vec())
+                .decompressed_content_with_limit(limit)
+                .ok()?
         };
+        bytes = Some(output);
     }
-    Some(bytes)
+    bytes
 }
 
 /// Inflate to the end of the deflate stream, or not at all: truncated data doesn't count.
+#[cfg(test)]
 pub(super) fn inflate_whole(input: &[u8], limit: usize) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    inflate_whole_into(input, limit, &mut output)?;
+    Some(output)
+}
+
+/// Inflate into a buffer of the caller's, cleared first, to the end of the deflate stream or not at all. It never grows past `limit`.
+fn inflate_whole_into(input: &[u8], limit: usize, output: &mut Vec<u8>) -> Option<()> {
     let mut decoder = flate2::Decompress::new(true);
-    let mut output = Vec::with_capacity(input.len().saturating_mul(3).clamp(4_096, limit.max(4_096)));
+    output.clear();
+    output.reserve(
+        input
+            .len()
+            .saturating_mul(3)
+            .clamp(4_096, limit.max(4_096))
+            .min(limit.max(1)),
+    );
     loop {
         if output.len() == output.capacity() {
             if output.len() >= limit {
                 return None;
             }
-            output.reserve_exact(output.len().min(limit - output.len()).max(4_096));
+            output.reserve_exact(output.len().max(4_096).min(limit - output.len()));
         }
         let (read_before, written_before) = (decoder.total_in(), decoder.total_out());
         let consumed = usize::try_from(read_before).ok()?;
         match decoder
-            .decompress_vec(&input[consumed..], &mut output, flate2::FlushDecompress::None)
+            .decompress_vec(&input[consumed..], output, flate2::FlushDecompress::None)
             .ok()?
         {
-            flate2::Status::StreamEnd => return Some(output),
+            flate2::Status::StreamEnd => return Some(()),
             flate2::Status::Ok | flate2::Status::BufError => {
                 let stuck = decoder.total_in() == read_before && decoder.total_out() == written_before;
                 if stuck && output.len() < output.capacity() {
@@ -294,10 +348,14 @@ pub(super) fn inflate_whole(input: &[u8], limit: usize) -> Option<Vec<u8>> {
 }
 
 impl Plan<'_> {
-    /// The holders a resource dictionary has, as held by `owner` if it's direct there.
+    /// The holders a resource dictionary has, as held by `owner` if it's direct there. A reference, or a category, is followed through
+    /// references to references to the object that holds it.
     fn holders_of(&mut self, resources: &Object, owner: u32) -> RewriteResult<Vec<Holder>> {
         let (dict, in_resources) = match resources {
-            Object::Reference((number, _)) => (self.peek_dict(*number)?, Some(*number)),
+            Object::Reference(_) => match self.final_object(resources)? {
+                Some((number, Object::Dictionary(dict))) => (Some(dict), Some(number)),
+                _ => (None, None),
+            },
             Object::Dictionary(dict) => (Some(dict.clone()), None),
             _ => (None, None),
         };
@@ -307,7 +365,11 @@ impl Plan<'_> {
         let mut holders = Vec::new();
         for (category, key) in CATEGORIES.iter().enumerate() {
             match dict.get(key) {
-                Ok(Object::Reference((number, _))) => holders.push(Holder::Category(*number)),
+                Ok(value @ Object::Reference(_)) => {
+                    if let Some((number, Object::Dictionary(_))) = self.final_object(&value.clone())? {
+                        holders.push(Holder::Category(number));
+                    }
+                }
                 Ok(Object::Dictionary(_)) => holders.push(match in_resources {
                     Some(number) => Holder::InResources(number, category),
                     None => Holder::InOwner(owner, category),
@@ -318,51 +380,136 @@ impl Plan<'_> {
         Ok(holders)
     }
 
-    /// Note what a removed page's resources are. `owner` is the page, or the node it inherits them from.
-    pub(super) fn note_removed_resources(
-        &mut self, owner: crate::ObjectId, shared: &mut SharedResources,
-    ) -> RewriteResult<()> {
-        let Some(dict) = self.peek_dict(owner.0)? else {
-            return Ok(());
+    /// Follow references to the object at the end, and give its number and value, a stream as its dictionary.
+    fn final_object(&mut self, value: &Object) -> RewriteResult<Option<(u32, Object)>> {
+        let Object::Reference((first, _)) = value else {
+            return Ok(None);
         };
-        let Ok(resources) = dict.get(b"Resources") else {
-            return Ok(());
-        };
-        for holder in self.holders_of(&resources.clone(), owner.0)? {
-            if shared.holders.len() >= MAX_SHARED_HOLDERS {
-                break;
+        let mut number = *first;
+        for _ in 0..32 {
+            match self.peek(number)? {
+                Some(Loaded::Plain(Object::Reference((next, _)))) => number = next,
+                Some(Loaded::Plain(object)) => return Ok(Some((number, object))),
+                Some(Loaded::Stream(dict, _)) => return Ok(Some((number, Object::Dictionary(dict)))),
+                None => return Ok(None),
             }
-            // What's directly in a removed page dies with it.
-            if !self.dead.get(holder.object()) {
-                shared.holders.insert(holder);
+        }
+        Ok(None)
+    }
+
+    /// List what a removed page could draw from: the dictionaries of its resources, its annotations' appearances, and whatever those can reach,
+    /// whether a removed page draws it or not. Nothing is decoded: listing too much costs a search, and listing too little leaves a removed
+    /// page's content behind.
+    pub(super) fn note_removed_resources(
+        &mut self, page: crate::ObjectId, owner: Option<crate::ObjectId>, shared: &mut SharedResources,
+    ) -> RewriteResult<()> {
+        let mut queue: Vec<(Object, u32)> = Vec::new();
+        if let Some(owner) = owner
+            && let Some(dict) = self.peek_dict(owner.0)?
+            && let Ok(resources) = dict.get(b"Resources")
+        {
+            queue.push((resources.clone(), owner.0));
+        }
+        if let Some(dict) = self.peek_dict(page.0)? {
+            for annotation in self.deref_array(dict.get(b"Annots").ok())? {
+                if let Some(annotation) = self.deref_dict(Some(&annotation))?
+                    && let Ok(appearance) = annotation.get(b"AP")
+                {
+                    self.list_value(appearance.clone(), page.0, shared, &mut queue)?;
+                }
+            }
+        }
+        while let Some((resources, owner)) = queue.pop() {
+            for holder in self.holders_of(&resources, owner)? {
+                // What's directly in a removed page dies with it, though what it names may not.
+                let dies = self.dead.get(holder.object()) && matches!(holder, Holder::InOwner(..));
+                if !dies && !shared.holders.contains(&holder) {
+                    if shared.holders.len() >= MAX_LISTED_HOLDERS {
+                        shared.unlisted += 1;
+                        continue;
+                    }
+                    shared.holders.insert(holder);
+                }
+                let Some(base) = self.peek_dict(holder.object())? else {
+                    continue;
+                };
+                let Some(names) = holder.names(&base) else { continue };
+                for (_, value) in names.iter() {
+                    self.list_value(value.clone(), owner, shared, &mut queue)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Set up the search from a removal: the kept pages that share a holder with a removed page are searched first.
-    pub(super) fn start_pruner(&mut self, removal: &super::removal::PageRemoval) -> RewriteResult<Pruner> {
+    /// Queue whatever resources something a removed page names has of its own, and what's under it.
+    fn list_value(
+        &mut self, value: Object, owner: u32, shared: &mut SharedResources, queue: &mut Vec<(Object, u32)>,
+    ) -> RewriteResult<()> {
+        let mut stack = vec![(value, 0_usize)];
+        while let Some((value, depth)) = stack.pop() {
+            if depth > 16 {
+                continue;
+            }
+            if shared.visited.len() >= MAX_LISTING_VISITS {
+                shared.unlisted += 1;
+                return Ok(());
+            }
+            let (number, object) = match &value {
+                Object::Reference((number, _)) => {
+                    if !shared.visited.insert(*number) {
+                        continue;
+                    }
+                    match self.final_object(&value)? {
+                        Some(found) => found,
+                        None => continue,
+                    }
+                }
+                Object::Dictionary(_) | Object::Array(_) => (owner, value.clone()),
+                _ => continue,
+            };
+            match object {
+                Object::Dictionary(dict) => {
+                    if let Ok(resources) = dict.get(b"Resources") {
+                        queue.push((resources.clone(), number));
+                    }
+                    for key in [&b"CharProcs"[..], b"SMask", b"G", b"N", b"D", b"R", b"Font", b"Pattern"] {
+                        if let Ok(inner) = dict.get(key) {
+                            stack.push((inner.clone(), depth + 1));
+                        }
+                    }
+                    // An appearance's states, a glyph table.
+                    if !dict.has(b"Type") && !dict.has(b"Subtype") {
+                        for (_, inner) in dict.iter() {
+                            stack.push((inner.clone(), depth + 1));
+                        }
+                    }
+                }
+                Object::Array(items) => {
+                    for item in items {
+                        stack.push((item, depth + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Set up the search from what a removal listed.
+    pub(super) fn start_pruner(&mut self, removal: &super::removal::PageRemoval) -> Pruner {
         let shared = &removal.shared;
         let mut pruner = Pruner {
-            holders: shared
-                .holders
-                .iter()
-                .map(|holder| {
-                    (
-                        *holder,
-                        HolderState {
-                            used: HashSet::new(),
-                            has_user: false,
-                            whole: false,
-                        },
-                    )
-                })
-                .collect(),
+            listed: shared.holders.clone(),
+            unlisted: shared.unlisted,
+            kept_pages: shared.kept_pages.clone(),
             bases: BTreeMap::new(),
-            searched: HashSet::new(),
-            pending: Vec::new(),
+            names: HashMap::new(),
+            remembered_names: 0,
             found: BTreeSet::new(),
             opaque: Vec::new(),
+            applied: BTreeMap::new(),
+            whole: BTreeSet::new(),
             decoded: 0,
             decoded_limit: self
                 .view
@@ -370,10 +517,10 @@ impl Plan<'_> {
                 .source_len
                 .saturating_mul(SCAN_PER_FILE_BYTE)
                 .max(SCAN_ALLOWANCE),
+            gave_up: false,
+            raw: Vec::new(),
+            inflated: Vec::new(),
         };
-        if pruner.holders.is_empty() {
-            return Ok(pruner);
-        }
         // A page the caller added takes its resources from wherever it was put, which isn't known here.
         let new_inheriting_page = self.objects.values().any(|change| {
             matches!(change, Change::Object { object: Object::Dictionary(dict), .. }
@@ -382,272 +529,82 @@ impl Plan<'_> {
         if new_inheriting_page {
             pruner.give_up();
         }
-        for holder in shared.holders.iter().copied() {
-            let number = holder.object();
-            if let std::collections::btree_map::Entry::Vacant(slot) = pruner.bases.entry(number)
+        pruner
+    }
+
+    /// The walk, with pruning settled around it: walk, see what kept content uses, prune, and walk again until nothing changes. The last walk
+    /// is always under the pruning that's in place.
+    pub(super) fn settle_pruning(&mut self, pruner: &mut Pruner, layers: &[u8]) -> RewriteResult<()> {
+        for round in 0..=MAX_ROUNDS {
+            let roots = self.roots()?;
+            self.reach(roots, Some(pruner), Some(layers))?;
+            if pruner.listed.is_empty() || round == MAX_ROUNDS {
+                return Ok(());
+            }
+            if round == 0 {
+                self.capture_bases(pruner)?;
+            }
+            let wanted = if pruner.gave_up {
+                BTreeMap::new()
+            } else {
+                self.search_round(pruner)?
+            };
+            // Out of allowance in the middle of a round: nothing it found can be trusted to be all there is.
+            let wanted = if pruner.gave_up { BTreeMap::new() } else { wanted };
+            if wanted == pruner.applied {
+                return Ok(());
+            }
+            pruner.applied = wanted;
+            self.apply_pruning(pruner);
+        }
+        Ok(())
+    }
+
+    /// Keep each listed holder's object as it is before anything is pruned, if it's reachable at all. One that isn't is gone anyway.
+    fn capture_bases(&mut self, pruner: &mut Pruner) -> RewriteResult<()> {
+        let objects: BTreeSet<u32> = pruner.listed.iter().map(|holder| holder.object()).collect();
+        for number in objects {
+            if self.live.get(number)
                 && let Some(base) = self.load(number)?
             {
-                slot.insert(base);
+                pruner.bases.insert(number, base);
             }
         }
-        for (page, owner) in &shared.kept_pages {
+        let bases = &pruner.bases;
+        pruner.listed.retain(|holder| bases.contains_key(&holder.object()));
+        Ok(())
+    }
+
+    /// One round: search everything kept that can draw from a listed holder, and say what each listed holder has to keep.
+    fn search_round(&mut self, pruner: &mut Pruner) -> RewriteResult<BTreeMap<Holder, BTreeSet<Vec<u8>>>> {
+        let mut round = Round::default();
+        // What can't be searched keeps what it touches.
+        for (number, resources) in std::mem::take(&mut pruner.opaque) {
+            for holder in self.holders_of(&resources, number)? {
+                if pruner.listed.contains(&holder) {
+                    pruner.whole.insert(holder);
+                }
+            }
+        }
+        // Kept pages, under their own or inherited resources.
+        for (page, owner) in pruner.kept_pages.clone() {
             let Some(owner) = owner else { continue };
-            let Some(dict) = self.peek_dict(*owner)? else { continue };
+            let Some(dict) = self.peek_dict(owner)? else { continue };
             let Ok(resources) = dict.get(b"Resources") else {
                 continue;
             };
-            let scope = self.scope_within(&resources.clone(), *owner, &pruner)?;
-            if scope.is_empty() {
+            let chain = self.holders_of(&resources.clone(), owner)?;
+            if !chain.iter().any(|holder| pruner.listed.contains(holder)) {
                 continue;
             }
-            let scope = Rc::new(scope);
-            for holder in scope.iter() {
-                if let Some(state) = pruner.holders.get_mut(holder) {
-                    state.has_user = true;
-                }
-            }
-            let Some(page_dict) = self.peek_dict(*page)? else {
+            let chain = Rc::new(chain);
+            let Some(page_dict) = self.peek_dict(page)? else {
                 continue;
             };
-            self.queue_page_content(&page_dict, &scope, &mut pruner)?;
+            self.queue_page(&page_dict, &chain, &mut round)?;
         }
-        self.run_searches(&mut pruner)?;
-        Ok(pruner)
-    }
-
-    /// Holders of this dictionary that matter.
-    fn scope_within(&mut self, resources: &Object, owner: u32, pruner: &Pruner) -> RewriteResult<Vec<Holder>> {
-        let mut holders = self.holders_of(resources, owner)?;
-        holders.retain(|holder| pruner.holders.contains_key(holder));
-        Ok(holders)
-    }
-
-    fn queue_page_content(
-        &mut self, page: &Dictionary, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner,
-    ) -> RewriteResult<()> {
-        match page.get(b"Contents") {
-            Ok(Object::Reference((number, _))) => {
-                let number = *number;
-                match self.peek(number)? {
-                    Some(Loaded::Plain(Object::Array(items))) => {
-                        for item in items {
-                            if let Object::Reference((stream, _)) = item {
-                                pruner.pending.push(Search {
-                                    stream,
-                                    scope: Rc::clone(scope),
-                                });
-                            }
-                        }
-                    }
-                    _ => pruner.pending.push(Search {
-                        stream: number,
-                        scope: Rc::clone(scope),
-                    }),
-                }
-            }
-            Ok(Object::Array(items)) => {
-                for item in items {
-                    if let Object::Reference((stream, _)) = item {
-                        pruner.pending.push(Search {
-                            stream: *stream,
-                            scope: Rc::clone(scope),
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-        // An appearance with no /Resources of its own: PDFium falls back to the page's.
-        for annotation in self.deref_array(page.get(b"Annots").ok())? {
-            let Some(annotation) = self.deref_dict(Some(&annotation))? else {
-                continue;
-            };
-            let Some(appearance) = self.deref_dict(annotation.get(b"AP").ok())? else {
-                continue;
-            };
-            for value in appearance.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>() {
-                self.follow(&value, scope, pruner, 0)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Something a used name led to. If it has content that falls back on this scope, or has its own in a holder that matters, queue it.
-    /// A soft mask's group, a Type 3 font's glyphs and an appearance's states can all be direct.
-    fn follow(
-        &mut self, value: &Object, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner, depth: usize,
-    ) -> RewriteResult<()> {
-        if depth > 8 {
-            return Ok(());
-        }
-        let (number, loaded) = match value {
-            Object::Reference((number, _)) => match self.peek(*number)? {
-                Some(loaded) => (Some(*number), loaded),
-                None => return Ok(()),
-            },
-            Object::Dictionary(dict) => (None, Loaded::Plain(Object::Dictionary(dict.clone()))),
-            _ => return Ok(()),
-        };
-        // What's direct can't be a holder's owner in the sense that matters: it isn't shared.
-        let owner = number.unwrap_or(u32::MAX);
-        match loaded {
-            Loaded::Stream(dict, _) => {
-                let is_form = matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Form");
-                let is_pattern = matches!(dict.get(b"PatternType"), Ok(Object::Integer(1)));
-                let inner_scope = self.content_scope(&dict, owner, scope, pruner)?;
-                if (is_form || is_pattern || dict.has(b"BBox")) && !inner_scope.is_empty() {
-                    pruner.pending.push(Search {
-                        stream: owner,
-                        scope: inner_scope,
-                    });
-                }
-            }
-            Loaded::Plain(Object::Dictionary(dict)) => {
-                if matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Type3") {
-                    let inner_scope = self.content_scope(&dict, owner, scope, pruner)?;
-                    if !inner_scope.is_empty()
-                        && let Some(procs) = self.deref_dict(dict.get(b"CharProcs").ok())?
-                    {
-                        for (_, proc_value) in procs.iter() {
-                            if let Object::Reference((stream, _)) = proc_value {
-                                pruner.pending.push(Search {
-                                    stream: *stream,
-                                    scope: Rc::clone(&inner_scope),
-                                });
-                            }
-                        }
-                    }
-                } else if let Some(mask) = self.deref_dict(dict.get(b"SMask").ok())? {
-                    if let Ok(group) = mask.get(b"G") {
-                        self.follow(&group.clone(), scope, pruner, depth + 1)?;
-                    }
-                } else if !dict.has(b"Type") && !dict.has(b"Subtype") {
-                    // An appearance's states, or a graphics state with nothing to follow.
-                    for inner in dict.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>() {
-                        self.follow(&inner, scope, pruner, depth + 1)?;
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// The scope content in this object is searched under: its own `/Resources`, or whatever is using it.
-    fn content_scope(
-        &mut self, dict: &Dictionary, number: u32, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner,
-    ) -> RewriteResult<Rc<Vec<Holder>>> {
-        let Ok(resources) = dict.get(b"Resources") else {
-            return Ok(Rc::clone(scope));
-        };
-        let holders = self.scope_within(&resources.clone(), number, pruner)?;
-        for holder in &holders {
-            if let Some(state) = pruner.holders.get_mut(holder) {
-                state.has_user = true;
-            }
-        }
-        Ok(Rc::new(holders))
-    }
-
-    /// Search everything queued, and whatever the names it finds lead to.
-    fn run_searches(&mut self, pruner: &mut Pruner) -> RewriteResult<()> {
-        while let Some(search) = pruner.pending.pop() {
-            if !pruner.searched.insert((search.stream, search.scope.as_ref().clone())) {
-                continue;
-            }
-            let Some(bytes) = self.decoded_content(search.stream, pruner)? else {
-                for holder in search.scope.iter() {
-                    if let Some(state) = pruner.holders.get_mut(holder) {
-                        state.whole = true;
-                    }
-                }
-                continue;
-            };
-            let mut newly_used = Vec::new();
-            every_name(&bytes, |name| {
-                for holder in search.scope.iter() {
-                    let Some(base) = pruner.bases.get(&holder.object()).and_then(Loaded::dictionary) else {
-                        continue;
-                    };
-                    let Some(names) = holder.names(base) else { continue };
-                    if names.has(name)
-                        && let Some(state) = pruner.holders.get_mut(holder)
-                        && state.used.insert(name.to_vec())
-                        && let Ok(value) = names.get(name)
-                    {
-                        newly_used.push(value.clone());
-                    }
-                }
-            });
-            drop(bytes);
-            for value in newly_used {
-                self.follow(&value, &search.scope, pruner, 0)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// A stream's decoded bytes, or `None` if they can't be had.
-    fn decoded_content(&mut self, number: u32, pruner: &mut Pruner) -> RewriteResult<Option<Vec<u8>>> {
-        let limit = usize::try_from(self.view.limits.max_stream_bytes).unwrap_or(usize::MAX);
-        let (mut dict, content) = match self.peek(number)? {
-            Some(Loaded::Stream(dict, StreamBody::Source { start, length })) => {
-                if length > self.view.limits.max_stream_bytes {
-                    return Ok(None);
-                }
-                let content = self
-                    .view
-                    .source
-                    .read_range(start, length, self.view.limits.max_stream_bytes)?;
-                (dict, content)
-            }
-            Some(Loaded::Stream(dict, StreamBody::Given)) => match self.objects.get(&number) {
-                Some(Change::Object {
-                    object: Object::Stream(stream),
-                    ..
-                }) => (dict, stream.content.clone()),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-        pruner.decoded = pruner.decoded.saturating_add(content.len() as u64);
-        for key in [&b"Filter"[..], b"DecodeParms"] {
-            if let Ok(Object::Reference(_)) = dict.get(key)
-                && let Some(value) = self.deref(&dict.get(key).cloned().unwrap_or(Object::Null))?
-            {
-                dict.set(key.to_vec(), value);
-            }
-        }
-        let Some(bytes) = decode_all_or_nothing(dict, content, limit) else {
-            return Ok(None);
-        };
-        pruner.decoded = pruner.decoded.saturating_add(bytes.len() as u64);
-        if pruner.decoded > pruner.decoded_limit {
-            pruner.give_up();
-            return Ok(None);
-        }
-        Ok(Some(bytes))
-    }
-
-    /// What the walk found using a holder that nothing has searched yet: search it. True if there's anything new, and the
-    /// walk has to go again, since what's pruned has changed.
-    pub(super) fn scan_new_users(&mut self, pruner: &mut Pruner) -> RewriteResult<bool> {
-        if pruner.holders.is_empty() {
-            return Ok(false);
-        }
-        let found = std::mem::take(&mut pruner.found);
-        let before = pruner.searched.len();
-        let mut grew = false;
-        for (number, resources) in std::mem::take(&mut pruner.opaque) {
-            for holder in self.scope_within(&resources, number, pruner)? {
-                if let Some(state) = pruner.holders.get_mut(&holder) {
-                    grew |= !state.whole;
-                    state.whole = true;
-                }
-            }
-        }
-        let mut queue = Vec::new();
-        for number in found {
+        // Whatever else reachable has resources of its own that include one.
+        for number in std::mem::take(&mut pruner.found) {
             let Some(loaded) = self.peek(number)? else { continue };
             let Some(dict) = loaded.dictionary().cloned() else {
                 continue;
@@ -655,112 +612,329 @@ impl Plan<'_> {
             let Ok(resources) = dict.get(b"Resources").cloned() else {
                 continue;
             };
-            let scope = self.scope_within(&resources, number, pruner)?;
-            if scope.is_empty() {
+            let own = self.holders_of(&resources, number)?;
+            if !own.iter().any(|holder| pruner.listed.contains(holder)) {
                 continue;
             }
-            queue.push((number, loaded, dict, scope));
-        }
-        for (number, loaded, dict, scope) in queue {
-            let scope = Rc::new(scope);
-            let was_unused = scope
-                .iter()
-                .any(|holder| pruner.holders.get(holder).is_some_and(|state| !state.has_user));
-            for holder in scope.iter() {
-                if let Some(state) = pruner.holders.get_mut(holder) {
-                    state.has_user = true;
-                }
-            }
-            grew |= was_unused;
-            let type3 = matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Type3");
+            let chain = Rc::new(own);
             match loaded {
-                Loaded::Stream(..) => pruner.pending.push(Search { stream: number, scope }),
-                Loaded::Plain(_) if type3 => {
-                    if let Some(procs) = self.deref_dict(dict.get(b"CharProcs").ok())? {
-                        for (_, value) in procs.iter() {
-                            if let Object::Reference((stream, _)) = value {
-                                pruner.pending.push(Search {
-                                    stream: *stream,
-                                    scope: Rc::clone(&scope),
-                                });
-                            }
-                        }
-                    }
+                Loaded::Stream(..) => round.pending.push(Search { stream: number, chain }),
+                Loaded::Plain(_) if dict.has_type(b"Page") => self.queue_page(&dict, &chain, &mut round)?,
+                Loaded::Plain(_) if matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Type3") => {
+                    self.queue_glyphs(&dict, &chain, &mut round)?;
                 }
-                Loaded::Plain(_) if dict.has_type(b"Page") => self.queue_page_content(&dict, &scope, pruner)?,
-                // Something else with /Resources, which isn't known to draw anything. No telling what it might use.
+                // Something with /Resources that isn't known to draw. No telling what it uses.
                 Loaded::Plain(_) => {
-                    for holder in scope.iter() {
-                        if let Some(state) = pruner.holders.get_mut(holder) {
-                            grew |= !state.whole;
-                            state.whole = true;
+                    for holder in chain.iter() {
+                        if pruner.listed.contains(holder) {
+                            pruner.whole.insert(*holder);
                         }
                     }
                 }
             }
         }
-        self.run_searches(pruner)?;
-        Ok(grew || pruner.searched.len() != before)
+        self.run_searches(pruner, &mut round)?;
+        let mut wanted = BTreeMap::new();
+        for holder in &pruner.listed {
+            if pruner.whole.contains(holder) || round.whole.contains(holder) {
+                pruner.whole.insert(*holder);
+                continue;
+            }
+            let mut keep = round.used.remove(holder).unwrap_or_default();
+            keep.extend(NAMES_LOOKED_UP_IMPLICITLY.iter().map(|name| name.to_vec()));
+            wanted.insert(*holder, keep);
+        }
+        Ok(wanted)
     }
 
-    /// Make the edits that the search so far allows. What's whole, and what nothing kept uses, stays as it was: the second is
-    /// out of reach anyway, unless the walk finds a user, and then it's searched.
-    pub(super) fn apply_pruner(&mut self, pruner: &mut Pruner) -> RewriteResult<()> {
-        if pruner.holders.is_empty() {
-            return Ok(());
-        }
-        for (number, base) in &pruner.bases {
-            let mut edited = base.clone();
-            let mut changed = false;
-            for (holder, state) in pruner.holders.range(..) {
-                if holder.object() != *number || !state.has_user || state.whole {
-                    continue;
-                }
-                let names = match &mut edited {
-                    Loaded::Plain(Object::Dictionary(dict)) | Loaded::Stream(dict, _) => holder.names_mut(dict),
-                    _ => None,
-                };
-                let Some(names) = names else { continue };
-                let before = names.len();
-                names.as_hashmap_mut().retain(|name, _| {
-                    state.used.contains(name) || NAMES_LOOKED_UP_IMPLICITLY.contains(&name.as_slice())
+    fn queue_page(&mut self, page: &Dictionary, chain: &Chain, round: &mut Round) -> RewriteResult<()> {
+        let contents = match page.get(b"Contents") {
+            Ok(Object::Reference((number, _))) => match self.peek(*number)? {
+                Some(Loaded::Plain(Object::Array(items))) => items,
+                _ => vec![Object::Reference((*number, 0))],
+            },
+            Ok(Object::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        };
+        for item in contents {
+            if let Object::Reference((stream, _)) = item {
+                round.pending.push(Search {
+                    stream,
+                    chain: Rc::clone(chain),
                 });
-                changed |= names.len() != before;
             }
-            if changed {
-                self.edits.insert(*number, edited);
-            } else {
-                self.edits.remove(number);
-                // Back to what it was before this search, which may itself have been an edit.
-                if !matches!(base, Loaded::Stream(_, StreamBody::Given)) {
-                    self.edits.insert(*number, base.clone());
+        }
+        // An appearance falls back on the page's resources in PDFium.
+        for annotation in self.deref_array(page.get(b"Annots").ok())? {
+            if let Some(annotation) = self.deref_dict(Some(&annotation))?
+                && let Ok(appearance) = annotation.get(b"AP")
+            {
+                self.follow(&appearance.clone(), chain, round, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_glyphs(&mut self, font: &Dictionary, chain: &Chain, round: &mut Round) -> RewriteResult<()> {
+        if let Some(procs) = self.deref_dict(font.get(b"CharProcs").ok())? {
+            for (_, value) in procs.iter() {
+                if let Object::Reference((stream, _)) = value {
+                    round.pending.push(Search {
+                        stream: *stream,
+                        chain: Rc::clone(chain),
+                    });
                 }
             }
         }
         Ok(())
     }
 
-    /// Say what the search did. Called when it's settled.
+    /// A chain for something with these resources of its own, used under `chain`: its own first, then everything above.
+    fn chain_below(
+        &mut self, resources: Option<&Object>, number: u32, chain: &Chain, round: &mut Round,
+    ) -> RewriteResult<Chain> {
+        let Some(resources) = resources else {
+            return Ok(Rc::clone(chain));
+        };
+        let mut own = self.holders_of(&resources.clone(), number)?;
+        for holder in chain.iter() {
+            if !own.contains(holder) {
+                own.push(*holder);
+            }
+        }
+        if own.len() > MAX_CHAIN {
+            round.whole.extend(own.iter().copied());
+            own.truncate(MAX_CHAIN);
+        }
+        Ok(Rc::new(own))
+    }
+
+    /// Something a used name led to: queue whatever content it has, under its own resources and then `chain`.
+    fn follow(&mut self, value: &Object, chain: &Chain, round: &mut Round, depth: usize) -> RewriteResult<()> {
+        if depth > 8 {
+            return Ok(());
+        }
+        let (number, loaded) = match value {
+            Object::Reference(_) => match self.final_object(value)? {
+                Some((number, _)) => match self.peek(number)? {
+                    Some(loaded) => (Some(number), loaded),
+                    None => return Ok(()),
+                },
+                None => return Ok(()),
+            },
+            Object::Dictionary(dict) => (None, Loaded::Plain(Object::Dictionary(dict.clone()))),
+            Object::Array(items) => {
+                // An ExtGState's /Font is [font size].
+                if let Some(first) = items.first() {
+                    self.follow(&first.clone(), chain, round, depth + 1)?;
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        // A direct dictionary isn't a holder anyone else shares.
+        let owner = number.unwrap_or(u32::MAX);
+        match loaded {
+            Loaded::Stream(dict, _) => {
+                let is_form = matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Form");
+                let is_pattern = matches!(dict.get(b"PatternType"), Ok(Object::Integer(1)));
+                if (is_form || is_pattern || dict.has(b"BBox"))
+                    && let Some(number) = number
+                {
+                    let inner = self.chain_below(dict.get(b"Resources").ok(), number, chain, round)?;
+                    round.pending.push(Search {
+                        stream: number,
+                        chain: inner,
+                    });
+                }
+            }
+            Loaded::Plain(Object::Dictionary(dict)) => {
+                if matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Type3") {
+                    let inner = self.chain_below(dict.get(b"Resources").ok(), owner, chain, round)?;
+                    self.queue_glyphs(&dict, &inner, round)?;
+                    return Ok(());
+                }
+                for key in [&b"SMask"[..], b"G", b"Font"] {
+                    if let Ok(inner) = dict.get(key) {
+                        self.follow(&inner.clone(), chain, round, depth + 1)?;
+                    }
+                }
+                if !dict.has(b"Type") && !dict.has(b"Subtype") {
+                    // An appearance's states.
+                    for inner in dict.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>() {
+                        self.follow(&inner, chain, round, depth + 1)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Search everything queued, and whatever the names it finds lead to.
+    fn run_searches(&mut self, pruner: &mut Pruner, round: &mut Round) -> RewriteResult<()> {
+        while let Some(search) = round.pending.pop() {
+            if pruner.gave_up {
+                return Ok(());
+            }
+            if round.searched.len() >= MAX_SEARCHES {
+                pruner.give_up();
+                return Ok(());
+            }
+            if !round.searched.insert((search.stream, search.chain.as_ref().clone())) {
+                continue;
+            }
+            let Some(names) = self.stream_names(search.stream, pruner)? else {
+                round.whole.extend(search.chain.iter().copied());
+                continue;
+            };
+            let mut followed = Vec::new();
+            for name in names.iter() {
+                for holder in search.chain.iter() {
+                    let current;
+                    let base = match pruner.bases.get(&holder.object()) {
+                        Some(base) => base.dictionary(),
+                        None => {
+                            current = self.peek(holder.object())?;
+                            current.as_ref().and_then(Loaded::dictionary)
+                        }
+                    };
+                    let Some(value) = base
+                        .and_then(|base| holder.names(base))
+                        .and_then(|names| names.get(name).ok())
+                    else {
+                        continue;
+                    };
+                    let value = value.clone();
+                    if pruner.listed.contains(holder) {
+                        round.used.entry(*holder).or_default().insert(name.clone());
+                    }
+                    followed.push(value);
+                }
+            }
+            for value in followed {
+                self.follow(&value, &search.chain, round, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The names in a stream's decoded bytes, decoded at most once while there's room to remember them. `None` if it can't be decoded to its end.
+    fn stream_names(&mut self, number: u32, pruner: &mut Pruner) -> RewriteResult<Option<Rc<[Vec<u8>]>>> {
+        if let Some(known) = pruner.names.get(&number) {
+            return Ok(known.clone());
+        }
+        let limit_stream = self.view.limits.max_stream_bytes;
+        let (mut dict, content_from) = match self.peek(number)? {
+            Some(Loaded::Stream(dict, StreamBody::Source { start, length })) => (dict, Some((start, length))),
+            Some(Loaded::Stream(dict, StreamBody::Given)) => (dict, None),
+            _ => {
+                pruner.names.insert(number, None);
+                return Ok(None);
+            }
+        };
+        // What's left of the allowance bounds this one too, so that nothing is decoded past it.
+        let left = pruner.decoded_limit.saturating_sub(pruner.decoded);
+        let limit = usize::try_from(limit_stream.min(left)).unwrap_or(usize::MAX);
+        let mut raw = std::mem::take(&mut pruner.raw);
+        let readable = match content_from {
+            Some((start, length)) if length <= limit as u64 => {
+                raw.clear();
+                raw.resize(usize::try_from(length).unwrap_or(0), 0);
+                self.view.source.read_exact_at(start, &mut raw)?;
+                true
+            }
+            Some(_) => false,
+            None => match self.objects.get(&number) {
+                Some(Change::Object {
+                    object: Object::Stream(stream),
+                    ..
+                }) if stream.content.len() <= limit => {
+                    raw.clear();
+                    raw.extend_from_slice(&stream.content);
+                    true
+                }
+                _ => false,
+            },
+        };
+        for key in [&b"Filter"[..], b"DecodeParms"] {
+            if let Ok(Object::Reference(_)) = dict.get(key)
+                && let Some(value) = self.deref(&dict.get(key).cloned().unwrap_or(Object::Null))?
+            {
+                dict.set(key.to_vec(), value);
+            }
+        }
+        let decoded = if readable {
+            pruner.decoded = pruner.decoded.saturating_add(raw.len() as u64);
+            decode_all_or_nothing(&dict, &raw, limit, &mut pruner.inflated)
+        } else {
+            None
+        };
+        pruner.raw = raw;
+        let Some(decoded) = decoded else {
+            if left < limit_stream {
+                // Out of allowance, not out of luck: everything stays whole from here.
+                pruner.give_up();
+            }
+            pruner.names.insert(number, None);
+            return Ok(None);
+        };
+        pruner.decoded = pruner.decoded.saturating_add(decoded.len() as u64);
+        let mut names = BTreeSet::new();
+        every_name(&decoded, |name| {
+            names.insert(name.to_vec());
+        });
+        drop(decoded);
+        let names: Rc<[Vec<u8>]> = names.into_iter().collect();
+        if pruner.remembered_names + names.len() <= MAX_REMEMBERED_NAMES {
+            pruner.remembered_names += names.len();
+            pruner.names.insert(number, Some(Rc::clone(&names)));
+        }
+        Ok(Some(names))
+    }
+
+    /// Put what's settled in place: each pruned holder keeps only its names. Everything else is as its base was.
+    fn apply_pruning(&mut self, pruner: &Pruner) {
+        for (number, base) in &pruner.bases {
+            let mut edited = base.clone();
+            for (holder, keep) in &pruner.applied {
+                if holder.object() != *number {
+                    continue;
+                }
+                let names = match &mut edited {
+                    Loaded::Plain(Object::Dictionary(dict)) | Loaded::Stream(dict, _) => holder.names_mut(dict),
+                    _ => None,
+                };
+                if let Some(names) = names {
+                    names.as_hashmap_mut().retain(|name, _| keep.contains(name));
+                }
+            }
+            self.edits.insert(*number, edited);
+        }
+    }
+
+    /// Say what the search did, once it's settled.
     pub(super) fn finish_pruner(&mut self, pruner: Pruner) {
-        for (holder, state) in &pruner.holders {
-            if state.whole {
-                self.report
-                    .resources_left_whole
-                    .push((holder.object(), self.generation(holder.object())));
-            } else if state.has_user
-                && let Some(base) = pruner.bases.get(&holder.object()).and_then(Loaded::dictionary)
+        let mut whole: BTreeSet<u32> = BTreeSet::new();
+        for holder in &pruner.listed {
+            let pruned = pruner.applied.get(holder);
+            if pruner.gave_up || pruner.whole.contains(holder) || pruned.is_none() {
+                if self.live.get(holder.object()) {
+                    whole.insert(holder.object());
+                }
+                continue;
+            }
+            if let (Some(keep), Some(base)) = (pruned, pruner.bases.get(&holder.object()).and_then(Loaded::dictionary))
                 && let Some(names) = holder.names(base)
             {
-                let gone = names
-                    .iter()
-                    .filter(|(name, _)| {
-                        !state.used.contains(*name) && !NAMES_LOOKED_UP_IMPLICITLY.contains(&name.as_slice())
-                    })
-                    .count();
+                let gone = names.iter().filter(|(name, _)| !keep.contains(*name)).count();
                 self.report.resource_names_pruned += gone as u64;
             }
         }
-        self.report.resources_left_whole.sort_unstable();
-        self.report.resources_left_whole.dedup();
+        self.report.resources_left_whole = whole
+            .into_iter()
+            .map(|number| (number, self.generation(number)))
+            .collect();
+        self.report.resource_dictionaries_unlisted = pruner.unlisted;
     }
 }

@@ -18,14 +18,7 @@ const MAX_THREAD_BEADS: usize = 1_000_000;
 
 /// What the later steps need to know about a removal.
 pub(super) struct PageRemoval {
-    kept_count: usize,
     pub(super) shared: SharedResources,
-}
-
-impl PageRemoval {
-    pub(super) fn kept_count(&self) -> usize {
-        self.kept_count
-    }
 }
 
 /// Which kind of name or number tree is being pruned.
@@ -153,10 +146,8 @@ impl Plan<'_> {
             }
         }
         for entry in &map.pages {
-            if self.dead.get(entry.id.0)
-                && let Some(owner) = entry.inherited.resources
-            {
-                self.note_removed_resources(owner, &mut shared)?;
+            if self.dead.get(entry.id.0) {
+                self.note_removed_resources(entry.id, entry.inherited.resources, &mut shared)?;
             }
         }
 
@@ -167,10 +158,9 @@ impl Plan<'_> {
         self.rebuild_page_labels(&mut catalog, &map)?;
         self.prune_threads(&mut catalog)?;
 
-        let kept_count = kept.len();
         shared.remember_kept_pages(&kept);
         self.edits.insert(self.root, Loaded::Plain(Object::Dictionary(catalog)));
-        Ok(PageRemoval { kept_count, shared })
+        Ok(PageRemoval { shared })
     }
 
     /// Whether a destination ends at a removed page. A destination that names nothing known isn't this.
@@ -907,7 +897,9 @@ impl Plan<'_> {
                     }
                     // Checked: a hostile range starts anywhere and numbers from anything. A number no viewer can show goes.
                     let first = dict.get(b"St").and_then(Object::as_i64).unwrap_or(1);
-                    let number = position.checked_sub(*start).and_then(|offset| first.checked_add(offset));
+                    let number = position
+                        .checked_sub(*start)
+                        .and_then(|offset| first.checked_add(offset));
                     if let Some(number) = number.filter(|number| (2..=i64::from(i32::MAX)).contains(number)) {
                         label.set("St", number);
                     }

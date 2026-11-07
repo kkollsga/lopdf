@@ -282,6 +282,9 @@ pub struct RemovalReport {
     /// Shared resource dictionaries left as they were because the content using them couldn't be searched, so
     /// what a removed page used through them may still be in the file.
     pub resources_left_whole: Vec<crate::ObjectId>,
+    /// Resource dictionaries a removed page could draw from that weren't even looked at, past the limit on how many are. What a removed
+    /// page used through them may still be in the file.
+    pub resource_dictionaries_unlisted: u64,
 }
 
 /// What removing signatures took out.
@@ -613,7 +616,9 @@ impl<'r, 'c> RewriteChanges<'r, 'c> {
     /// # Errors
     ///
     /// Any refusal described in the [module docs](self), and any read or write failure.
-    pub fn write_unverified_to<W: AppendOutput>(self, policy: RewritePolicy, out: W) -> RewriteResult<UnverifiedRewrite> {
+    pub fn write_unverified_to<W: AppendOutput>(
+        self, policy: RewritePolicy, out: W,
+    ) -> RewriteResult<UnverifiedRewrite> {
         let reader = self.reader;
         let plan = Plan::prepare(self, policy, false)?;
         let (summary, written) = write_plan(reader, plan, out)?;

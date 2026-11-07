@@ -292,7 +292,9 @@ fn rewrite_with(
     let mut changes = RewriteChanges::new(&reader).expect("this file can be rewritten");
     change(&mut changes);
     let mut output = Vec::new();
-    let unverified = changes.write_unverified_to(policy, &mut output).expect("the rewrite is written");
+    let unverified = changes
+        .write_unverified_to(policy, &mut output)
+        .expect("the rewrite is written");
     assert_eq!(unverified.summary().new_len, output.len() as u64);
     // Every rewrite in these tests goes through the same check a save does.
     let (summary, after) = unverified
@@ -1727,7 +1729,8 @@ fn new_objects_a_new_root_and_a_removed_object() {
 /// that has nothing to do with any of it.
 fn signed_everywhere(form: Form) -> Vec<u8> {
     let mut builder = Builder::new(500);
-    let sig = |number: u32, extra: &str, range: &str| Obj {
+    let sig = |number: u32, extra: &str, range: &str| {
+        Obj {
         number,
         generation: 0,
         body: format!(
@@ -1736,6 +1739,7 @@ fn signed_everywhere(form: Form) -> Vec<u8> {
         .into_bytes(),
         // Top level, as a signature has to be.
         is_stream: true,
+    }
     };
     let objects = vec![
         obj(
@@ -1743,22 +1747,43 @@ fn signed_everywhere(form: Form) -> Vec<u8> {
             "<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 6 0 R /UR3 7 0 R >> /DSS 8 0 R \
              /AcroForm << /SigFlags 3 /Fields [5 0 R 9 0 R 10 0 R] /DA (/Helv 0 Tf 0 g) >> >>",
         ),
-        obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>"),
+        obj(
+            2,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>",
+        ),
         obj(3, "<< /Type /Page /Parent 2 0 R /Annots [5 0 R 9 0 R] >>"),
         obj(4, "<< /Type /Page /Parent 2 0 R /Annots [12 0 R] >>"),
         obj(
             5,
             "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /Rect [0 0 90 20] /P 3 0 R /V 6 0 R /AP << /N 11 0 R >> /Lock 14 0 R >>",
         ),
-        sig(6, "/Reference [<< /TransformMethod /DocMDP /TransformParams << /P 2 >> >>]", "0 100 200 300"),
+        sig(
+            6,
+            "/Reference [<< /TransformMethod /DocMDP /TransformParams << /P 2 >> >>]",
+            "0 100 200 300",
+        ),
         sig(7, "/Reference [<< /TransformMethod /UR3 >>]", "0 110 210 310"),
         obj(8, "<< /Certs [15 0 R] >>"),
         deflated(15, "", b"M_CERTIFICATE"),
-        obj(9, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (K_TYPED) /Rect [0 0 90 20] /P 3 0 R >>"),
+        obj(
+            9,
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (K_TYPED) /Rect [0 0 90 20] /P 3 0 R >>",
+        ),
         obj(10, "<< /FT /Sig /T (Signature2) /Kids [12 0 R] /V 13 0 R >>"),
-        obj(12, "<< /Type /Annot /Subtype /Widget /Parent 10 0 R /Rect [0 0 90 20] /P 4 0 R /AP << /N 16 0 R >> >>"),
-        deflated(11, "/Type /XObject /Subtype /Form /BBox [0 0 90 20]", b"(M_SIGNED_BY_ONE) Tj"),
-        deflated(16, "/Type /XObject /Subtype /Form /BBox [0 0 90 20]", b"(M_SIGNED_BY_TWO) Tj"),
+        obj(
+            12,
+            "<< /Type /Annot /Subtype /Widget /Parent 10 0 R /Rect [0 0 90 20] /P 4 0 R /AP << /N 16 0 R >> >>",
+        ),
+        deflated(
+            11,
+            "/Type /XObject /Subtype /Form /BBox [0 0 90 20]",
+            b"(M_SIGNED_BY_ONE) Tj",
+        ),
+        deflated(
+            16,
+            "/Type /XObject /Subtype /Form /BBox [0 0 90 20]",
+            b"(M_SIGNED_BY_TWO) Tj",
+        ),
         sig(13, "", "0 120 220 320"),
         obj(14, "<< /Type /SigFieldLock /Action /All >>"),
     ];
@@ -1800,13 +1825,32 @@ fn a_rewritten_copy_of_a_signed_file_is_unsigned() {
         let parts = &summary.signature_removal;
         assert_eq!(parts.fields, 3, "the two signature fields and the second one's widget");
         assert!(parts.permissions && parts.signature_flags && parts.security_store);
-        assert!(after.signatures().unwrap().is_empty(), "{form:?}: the copy still holds a signature");
-        assert_markers(&output, &["M_SIGNED_BY_ONE", "M_SIGNED_BY_TWO", "M_CERTIFICATE", "ByteRange", "SigFlags"], &["K_TYPED"]);
+        assert!(
+            after.signatures().unwrap().is_empty(),
+            "{form:?}: the copy still holds a signature"
+        );
+        assert_markers(
+            &output,
+            &[
+                "M_SIGNED_BY_ONE",
+                "M_SIGNED_BY_TWO",
+                "M_CERTIFICATE",
+                "ByteRange",
+                "SigFlags",
+            ],
+            &["K_TYPED"],
+        );
         let catalog = dict(&after, 1);
         assert!(!catalog.has(b"Perms") && !catalog.has(b"DSS"));
         let acro = catalog.get(b"AcroForm").unwrap().as_dict().unwrap();
-        assert_eq!(acro.get(b"Fields").unwrap().as_array().unwrap(), &vec![Object::Reference((9, 0))]);
-        assert_eq!(dict(&after, 3).get(b"Annots").unwrap().as_array().unwrap(), &vec![Object::Reference((9, 0))]);
+        assert_eq!(
+            acro.get(b"Fields").unwrap().as_array().unwrap(),
+            &vec![Object::Reference((9, 0))]
+        );
+        assert_eq!(
+            dict(&after, 3).get(b"Annots").unwrap().as_array().unwrap(),
+            &vec![Object::Reference((9, 0))]
+        );
         assert!(dict(&after, 4).get(b"Annots").unwrap().as_array().unwrap().is_empty());
         assert_eq!(after.page_count().unwrap(), 2);
     }
@@ -1835,7 +1879,9 @@ fn usage_rights_are_classed_as_such_and_removed_with_consent() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].kind, IndexedSignatureKind::UsageRights);
     assert!(matches!(
-        RewriteChanges::new(&reader).unwrap().write_unverified_to(RewritePolicy::new(), std::io::sink()),
+        RewriteChanges::new(&reader)
+            .unwrap()
+            .write_unverified_to(RewritePolicy::new(), std::io::sink()),
         Err(RewriteError::SignedNeedsConsent { .. })
     ));
     let (output, summary, after) = rewrite_with(&builder.bytes, RewritePolicy::new().remove_signatures(), |_| {});
@@ -2169,7 +2215,9 @@ fn a_signed_file_is_never_replaced_and_a_save_as_says_what_it_removed() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 
     let new = folder.path().join("copy.pdf");
-    let refused = rewrite_atomically(&reader, AppendDestination::NewFile(&new), RewriteOptions::new(), |_| Ok(()));
+    let refused = rewrite_atomically(&reader, AppendDestination::NewFile(&new), RewriteOptions::new(), |_| {
+        Ok(())
+    });
     assert!(matches!(refused, Err(RewriteError::SignedNeedsConsent { .. })));
     assert!(!new.exists());
 
@@ -2177,7 +2225,13 @@ fn a_signed_file_is_never_replaced_and_a_save_as_says_what_it_removed() {
     assert_eq!(done.summary.removed_signatures.len(), 3);
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     // The copy isn't signed, so it can be saved over like any other file.
-    let saved = rewrite_atomically(&done.reader, AppendDestination::SameFile(&new), RewriteOptions::new(), |_| Ok(())).unwrap();
+    let saved = rewrite_atomically(
+        &done.reader,
+        AppendDestination::SameFile(&new),
+        RewriteOptions::new(),
+        |_| Ok(()),
+    )
+    .unwrap();
     assert!(saved.summary.removed_signatures.is_empty());
     no_temporary_names(folder.path());
 }
@@ -2588,8 +2642,14 @@ fn hostile_page_label_numbers_neither_panic_nor_wrap() {
     ] {
         let mut builder = Builder::new(500);
         let objects = vec![
-            obj(1, &format!("<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums {nums} >> >>")),
-            obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 9 9] >>"),
+            obj(
+                1,
+                &format!("<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums {nums} >> >>"),
+            ),
+            obj(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 9 9] >>",
+            ),
             obj(3, "<< /Type /Page /Parent 2 0 R >>"),
             obj(4, "<< /Type /Page /Parent 2 0 R >>"),
             obj(5, "<< /Type /Page /Parent 2 0 R >>"),
@@ -2598,7 +2658,15 @@ fn hostile_page_label_numbers_neither_panic_nor_wrap() {
         builder.finish_revision(Form::Table, "/Root 1 0 R");
         let (_, _, after) = rewrite(&builder.bytes, remove_second_page);
         let catalog = dict(&after, 1);
-        let labels = catalog.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
+        let labels = catalog
+            .get(b"PageLabels")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Nums")
+            .unwrap()
+            .as_array()
+            .unwrap();
         for value in labels.iter().filter_map(|value| value.as_dict().ok()) {
             if let Ok(start) = value.get(b"St") {
                 let start = start.as_i64().unwrap();
@@ -2617,7 +2685,9 @@ fn signed_in_old_revision_at(byte_range_at: usize, key: &str, value: &str) -> Ve
     builder.write_obj(&obj(3, "<< /Type /Page /Parent 2 0 R >>"));
     let prefix = "7 0 obj\n<< /Type /Sig /Contents <00> ";
     let pad = byte_range_at - builder.bytes.len() - prefix.len() - 2;
-    builder.bytes.extend_from_slice(format!("% {}\n", "x".repeat(pad.saturating_sub(1))).as_bytes());
+    builder
+        .bytes
+        .extend_from_slice(format!("% {}\n", "x".repeat(pad.saturating_sub(1))).as_bytes());
     assert!(builder.bytes.len() + prefix.len() <= byte_range_at);
     while builder.bytes.len() + prefix.len() < byte_range_at {
         builder.bytes.push(b' ');
@@ -2625,7 +2695,9 @@ fn signed_in_old_revision_at(byte_range_at: usize, key: &str, value: &str) -> Ve
     builder.offsets.insert(7, builder.bytes.len() as u64);
     builder.bytes.extend_from_slice(prefix.as_bytes());
     assert_eq!(builder.bytes.len(), byte_range_at);
-    builder.bytes.extend_from_slice(format!("{key}{value} >>\nendobj\n").as_bytes());
+    builder
+        .bytes
+        .extend_from_slice(format!("{key}{value} >>\nendobj\n").as_bytes());
     builder.finish_revision(Form::Table, "/Root 1 0 R");
     builder.free.push(7);
     builder.place(Form::Table, &[obj(1, "<< /Type /Catalog /Pages 2 0 R >>")], 100);
@@ -2682,7 +2754,9 @@ fn the_page_count_is_checked_whatever_changed() {
     let mut changes = RewriteChanges::new(&reader).unwrap();
     // A new kid that the planned count sees and that the written file has too: a check that compares the two passes.
     let page = changes
-        .add_object(Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => Object::Reference((2, 0)) }))
+        .add_object(Object::Dictionary(
+            dictionary! { "Type" => "Page", "Parent" => Object::Reference((2, 0)) },
+        ))
         .unwrap();
     changes
         .write_object(
@@ -2707,9 +2781,217 @@ fn the_page_count_is_checked_whatever_changed() {
     changes.remove_page(1);
     let mut output = Vec::new();
     let written = changes.write_unverified_to(RewritePolicy::new(), &mut output).unwrap();
-    let damaged = String::from_utf8_lossy(&output).replace("/Count 1", "/Count 2").into_bytes();
+    let damaged = String::from_utf8_lossy(&output)
+        .replace("/Count 1", "/Count 2")
+        .into_bytes();
     assert!(matches!(
         written.verify(&reader, std::sync::Arc::new(BytesSource::from(damaged))),
         Err(RewriteError::VerificationFailed { .. })
     ));
+}
+
+/// A kept page losing what its content draws, in every viewer: content that falls back on the page's resources when it has none of its own, or
+/// only some, reached through a category the removed page didn't share. A form with no resources, a form with only /ProcSet, a form whose own
+/// /XObject lacks the name, a Type 3 glyph, a tiling pattern and an appearance. Each draws one thing from the shared dictionary; another thing in
+/// it, only the removed page's, has to go.
+#[test]
+fn whatever_kept_content_reaches_keeps_what_it_names() {
+    let form = "/Type /XObject /Subtype /Form /BBox [0 0 50 50]";
+    let shared = "<< /Fm 7 0 R /Im 10 0 R /Gone 11 0 R >>";
+    let cases: Vec<(&str, &str, Vec<Obj>)> = vec![
+        (
+            "no resources, through an unshared category",
+            "/XObject << /Fm 7 0 R >> /Font 9 0 R",
+            vec![
+                obj(9, "<< /F1 20 0 R /Gone 11 0 R >>"),
+                deflated(7, form, b"BT /F1 12 Tf (x) Tj ET"),
+                obj(
+                    20,
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Note (K_USED) >>",
+                ),
+            ],
+        ),
+        (
+            "only /ProcSet",
+            "/XObject 9 0 R",
+            vec![
+                obj(9, shared),
+                deflated(7, &format!("{form} /Resources << /ProcSet [/PDF] >>"), b"/Im Do"),
+            ],
+        ),
+        (
+            "an /XObject without the name",
+            "/XObject 9 0 R",
+            vec![
+                obj(9, shared),
+                deflated(
+                    7,
+                    &format!("{form} /Resources << /XObject << /Other 12 0 R >> >>"),
+                    b"/Other Do /Im Do",
+                ),
+                deflated(12, form, b"% other"),
+            ],
+        ),
+        (
+            "a Type 3 glyph in an unshared /Font",
+            "/Font << /T3 13 0 R >> /XObject 9 0 R",
+            vec![
+                obj(9, shared),
+                obj(
+                    13,
+                    "<< /Type /Font /Subtype /Type3 /FontMatrix [1 0 0 1 0 0] /CharProcs << /a 14 0 R >> /Encoding << /Differences [97 /a] >> >>",
+                ),
+                deflated(14, "", b"0 0 d0 /Im Do"),
+                deflated(7, form, b"BT /T3 1 Tf (a) Tj ET"),
+            ],
+        ),
+        (
+            "a tiling pattern in an unshared /Pattern",
+            "/Pattern << /P0 15 0 R >> /XObject 9 0 R",
+            vec![
+                obj(9, shared),
+                deflated(
+                    15,
+                    "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 9 9] /XStep 9 /YStep 9",
+                    b"/Im Do",
+                ),
+                deflated(7, form, b"/Pattern cs /P0 scn 0 0 9 9 re f"),
+            ],
+        ),
+        (
+            "an appearance with only /ProcSet",
+            "/XObject 9 0 R",
+            vec![
+                obj(9, shared),
+                obj(
+                    16,
+                    "<< /Type /Annot /Subtype /Stamp /Rect [0 0 50 50] /AP << /N 17 0 R >> >>",
+                ),
+                deflated(17, &format!("{form} /Resources << /ProcSet [/PDF] >>"), b"/Im Do"),
+                deflated(7, form, b"% nothing"),
+            ],
+        ),
+    ];
+    for (what, resources, extra) in cases {
+        let mut objects = vec![
+            deflated(5, "", b"/Fm Do"),
+            deflated(6, "", b"/Gone Do"),
+            deflated(10, form, b"0 0 1 rg 0 0 50 50 re f % K_USED"),
+            deflated(11, form, b"1 0 0 rg 0 0 50 50 re f % M_GONE"),
+        ];
+        objects.extend(extra);
+        let annots = if what.starts_with("an appearance") {
+            "/Annots [16 0 R]"
+        } else {
+            ""
+        };
+        let bytes = resource_sharing(
+            &objects,
+            "",
+            &format!("/Contents 5 0 R /Resources << {resources} >> {annots}"),
+            &format!(
+                "/Contents 6 0 R /Resources << {} >>",
+                if resources.contains("/Font 9 0 R") {
+                    "/Font 9 0 R"
+                } else {
+                    "/XObject 9 0 R"
+                }
+            ),
+        );
+        let (output, summary, _) = rewrite(&bytes, remove_second_page);
+        dump(&format!("fallback_{}.pdf", what.replace(' ', "_")), &output);
+        assert_markers(&output, &[], &["K_USED"]);
+        assert!(
+            !holds_marker(&output, &every_decoded_stream(&output), "M_GONE")
+                || !summary.removal.resources_left_whole.is_empty(),
+            "{what}: the removed page's image stayed and nothing said so"
+        );
+    }
+}
+
+/// Removed content staying with nothing in the report: a /Pages node's dictionary only the removed page inherited, forms on each page sharing one
+/// dictionary of their own, a /Resources or a category given as a reference to a reference.
+#[test]
+fn removed_content_reached_another_way_goes_or_is_reported() {
+    let form = "/Type /XObject /Subtype /Form /BBox [0 0 50 50]";
+    let image = |number| deflated(number, form, b"% M_GONE");
+    let keep = |number| deflated(number, form, b"% K_KEEP");
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a /Pages node's dictionary only the removed page inherits",
+            resource_sharing(
+                &[
+                    obj(9, "<< /XObject << /Gone 11 0 R >> >>"),
+                    image(11),
+                    deflated(5, "", b"0 g"),
+                    deflated(6, "", b"/Gone Do"),
+                ],
+                "/Resources 9 0 R",
+                "/Contents 5 0 R /Resources << >>",
+                "/Contents 6 0 R",
+            ),
+        ),
+        (
+            "forms on each page sharing their own dictionary",
+            resource_sharing(
+                &[
+                    obj(9, "<< /XObject << /Keep 10 0 R /Gone 11 0 R >> >>"),
+                    keep(10),
+                    image(11),
+                    deflated(7, &format!("{form} /Resources 9 0 R"), b"/Keep Do"),
+                    deflated(8, &format!("{form} /Resources 9 0 R"), b"/Gone Do"),
+                    deflated(5, "", b"/F Do"),
+                    deflated(6, "", b"/G Do"),
+                ],
+                "",
+                "/Contents 5 0 R /Resources << /XObject << /F 7 0 R >> >>",
+                "/Contents 6 0 R /Resources << /XObject << /G 8 0 R >> >>",
+            ),
+        ),
+        (
+            "/Resources as a reference to a reference",
+            resource_sharing(
+                &[
+                    obj(30, "31 0 R"),
+                    obj(31, "<< /XObject << /Keep 10 0 R /Gone 11 0 R >> >>"),
+                    keep(10),
+                    image(11),
+                    deflated(5, "", b"/Keep Do"),
+                    deflated(6, "", b"/Gone Do"),
+                ],
+                "",
+                "/Contents 5 0 R /Resources 30 0 R",
+                "/Contents 6 0 R /Resources 30 0 R",
+            ),
+        ),
+        (
+            "a category as a reference to a reference",
+            resource_sharing(
+                &[
+                    obj(30, "31 0 R"),
+                    obj(31, "<< /Keep 10 0 R /Gone 11 0 R >>"),
+                    keep(10),
+                    image(11),
+                    deflated(5, "", b"/Keep Do"),
+                    deflated(6, "", b"/Gone Do"),
+                ],
+                "",
+                "/Contents 5 0 R /Resources << /XObject 30 0 R >>",
+                "/Contents 6 0 R /Resources << /XObject 30 0 R >>",
+            ),
+        ),
+    ];
+    for (what, bytes) in cases {
+        let (output, summary, _) = rewrite(&bytes, remove_second_page);
+        let streams = every_decoded_stream(&output);
+        assert!(
+            holds_marker(&output, &streams, "K_KEEP") || !what.contains("share") && !what.contains("reference"),
+            "{what}: what's kept went"
+        );
+        assert!(
+            !holds_marker(&output, &streams, "M_GONE"),
+            "{what}: the removed page's image stayed (reported whole: {:?})",
+            summary.removal.resources_left_whole
+        );
+    }
 }

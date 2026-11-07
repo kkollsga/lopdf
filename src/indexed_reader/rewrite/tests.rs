@@ -325,6 +325,7 @@ fn a_write_that_fails_at_any_point_fails_the_rewrite() {
             .unwrap()
             .write_unverified_to(policy, std::io::sink())
             .unwrap()
+            .summary()
             .new_len as usize;
         // The output buffer holds 64 KiB, so a small file only reaches its writer at the end, in one piece.
         for allowed in 0..length {
@@ -382,4 +383,87 @@ fn the_name_search_finds_every_name_wherever_it_is() {
     for name in ["A", "B", "C D", "C#20D", "E", "F", "G\u{FFFD}EI", "H"] {
         assert!(found.iter().any(|known| known == name), "{name} in {found:?}");
     }
+}
+
+/// Past the limit on how many resource dictionaries are listed, the rest used to be skipped without a word, and a removed page's content in one of them
+/// stayed with an empty report. The limit is 64 in this build. Here 70 removed pages each have their own, and the last also shares one with the kept page.
+#[test]
+fn resource_dictionaries_past_the_limit_are_reported() {
+    const PAGES: u32 = 71;
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = std::collections::BTreeMap::new();
+    let mut add = |bytes: &mut Vec<u8>, number: u32, body: String| {
+        offsets.insert(number, bytes.len());
+        bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    };
+    let kids: Vec<String> = (0..PAGES).map(|page| format!("{} 0 R", 100 + page)).collect();
+    add(&mut bytes, 1, "<< /Type /Catalog /Pages 2 0 R >>".to_string());
+    add(
+        &mut bytes,
+        2,
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {PAGES} /MediaBox [0 0 9 9] >>",
+            kids.join(" ")
+        ),
+    );
+    add(&mut bytes, 3, "<< /Shared 4 0 R /Gone 5 0 R >>".to_string());
+    add(
+        &mut bytes,
+        4,
+        "<< /Subtype /Form /BBox [0 0 9 9] /Length 4 >>\nstream\n% ok\nendstream".to_string(),
+    );
+    add(
+        &mut bytes,
+        5,
+        "<< /Subtype /Form /BBox [0 0 9 9] /Length 8 >>\nstream\n% M_GONE\nendstream".to_string(),
+    );
+    add(
+        &mut bytes,
+        6,
+        "<< /Length 10 >>\nstream\n/Shared Do\nendstream".to_string(),
+    );
+    add(
+        &mut bytes,
+        7,
+        "<< /Length 8 >>\nstream\n/Gone Do\nendstream".to_string(),
+    );
+    // The kept page, sharing 3.
+    add(
+        &mut bytes,
+        100,
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /XObject 3 0 R >> >>".to_string(),
+    );
+    for page in 1..PAGES {
+        let resources = if page == PAGES - 1 {
+            "<< /XObject 3 0 R >>".to_string()
+        } else {
+            format!("<< /XObject {} 0 R >>", 1_000 + page)
+        };
+        add(
+            &mut bytes,
+            100 + page,
+            format!("<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources {resources} >>"),
+        );
+        add(&mut bytes, 1_000 + page, "<< /Own 4 0 R >>".to_string());
+    }
+    let xref = bytes.len();
+    let size = offsets.keys().next_back().unwrap() + 1;
+    bytes.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \n").as_bytes());
+    for (number, offset) in &offsets {
+        bytes.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    let reader = IndexedReader::open(crate::source::BytesSource::from(bytes)).unwrap();
+    let mut changes = RewriteChanges::new(&reader).unwrap();
+    for page in 1..PAGES as usize {
+        changes.remove_page(page);
+    }
+    let mut output = Vec::new();
+    let written = changes.write_unverified_to(RewritePolicy::new(), &mut output).unwrap();
+    let report = &written.summary().removal;
+    let still_there = output.windows(6).any(|window| window == b"M_GONE");
+    assert!(
+        !still_there || report.resource_dictionaries_unlisted > 0 || !report.resources_left_whole.is_empty(),
+        "the removed page's content stayed and nothing said so: {report:?}"
+    );
 }

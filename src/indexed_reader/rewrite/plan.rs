@@ -197,7 +197,9 @@ impl Plan<'_> {
                 indices.push(index);
                 continue;
             }
-            let mut parent = self.peek_dict(entry.id.0)?.and_then(|page| page.get(b"Parent").ok().cloned());
+            let mut parent = self
+                .peek_dict(entry.id.0)?
+                .and_then(|page| page.get(b"Parent").ok().cloned());
             let mut seen = HashSet::new();
             while let Some(Object::Reference((number, _))) = parent {
                 if !seen.insert(number) || seen.len() > self.view.options.page_tree_depth {
@@ -207,7 +209,9 @@ impl Plan<'_> {
                     indices.push(index);
                     break;
                 }
-                parent = self.peek_dict(number)?.and_then(|node| node.get(b"Parent").ok().cloned());
+                parent = self
+                    .peek_dict(number)?
+                    .and_then(|node| node.get(b"Parent").ok().cloned());
             }
         }
         // They go through the page removal, which marks them dead again itself.
@@ -957,7 +961,7 @@ impl<'c> Plan<'c> {
 
     /// Follow references from what's queued. Each round goes in the order of the file's object streams, so a stream is decoded
     /// as few times as can be however far apart the references are.
-    fn reach(
+    pub(super) fn reach(
         &mut self, mut frontier: Vec<u32>, mut pruner: Option<&mut Pruner>, hold_back: Option<&[u8]>,
     ) -> RewriteResult<()> {
         while !frontier.is_empty() {
@@ -1008,7 +1012,7 @@ impl<'c> Plan<'c> {
         Ok(())
     }
 
-    fn roots(&mut self) -> RewriteResult<Vec<u32>> {
+    pub(super) fn roots(&mut self) -> RewriteResult<Vec<u32>> {
         self.seen.clear();
         self.live.clear();
         let mut roots = Vec::new();
@@ -1041,26 +1045,8 @@ impl<'c> Plan<'c> {
             return self.reach(roots, None, None);
         };
         const LAYERS: &[u8] = b"OCProperties";
-        let mut pruner = self.start_pruner(&removal)?;
-        // Anything in the shared dictionaries that kept content uses, then whatever else turns up using them.
-        const MAX_ROUNDS: usize = 4;
-        let mut rounds = 0;
-        loop {
-            self.apply_pruner(&mut pruner)?;
-            let roots = self.roots()?;
-            self.reach(roots, Some(&mut pruner), Some(LAYERS))?;
-            if !self.scan_new_users(&mut pruner)? {
-                break;
-            }
-            rounds += 1;
-            if rounds >= MAX_ROUNDS {
-                pruner.give_up();
-                self.apply_pruner(&mut pruner)?;
-                let roots = self.roots()?;
-                self.reach(roots, None, Some(LAYERS))?;
-                break;
-            }
-        }
+        let mut pruner = self.start_pruner(&removal);
+        self.settle_pruning(&mut pruner, LAYERS)?;
         self.finish_pruner(pruner);
 
         // A layer nothing kept can reach goes. Only now is it known what's reachable without the list of layers itself.
