@@ -821,6 +821,75 @@ fn lopdf_last_startxref(bytes: &[u8]) -> Option<u64> {
     text.split_whitespace().next()?.parse().ok()
 }
 
+/// Content a viewer draws with the page's dictionary for lack of its own being missed: an appearance, a Type 3 font's glyphs direct and not, a soft mask, a
+/// tiling pattern, each naming something only it names.
+#[test]
+fn everything_that_falls_back_on_the_page_resources_counts() {
+    let form = "/Subtype /Form /BBox [0 0 9 9]";
+    let bytes = resource_sharing(
+        &[
+            obj(5, "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /AP << /N 6 0 R /D << /On 7 0 R >> >> >>"),
+            deflated(6, form, b"/FromAppearance Do"),
+            deflated(7, form, b"/FromAppearanceState Do"),
+            deflated(10, "", b"BT /T3 1 Tf /T3Direct 1 Tf ET /Mask gs /MaskDirect gs /Tile scn"),
+            deflated(11, "", b"/Secret Do"),
+            obj(20, "<< /Type /Font /Subtype /Type3 /CharProcs << /a 21 0 R >> >>"),
+            deflated(21, "", b"/FromGlyph Do"),
+            deflated(22, "", b"/FromDirectGlyph Do"),
+            obj(23, "<< /Type /ExtGState /SMask << /G 24 0 R >> >>"),
+            deflated(24, form, b"/FromMask Do"),
+            deflated(25, form, b"/FromDirectMask Do"),
+            deflated(26, "/PatternType 1 /BBox [0 0 9 9]", b"/FromPattern Do"),
+            deflated(30, form, b"K_APPEARANCE"),
+            deflated(31, form, b"K_STATE"),
+            deflated(32, form, b"K_GLYPH"),
+            deflated(33, form, b"K_DIRECT_GLYPH"),
+            deflated(34, form, b"K_MASK"),
+            deflated(35, form, b"K_DIRECT_MASK"),
+            deflated(36, form, b"K_PATTERN"),
+            deflated(37, form, b"M_SECRET"),
+        ],
+        "/Resources << /Font << /T3 20 0 R /T3Direct << /Type /Font /Subtype /Type3 /CharProcs << /a 22 0 R >> >> >> \
+         /ExtGState << /Mask 23 0 R /MaskDirect << /SMask << /G 25 0 R >> >> >> /Pattern << /Tile 26 0 R >> \
+         /XObject << /FromAppearance 30 0 R /FromAppearanceState 31 0 R /FromGlyph 32 0 R /FromDirectGlyph 33 0 R \
+         /FromMask 34 0 R /FromDirectMask 35 0 R /FromPattern 36 0 R /Secret 37 0 R >> >>",
+        "/Contents 10 0 R /Annots [5 0 R]",
+        "/Contents 11 0 R",
+    );
+    let (output, summary, _) = rewrite(&bytes, remove_second_page);
+    assert!(summary.removal.resources_left_whole.is_empty());
+    assert_markers(
+        &output,
+        &["M_SECRET"],
+        &["K_APPEARANCE", "K_STATE", "K_GLYPH", "K_DIRECT_GLYPH", "K_MASK", "K_DIRECT_MASK", "K_PATTERN"],
+    );
+}
+
+/// A form's default resources sharing a dictionary with the pages, which fields use by a name in a string that no search of content can see: pruned, the
+/// form's text can't be drawn again. Or /Resources in something direct, which says nothing about what it uses.
+#[test]
+fn what_a_search_cannot_see_keeps_the_dictionary_whole() {
+    for catalog in ["/AcroForm << /Fields [] /DR << /Font 9 0 R >> >>", "/Odd [<< /Resources << /Font 9 0 R >> >>]"] {
+        let mut builder = Builder::new(500);
+        let objects = vec![
+            obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>")),
+            obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>"),
+            obj(3, "<< /Type /Page /Parent 2 0 R /Contents 10 0 R /Resources << /Font 9 0 R >> >>"),
+            obj(4, "<< /Type /Page /Parent 2 0 R /Contents 11 0 R /Resources << /Font 9 0 R >> >>"),
+            obj(9, "<< /Used 20 0 R /Helv 21 0 R >>"),
+            deflated(10, "", b"/Used 1 Tf"),
+            deflated(11, "", b"/Used 1 Tf"),
+            obj(20, "<< /Type /Font /Note (K_USED) >>"),
+            obj(21, "<< /Type /Font /Note (K_BY_DA) >>"),
+        ];
+        builder.place(Form::Table, &objects, 100);
+        builder.finish_revision(Form::Table, "/Root 1 0 R");
+        let (output, summary, _) = rewrite(&builder.bytes, remove_second_page);
+        assert_eq!(summary.removal.resources_left_whole, vec![(9, 0)], "{catalog}");
+        assert_markers(&output, &[], &["K_USED", "K_BY_DA"]);
+    }
+}
+
 /// Resources that can't be searched being pruned anyway, which would break a page, or kept and not said.
 #[test]
 fn content_that_cannot_be_searched_leaves_the_dictionary_whole_and_says_so() {
@@ -1175,6 +1244,27 @@ fn an_object_keeps_its_generation() {
     // The stream form can't compress it, but has to find it just the same.
     let (_, _, after) = rewrite_with(&bytes, RewritePolicy::new().form(RewriteFormChoice::Force(RewriteForm::Stream)), |_| {});
     assert!(after.resolve_object((4, 3)).unwrap().as_dict().unwrap().has(b"Note"));
+}
+
+/// The cross-reference data stating another generation than the object's own header, where a reference matching the header still resolves, in this reader as in
+/// viewers. Believing the table took the object for missing, and with it, in the fuzz case this came from, the document's only page.
+#[test]
+fn an_object_whose_header_disagrees_with_the_table_stays() {
+    let mut builder = Builder::new(500);
+    let objects = vec![
+        obj(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        obj(2, "<< /Type /Pages /Kids [11 0 R] /Count 1 >>"),
+        obj(11, "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /MediaBox [0 0 9 9] >>"),
+        obj(5, "<< /Type /Page /Parent 11 0 R >>"),
+    ];
+    builder.place(Form::Table, &objects, 100);
+    builder.generations.insert(11, 2000);
+    builder.finish_revision(Form::Table, "/Root 1 0 R");
+    assert_eq!(open_bytes(&builder.bytes).page_count().unwrap(), 1);
+    for policy in [RewriteFormChoice::MatchSource, RewriteFormChoice::Force(RewriteForm::Stream)] {
+        let (_, _, after) = rewrite_with(&builder.bytes, RewritePolicy::new().form(policy), |_| {});
+        assert_eq!(after.page_count().unwrap(), 1, "{policy:?}");
+    }
 }
 
 /// A reference that names nothing being kept, where a new object could then get that number and give it a meaning it never had.

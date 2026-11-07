@@ -117,6 +117,9 @@ pub(super) struct Pruner {
     pending: Vec<Search>,
     /// Objects the walk reached that have `/Resources`, to look at next.
     found: BTreeSet<u32>,
+    /// `/DR` anywhere, or `/Resources` inside something that isn't an object of its own, with the object it's in. None of that says what it uses,
+    /// so what it holds has to stay.
+    opaque: Vec<(u32, Object)>,
     decoded: u64,
     decoded_limit: u64,
 }
@@ -124,8 +127,37 @@ pub(super) struct Pruner {
 impl Pruner {
     /// A dictionary the walk reached. If it has `/Resources` in a shared holder, it uses them, which is looked at after the walk.
     pub(super) fn note_reached(&mut self, number: u32, dict: &Dictionary) {
-        if dict.has(b"Resources") && !dict.has_type(b"Pages") && !self.holders.is_empty() {
+        if self.holders.is_empty() {
+            return;
+        }
+        if dict.has(b"Resources") && !dict.has_type(b"Pages") {
             self.found.insert(number);
+        }
+        self.note_opaque(number, dict, true);
+    }
+
+    fn note_opaque(&mut self, number: u32, dict: &Dictionary, top_level: bool) {
+        if let Ok(default_resources) = dict.get(b"DR") {
+            // A form's fields use these by a name in a string, /DA, which no content search can see.
+            self.opaque.push((number, default_resources.clone()));
+        }
+        if !top_level && let Ok(resources) = dict.get(b"Resources") {
+            self.opaque.push((number, resources.clone()));
+        }
+        for (_, value) in dict.iter() {
+            self.note_opaque_value(number, value);
+        }
+    }
+
+    fn note_opaque_value(&mut self, number: u32, value: &Object) {
+        match value {
+            Object::Dictionary(dict) => self.note_opaque(number, dict, false),
+            Object::Array(items) => {
+                for item in items {
+                    self.note_opaque_value(number, item);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -311,6 +343,7 @@ impl Plan<'_> {
             searched: HashSet::new(),
             pending: Vec::new(),
             found: BTreeSet::new(),
+            opaque: Vec::new(),
             decoded: 0,
             decoded_limit: self.view.index.source_len.saturating_mul(SCAN_PER_FILE_BYTE).max(SCAN_ALLOWANCE),
         };
@@ -410,35 +443,36 @@ impl Plan<'_> {
     }
 
     /// Something a used name led to. If it has content that falls back on this scope, or has its own in a holder that matters, queue it.
+    /// A soft mask's group, a Type 3 font's glyphs and an appearance's states can all be direct.
     fn follow(&mut self, value: &Object, scope: &Rc<Vec<Holder>>, pruner: &mut Pruner, depth: usize) -> RewriteResult<()> {
         if depth > 8 {
             return Ok(());
         }
-        let Object::Reference((number, _)) = value else {
-            if let Object::Dictionary(dict) = value {
-                // An appearance's states.
-                for inner in dict.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>() {
-                    self.follow(&inner, scope, pruner, depth + 1)?;
-                }
-            }
-            return Ok(());
+        let (number, loaded) = match value {
+            Object::Reference((number, _)) => match self.peek(*number)? {
+                Some(loaded) => (Some(*number), loaded),
+                None => return Ok(()),
+            },
+            Object::Dictionary(dict) => (None, Loaded::Plain(Object::Dictionary(dict.clone()))),
+            _ => return Ok(()),
         };
-        let number = *number;
-        match self.peek(number)? {
-            Some(Loaded::Stream(dict, _)) => {
+        // What's direct can't be a holder's owner in the sense that matters: it isn't shared.
+        let owner = number.unwrap_or(u32::MAX);
+        match loaded {
+            Loaded::Stream(dict, _) => {
                 let is_form = matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Form");
                 let is_pattern = matches!(dict.get(b"PatternType"), Ok(Object::Integer(1)));
-                let inner_scope = self.content_scope(&dict, number, scope, pruner)?;
+                let inner_scope = self.content_scope(&dict, owner, scope, pruner)?;
                 if (is_form || is_pattern || dict.has(b"BBox")) && !inner_scope.is_empty() {
                     pruner.pending.push(Search {
-                        stream: number,
+                        stream: owner,
                         scope: inner_scope,
                     });
                 }
             }
-            Some(Loaded::Plain(Object::Dictionary(dict))) => {
+            Loaded::Plain(Object::Dictionary(dict)) => {
                 if matches!(dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Type3") {
-                    let inner_scope = self.content_scope(&dict, number, scope, pruner)?;
+                    let inner_scope = self.content_scope(&dict, owner, scope, pruner)?;
                     if !inner_scope.is_empty()
                         && let Some(procs) = self.deref_dict(dict.get(b"CharProcs").ok())?
                     {
@@ -451,18 +485,14 @@ impl Plan<'_> {
                             }
                         }
                     }
-                }
-                if let Some(mask) = self.deref_dict(dict.get(b"SMask").ok())?
-                    && let Ok(group) = mask.get(b"G")
-                {
-                    self.follow(&group.clone(), scope, pruner, depth + 1)?;
-                }
-                // An appearance's states, one more level down.
-                if !dict.has(b"Type") && !dict.has(b"Subtype") {
+                } else if let Some(mask) = self.deref_dict(dict.get(b"SMask").ok())? {
+                    if let Ok(group) = mask.get(b"G") {
+                        self.follow(&group.clone(), scope, pruner, depth + 1)?;
+                    }
+                } else if !dict.has(b"Type") && !dict.has(b"Subtype") {
+                    // An appearance's states, or a graphics state with nothing to follow.
                     for inner in dict.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>() {
-                        if matches!(inner, Object::Reference(_)) {
-                            self.follow(&inner, scope, pruner, depth + 1)?;
-                        }
+                        self.follow(&inner, scope, pruner, depth + 1)?;
                     }
                 }
             }
@@ -573,6 +603,15 @@ impl Plan<'_> {
         }
         let found = std::mem::take(&mut pruner.found);
         let before = pruner.searched.len();
+        let mut grew = false;
+        for (number, resources) in std::mem::take(&mut pruner.opaque) {
+            for holder in self.scope_within(&resources, number, pruner)? {
+                if let Some(state) = pruner.holders.get_mut(&holder) {
+                    grew |= !state.whole;
+                    state.whole = true;
+                }
+            }
+        }
         let mut queue = Vec::new();
         for number in found {
             let Some(loaded) = self.peek(number)? else { continue };
@@ -584,7 +623,6 @@ impl Plan<'_> {
             }
             queue.push((number, loaded, dict, scope));
         }
-        let mut grew = false;
         for (number, loaded, dict, scope) in queue {
             let scope = Rc::new(scope);
             let was_unused = scope.iter().any(|holder| pruner.holders.get(holder).is_some_and(|state| !state.has_user));

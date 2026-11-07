@@ -159,7 +159,7 @@ impl IndexedReader {
     fn look_at(&self, id: crate::ObjectId) -> Option<Object> {
         match self.index.locations.get(&id.0)? {
             ObjectLocation64::Normal { generation, .. } => {
-                let (_, _, parsed) = self.resolve_normal_framed((id.0, *generation)).ok()?;
+                let (_, _, parsed) = self.frame_at_header_generation((id.0, *generation)).1.ok()?;
                 Some(parsed.object)
             }
             ObjectLocation64::Compressed { .. } => self.resolve_object((id.0, 0)).ok(),
@@ -248,7 +248,7 @@ impl IndexedReader {
                 .checked_sub(1)
                 .and_then(|index| starts.get(index));
             let dict = holder.and_then(|(_, number, generation)| {
-                let (_, _, parsed) = self.resolve_normal_framed((*number, *generation)).ok()?;
+                let (_, _, parsed) = self.frame_at_header_generation((*number, *generation)).1.ok()?;
                 parsed.object.as_dict().ok().cloned()
             });
             let in_this_object = dict.as_ref().is_some_and(|dict| {

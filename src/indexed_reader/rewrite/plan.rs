@@ -142,6 +142,8 @@ pub(super) struct Plan<'c> {
     pub(super) edits: HashMap<u32, Loaded>,
     /// Indirect arrays that hold a list, found at the key that names them.
     list_arrays: HashSet<u32>,
+    /// Objects whose own header states another generation than the cross-reference data does. The header is what a reference to one resolves to.
+    header_generations: HashMap<u32, u16>,
     /// Destination names that went, which links and bookmarks may still use.
     pub(super) dead_names: HashSet<Vec<u8>>,
     pub(super) report: RemovalReport,
@@ -150,6 +152,22 @@ pub(super) struct Plan<'c> {
     containers: Containers,
     work: u64,
     work_limit: u64,
+}
+
+impl IndexedReader {
+    /// Frame a normal object by its number. The cross-reference data's generation can disagree with the object's own header, and a reference
+    /// matching the header still resolves, as it does in viewers. So the header is what's believed, and what's returned. Any other failure comes back as it was.
+    pub(super) fn frame_at_header_generation(
+        &self, id: crate::ObjectId,
+    ) -> (crate::ObjectId, IndexedReaderResult<(u64, u64, ParsedObject)>) {
+        match self.resolve_normal_framed(id) {
+            Err(IndexedReaderError::MissingNormalObjectAtXref {
+                reason: MissingNormalObjectReason::GenerationMismatch { actual, .. },
+                ..
+            }) if actual.0 == id.0 => (actual, self.resolve_normal_framed(actual)),
+            other => (id, other),
+        }
+    }
 }
 
 /// Whether what a rewrite would break is allowed to break. The bytes of a signed file never change, whatever is asked for.
@@ -212,6 +230,7 @@ impl<'c> Plan<'c> {
             seen: Bits::new(capacity),
             edits: HashMap::new(),
             list_arrays: HashSet::new(),
+            header_generations: HashMap::new(),
             dead_names: HashSet::new(),
             report: RemovalReport::default(),
             signatures,
@@ -271,8 +290,9 @@ impl<'c> Plan<'c> {
         match self.objects.get(&number) {
             Some(Change::Object { generation, .. } | Change::Stream { generation, .. }) => *generation,
             Some(Change::Reserved) => 0,
-            None => match self.view.index.locations.get(&number) {
-                Some(ObjectLocation64::Normal { generation, .. }) => *generation,
+            None => match (self.header_generations.get(&number), self.view.index.locations.get(&number)) {
+                (Some(generation), _) => *generation,
+                (None, Some(ObjectLocation64::Normal { generation, .. })) => *generation,
                 _ => 0,
             },
         }
@@ -387,7 +407,11 @@ impl<'c> Plan<'c> {
                 source: Box::new(other),
             },
         };
-        let (body_offset, source_len, parsed) = match self.view.resolve_normal_framed(id) {
+        let (id, framed) = self.view.frame_at_header_generation(id);
+        if id.1 != self.generation(id.0) {
+            self.header_generations.insert(id.0, id.1);
+        }
+        let (body_offset, source_len, parsed) = match framed {
             Ok(framed) => framed,
             // The entry names nothing. Everyone reads that as null.
             Err(IndexedReaderError::MissingNormalObject { .. } | IndexedReaderError::MissingNormalObjectAtXref { .. }) => {
