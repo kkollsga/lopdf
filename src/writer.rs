@@ -691,9 +691,20 @@ impl Writer {
                 let octal = |byte: u8| style.ascii && !is_ascii_text(byte);
                 let mut escape_indice = Vec::new();
                 let mut parentheses = Vec::new();
+                // Pairs nested past what the parsers read, which go out escaped. Left bare, the
+                // string would be written fine and never read again.
+                let mut too_deep = 0_usize;
                 for (index, &byte) in text.iter().enumerate() {
                     match byte {
+                        b'(' if parentheses.len() >= crate::reader::MAX_BRACKET => {
+                            too_deep += 1;
+                            escape_indice.push(index);
+                        }
                         b'(' => parentheses.push(index),
+                        b')' if too_deep > 0 => {
+                            too_deep -= 1;
+                            escape_indice.push(index);
+                        }
                         b')' => {
                             if !parentheses.is_empty() {
                                 parentheses.pop();

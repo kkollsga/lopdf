@@ -51,8 +51,9 @@ const MAX_OBJECT_NUMBER: u32 = 4 * 1_024 * 1_024;
 const MAX_UPDATE_OBJECTS: usize = 500_000;
 /// A classic table's offset field is 10 digits.
 const MAX_TABLE_OFFSET: u64 = 9_999_999_999;
-/// Nesting allowed in an object, the same as the parser's own.
-const MAX_OBJECT_DEPTH: usize = 100;
+/// Arrays and dictionaries one object can nest and still be read back: one less than the parser's limit,
+/// which it reaches at the 100th level.
+const MAX_OBJECT_CONTAINERS: usize = crate::reader::MAX_BRACKET - 1;
 /// What's dropped from the old trailer: entries this update states again, and entries that describe
 /// the old section's own stream rather than the document.
 const TRAILER_KEYS_NOT_CARRIED: [&[u8]; 13] = [
@@ -70,6 +71,9 @@ const TRAILER_KEYS_NOT_CARRIED: [&[u8]; 13] = [
     b"FFilter",
     b"FDecodeParms",
 ];
+
+/// Trailer entries an update may set to something new, so they aren't compared with the old trailer.
+const TRAILER_KEYS_AN_UPDATE_SETS: [&[u8]; 3] = [b"Root", b"Info", b"ID"];
 
 /// Result of an append operation.
 pub type AppendResult<T> = std::result::Result<T, AppendError>;
@@ -218,8 +222,9 @@ impl IndexedReader {
     /// before this passes.
     ///
     /// Compares every original byte, in small pieces. Checks that the new file's chain starts at
-    /// the update and reaches the old one, that every object written is where the summary says, and
-    /// that every other object is exactly where it was.
+    /// the update and reaches the old one, that its trailer carries what the old one had, that every
+    /// object written is where the summary says and parses, and that every other object is exactly
+    /// where it was. A written stream's data isn't read, only its dictionary and framing.
     ///
     /// # Errors
     ///
@@ -263,6 +268,25 @@ impl IndexedReader {
             return failed("/Size is wrong");
         }
 
+        // A carried trailer entry has to come through unchanged. The trailer is what every reader starts
+        // from, and one entry it can't read costs the whole file.
+        for (key, value) in self.index.trailer.iter() {
+            if !TRAILER_KEYS_NOT_CARRIED.contains(&key.as_slice())
+                && !TRAILER_KEYS_AN_UPDATE_SETS.contains(&key.as_slice())
+                && index.trailer.get(key).ok() != Some(value)
+            {
+                return failed("a trailer entry changed");
+            }
+        }
+        if let Ok(Object::Array(before)) = self.index.trailer.get(b"ID")
+            && matches!(before.as_slice(), [Object::String(..), Object::String(..)])
+        {
+            let now = index.trailer.get(b"ID").and_then(Object::as_array);
+            if now.map(|now| now.first()).ok().flatten() != before.first() {
+                return failed("the permanent /ID changed");
+            }
+        }
+
         let mut written = BTreeMap::new();
         for object in &summary.objects {
             let found = index.locations.get(&object.id.0);
@@ -283,6 +307,9 @@ impl IndexedReader {
             if probe != header.as_bytes() {
                 return failed("an object's header isn't at its offset");
             }
+            if !reader.written_object_parses(object.id) {
+                return failed("an object that was written can't be read back");
+            }
             written.insert(object.id.0, ());
         }
         for (number, location) in &self.index.locations {
@@ -302,6 +329,16 @@ impl IndexedReader {
             return failed("/Root no longer resolves");
         }
         Ok(reader)
+    }
+
+    /// Whether a reader gets a whole object back. A stream's dictionary and framing are parsed and its
+    /// data isn't read, so this costs at most one object's parsing window, however large the stream.
+    fn written_object_parses(&self, id: crate::ObjectId) -> bool {
+        match self.resolve_stream_descriptor(id) {
+            Ok(stream) => matches!(stream.encoded_length(), EncodedStreamLength::Known(_)),
+            Err(IndexedStreamReadError::NotStream { .. }) => self.resolve_object(id).is_ok(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -902,7 +939,8 @@ fn runs(entries: &BTreeMap<u32, Pending>) -> Vec<Run> {
 /// Refuse what the serializer would write as something a reader takes differently, or can't read.
 fn check_object(id: crate::ObjectId, object: &Object, depth: usize, top_level: bool) -> AppendResult<()> {
     let invalid = |reason| Err(AppendError::InvalidObject { id, reason });
-    if depth > MAX_OBJECT_DEPTH {
+    let is_container = matches!(object, Object::Array(_) | Object::Dictionary(_) | Object::Stream(_));
+    if is_container && depth >= MAX_OBJECT_CONTAINERS {
         return invalid("it nests too deeply");
     }
     match object {

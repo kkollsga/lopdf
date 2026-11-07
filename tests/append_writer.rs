@@ -561,6 +561,190 @@ fn hostile_text_stays_inside_its_token() {
     assert_eq!(after.trailer_entry_raw_owned(b"Root"), Some(Object::Reference((1, 0))));
 }
 
+fn string_object(text: &[u8], format: StringFormat) -> Object {
+    let mut dict = Dictionary::new();
+    dict.set("S", Object::String(text.to_vec(), format));
+    Object::Dictionary(dict)
+}
+
+/// A string nested past the parser's 100 levels being written bare: `finish`, the check and the rename all
+/// passed, and the object could then never be read, which on a page or a form loses it for good.
+#[test]
+fn a_string_nested_past_the_parsers_limit_still_reads_back() {
+    let reader = open(&classic_pdf());
+    for depth in [99, 100, 101, 102, 1_000, 100_000] {
+        let mut text = vec![b'('; depth];
+        text.extend(std::iter::repeat_n(b')', depth));
+        let mut output = Vec::new();
+        let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+        let added = writer.add_object(&string_object(&text, StringFormat::Literal)).unwrap();
+        let summary = writer.finish().unwrap();
+        let after = reader
+            .verify_appended(Arc::new(BytesSource::from(output.clone())), &summary)
+            .unwrap_or_else(|error| panic!("depth {depth}: {error}"));
+        let read = after.resolve_object(added.id).unwrap();
+        assert_eq!(
+            read.as_dict().unwrap().get(b"S").unwrap().as_str().unwrap(),
+            text,
+            "depth {depth}"
+        );
+        let eager = Document::load_mem(&output).unwrap();
+        let read = eager.get_object(added.id).unwrap().as_dict().unwrap();
+        assert_eq!(
+            read.get(b"S").unwrap().as_str().unwrap(),
+            text,
+            "depth {depth}, eager reader"
+        );
+    }
+}
+
+/// A hostile `/ID` that only parses because its parentheses are escaped. Carried into the new trailer bare,
+/// it made a file no reader could open, and plain `finish` called that a success.
+#[test]
+fn a_hostile_id_doesnt_make_a_file_that_cant_be_opened() {
+    let permanent = format!("({}{})", "\\(".repeat(101), "\\)".repeat(101));
+    let mut pdf = Pdf::base();
+    let xref = pdf.table(&format!("<< /Size 6 /Root 1 0 R /ID [{permanent} <CCDD>] >>"));
+    let bytes = pdf.finish(xref);
+    let reader = open(&bytes);
+    let (output, summary, added) = small_update(&reader);
+    let after = reader
+        .verify_appended(Arc::new(BytesSource::from(output)), &summary)
+        .unwrap();
+    assert!(!after.index_stats().unwrap().recovered());
+    assert!(after.resolve_object(added).is_ok());
+    let id = after.trailer_entry_raw_owned(b"ID").unwrap();
+    assert_eq!(
+        id.as_array().unwrap()[0],
+        reader.trailer_entry_raw_owned(b"ID").unwrap().as_array().unwrap()[0]
+    );
+}
+
+/// The serializer and the parsers disagreeing on any string, which `verify_appended` can't see if the result
+/// still parses. Seeded, and heavy on the bytes that need escaping.
+#[test]
+fn any_string_or_name_reads_back_as_it_was_written() {
+    let mut random = Random(0xFACE);
+    let alphabet = b"()()()\\\\\\\r\n\t %<>/#[]{}\0\xFFab0";
+    let reader = open(&classic_pdf());
+    for round in 0..400 {
+        let length = random.below(if round % 16 == 0 { 2_000 } else { 64 }) as usize;
+        let text: Vec<u8> = (0..length)
+            .map(|_| alphabet[random.below(alphabet.len() as u64) as usize])
+            .collect();
+        let name: Vec<u8> = text.iter().copied().filter(|byte| *byte != 0).collect();
+        let mut dict = Dictionary::new();
+        dict.set("Literal", Object::String(text.clone(), StringFormat::Literal));
+        dict.set("Hex", Object::String(text.clone(), StringFormat::Hexadecimal));
+        dict.set("Name", Object::Name(name.clone()));
+        let mut output = Vec::new();
+        let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+        let added = writer.add_object(&Object::Dictionary(dict)).unwrap();
+        let summary = writer.finish().unwrap();
+        let after = reader
+            .verify_appended(Arc::new(BytesSource::from(output)), &summary)
+            .unwrap_or_else(|error| panic!("{text:?}: {error}"));
+        let read = after.resolve_object(added.id).unwrap();
+        let read = read.as_dict().unwrap();
+        assert_eq!(read.get(b"Literal").unwrap().as_str().unwrap(), text);
+        assert_eq!(read.get(b"Hex").unwrap().as_str().unwrap(), text);
+        assert_eq!(read.get(b"Name").unwrap().as_name().unwrap(), name);
+    }
+}
+
+/// An object nested just past what the parser reads being accepted, then lost. Every depth around the limit is
+/// either refused before it reaches the file, or reads back.
+#[test]
+fn an_object_nested_near_the_limit_is_refused_or_reads_back() {
+    let reader = open(&classic_pdf());
+    for shape in ["mixed", "arrays", "dictionaries"] {
+        let mut accepted = 0;
+        let mut refused = 0;
+        for depth in 90..=110 {
+            let mut object = Object::Integer(1);
+            for level in 0..depth {
+                let array = match shape {
+                    "mixed" => level % 2 == 0,
+                    other => other == "arrays",
+                };
+                object = if array {
+                    Object::Array(vec![object])
+                } else {
+                    Object::Dictionary(dictionary! { "K" => object })
+                };
+            }
+            let mut output = Vec::new();
+            let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+            match writer.add_object(&object) {
+                Err(AppendError::InvalidObject { .. }) => refused += 1,
+                Err(error) => panic!("{shape} {depth}: {error}"),
+                Ok(added) => {
+                    let summary = writer.finish().unwrap();
+                    let after = reader
+                        .verify_appended(Arc::new(BytesSource::from(output)), &summary)
+                        .unwrap_or_else(|error| panic!("{shape} {depth}: {error}"));
+                    assert!(after.resolve_object(added.id).is_ok(), "{shape} {depth}");
+                    accepted += 1;
+                }
+            }
+        }
+        assert!(
+            accepted > 0 && refused > 0,
+            "{shape}: the limit isn't between 90 and 110, so this checked nothing"
+        );
+    }
+}
+
+/// A check that only looks at headers: an object whose header is fine and whose body can't be parsed has to fail
+/// it, or a bad update replaces a good file.
+#[test]
+fn the_verifier_catches_an_object_that_doesnt_parse() {
+    let reader = open(&classic_pdf());
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    let added = writer
+        .add_object(&Object::Dictionary(dictionary! { "Kept" => 1 }))
+        .unwrap();
+    let summary = writer.finish().unwrap();
+    assert!(
+        reader
+            .verify_appended(Arc::new(BytesSource::from(output.clone())), &summary)
+            .is_ok()
+    );
+
+    let start = added.offset as usize;
+    let at = start + output[start..].windows(2).position(|pair| pair == b">>").unwrap();
+    output[at..at + 2].copy_from_slice(b"{{");
+    let result = reader.verify_appended(Arc::new(BytesSource::from(output)), &summary);
+    assert!(matches!(result.err(), Some(AppendError::VerificationFailed { reason }) if reason.contains("read back")),);
+}
+
+/// A large stream being read whole to verify it: the data stays on disk, and only its framing is parsed.
+#[test]
+fn the_verifier_checks_a_stream_without_reading_its_data() {
+    let reader = open(&classic_pdf());
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    let body = vec![7_u8; 8 * 1_024 * 1_024];
+    let id = writer.allocate().unwrap();
+    writer
+        .write_stream_from(id, &Dictionary::new(), body.len() as u64, &mut body.as_slice())
+        .unwrap();
+    let summary = writer.finish().unwrap();
+    let previous = summary.previous_len;
+    let source = Arc::new(CountingSource {
+        inner: BytesSource::from(output),
+        largest_read: AtomicU64::new(0),
+        total_read: AtomicU64::new(0),
+    });
+    reader.verify_appended(source.clone(), &summary).unwrap();
+    let read = source.total_read.load(Ordering::Relaxed);
+    assert!(
+        read < previous + 2 * 1_024 * 1_024,
+        "the check read {read} bytes of a file with an 8 MiB stream"
+    );
+}
+
 /// Objects with no valid PDF spelling reaching the file, or bad numbers quietly shadowing real objects.
 #[test]
 fn a_caller_mistake_is_refused_before_it_reaches_the_file() {
