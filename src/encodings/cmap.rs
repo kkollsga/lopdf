@@ -123,7 +123,17 @@ impl ToUnicodeCMap {
     /// A key whose leading byte isn't zero can't be one of those, so the CMap means what it says: such files do show several
     /// bytes per code, and text is lost if they're split. Those mappings stay, with the codespace that goes with them. A byte that
     /// begins one is left to it, unless the CMap maps that byte on its own, and takes nothing from `fallback`.
-    pub(crate) fn for_simple_font(&self, mut fallback: impl FnMut(u8) -> Option<Vec<u16>>) -> ToUnicodeCMap {
+    pub(crate) fn for_simple_font(&self, fallback: impl FnMut(u8) -> Option<Vec<u16>>) -> ToUnicodeCMap {
+        let mut cmap = self.for_simple_font_forward_only(fallback);
+        cmap.build_reverse_map();
+        cmap
+    }
+
+    /// [`Self::for_simple_font`] without the reverse map, for reading text only. The reverse map enumerates every code a range
+    /// covers, which a compact range in a hostile file can make billions.
+    pub(crate) fn for_simple_font_forward_only(
+        &self, mut fallback: impl FnMut(u8) -> Option<Vec<u16>>,
+    ) -> ToUnicodeCMap {
         let mut cmap = Self::new();
         for (index, ranges) in self.bf_ranges.iter().enumerate().skip(1) {
             let leading_byte_shift = 8 * index;
@@ -151,7 +161,6 @@ impl ToUnicodeCMap {
         } else {
             cmap.codespace_ranges.push((0x00, 0xFF, 1));
         }
-        cmap.build_reverse_map();
         cmap
     }
 

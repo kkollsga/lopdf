@@ -159,9 +159,44 @@ impl OwnedEncoding {
     /// reverse Unicode-to-source map. The reverse map is unnecessary for
     /// [`Self::write_to_string`] and can otherwise enumerate every source code covered by a
     /// compact `bfrange`.
+    ///
+    /// This reads the CMap as it stands, which is right for a `Type0` font. For a simple font, use
+    /// [`Self::for_simple_font_text`].
     pub fn from_to_unicode_for_extraction(content: Vec<u8>) -> Result<Self> {
         Ok(Self {
             kind: OwnedEncodingKind::UnicodeMap(ToUnicodeCMap::parse_forward_only(content)?),
+        })
+    }
+
+    /// The encoding that turns a **simple font's** character codes into text, reading its `/ToUnicode` first and its `/Encoding` for
+    /// the codes the CMap leaves out, as ISO 32000-1, 9.10.2 orders them. It reads text exactly as
+    /// [`Dictionary::get_font_encoding`](crate::Dictionary::get_font_encoding) does for such a font.
+    ///
+    /// `to_unicode` is the decoded bytes of the font's `/ToUnicode` stream. `font_encoding` is what the font's `/Encoding` says: `None`
+    /// if it has none, and [`Self::standard`] if it has one that can't be read, which is `Document`'s rule.
+    ///
+    /// **Only for a font whose `/Subtype` is `Type1`, `MMType1`, `TrueType` or `Type3`.** A simple font's codes are one byte, so a key such as
+    /// `<0041>` means the code 0x41 here. For a `Type0` font, whose codes really can be that wide, use
+    /// [`Self::from_to_unicode_for_extraction`], which reads the CMap as it stands.
+    ///
+    /// **This decides the text, and `/Encoding` decides the glyph that's drawn.** They're meant to agree, but nothing makes them, so on a
+    /// hostile file a page can show one thing and read as another. That's what the file says and isn't an error here: a caller who
+    /// needs to know can decode with both and compare.
+    ///
+    /// The result is for reading only, and costs no reverse map, so a compact range in a hostile CMap stays cheap.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the CMap can't be parsed. `Document` then uses `/Encoding` alone, and a caller should too.
+    pub fn for_simple_font_text(to_unicode: Vec<u8>, font_encoding: Option<&OwnedEncoding>) -> Result<Self> {
+        let cmap = ToUnicodeCMap::parse_forward_only(to_unicode)?;
+        let cmap = cmap.for_simple_font_forward_only(|code| {
+            let mut text = String::new();
+            font_encoding?.write_to_string(&[code], &mut text).ok()?;
+            Some(text.encode_utf16().collect())
+        });
+        Ok(Self {
+            kind: OwnedEncodingKind::UnicodeMap(cmap),
         })
     }
 
