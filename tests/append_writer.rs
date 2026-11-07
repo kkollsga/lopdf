@@ -2466,7 +2466,9 @@ mod atomic {
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         child.wait().unwrap();
         let dead = child.id();
-        let alive = std::os::unix::process::parent_id();
+        // A process certainly alive, and pid 1, which is alive but belongs to another user.
+        let mut sleeper = std::process::Command::new("/bin/sleep").arg("120").spawn().unwrap();
+        let alive = sleeper.id();
         let old = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
         let put = |name: String, aged: bool| {
             let path = dir.path().join(name);
@@ -2486,6 +2488,9 @@ mod atomic {
         let mut kept = vec![
             format!("{other_prefix}{dead}-0.tmp"),
             format!("{prefix}{alive}-0.tmp"),
+            format!("{prefix}1-0.tmp"),
+            format!("{prefix}0-0.tmp"),
+            format!("{prefix}4294967297-0.tmp"),
             format!("{prefix}{dead}-0.tmp2"),
             format!("{prefix}{dead}-x.tmp"),
             format!("{prefix}x-0.tmp"),
@@ -2515,6 +2520,8 @@ mod atomic {
             add_one,
         )
         .unwrap();
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
 
         let now = entries(dir.path());
         assert!(!now.contains(&stale), "the dead process's temporary is still there");

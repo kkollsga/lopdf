@@ -1317,9 +1317,9 @@ const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(
 /// Folder entries one sweep looks at, so a huge folder can't make a save slow.
 #[cfg(unix)]
 const MAX_SWEEP_ENTRIES: usize = 65_536;
-/// Files one sweep removes.
+/// Processes one sweep asks about, each a spawned `ps`, so that a folder of planted names can't make a save spawn thousands.
 #[cfg(unix)]
-const MAX_SWEPT_FILES: usize = 16;
+const MAX_SWEEP_PROBES: usize = 16;
 
 #[cfg(any(unix, windows))]
 fn folder_of(target: &std::path::Path) -> &std::path::Path {
@@ -1345,16 +1345,30 @@ fn temporary_prefix(target: &std::path::Path) -> String {
     prefix
 }
 
-/// The process number in a temporary name for this target. Anything but exactly `<prefix><pid>-<attempt>.tmp` is `None`.
+/// The process number in a temporary name for this target. Anything but exactly `<prefix><pid>-<attempt>.tmp`, with a number that
+/// could be a process, is `None`.
 #[cfg(unix)]
 fn temporary_owner(name: &str, prefix: &str) -> Option<u32> {
     let (process, attempt) = name.strip_prefix(prefix)?.strip_suffix(".tmp")?.split_once('-')?;
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    if digits(process) && digits(attempt) {
-        process.parse().ok()
-    } else {
-        None
+    if !digits(process) || !digits(attempt) {
+        return None;
     }
+    let process: u32 = process.parse().ok()?;
+    (process > 0 && i32::try_from(process).is_ok()).then_some(process)
+}
+
+/// Whether a process exists, by asking `/bin/ps`, since the crate forbids the unsafe call. `None` if the tool can't be run.
+#[cfg(unix)]
+fn process_exists(process: u32) -> Option<bool> {
+    let status = std::process::Command::new("/bin/ps")
+        .args(["-p", &process.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    Some(status.success())
 }
 
 /// Remove our own temporary names that are links to the target itself. A crash just after a Save As moved a file into place can
@@ -1382,17 +1396,18 @@ fn clear_leftover_links(target: &std::path::Path, target_metadata: &std::fs::Met
     }
 }
 
-/// Remove what a crash left: temporary files for this same target, by this same user, from a process that's gone, and over
-/// an hour old. Only a regular file whose name fits the pattern exactly is ever touched, and any doubt leaves it alone,
-/// since a leftover costs some disk and a wrong removal costs a save in progress. Whether a process is alive is asked of
-/// `/bin/kill`, as the crate forbids the unsafe call, and only when a candidate has been found, which is rare.
+/// Remove what a crash left: temporary files for this same target, by this same user, from a process that's gone, and over an hour
+/// old. Only a regular file whose name fits the pattern exactly is ever touched, and any doubt leaves it alone, since a leftover costs
+/// some disk and a wrong removal costs a save in progress. `ps` only says "gone" for a number it can look at, whoever owns the process,
+/// and it's first asked about this process, so a tool that can't answer is never taken for an answer. Returns how many processes it asked
+/// about, which only happens once a candidate has been found, and that's rare.
 #[cfg(unix)]
-fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32) {
+fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32) -> usize {
     use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(folder) else {
-        return;
+        return 0;
     };
-    let mut swept = 0;
+    let mut probes = 0;
     for entry in entries.take(MAX_SWEEP_ENTRIES).flatten() {
         let name = entry.file_name();
         let Some(process) = name.to_str().and_then(|name| temporary_owner(name, prefix)) else {
@@ -1412,19 +1427,18 @@ fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32
         if !metadata.is_file() || metadata.uid() != own_user || !old_enough {
             continue;
         }
-        let alive = std::process::Command::new("/bin/kill")
-            .args(["-0", &process.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        // A tool that can't be run says nothing about the process.
-        if matches!(alive, Ok(status) if !status.success()) && std::fs::remove_file(entry.path()).is_ok() {
-            swept += 1;
-            if swept == MAX_SWEPT_FILES {
-                return;
-            }
+        if probes == 0 && process_exists(std::process::id()) != Some(true) {
+            return 0;
+        }
+        if probes == MAX_SWEEP_PROBES {
+            return probes;
+        }
+        probes += 1;
+        if process_exists(process) == Some(false) {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
+    probes
 }
 
 #[cfg(any(unix, windows))]
@@ -1575,6 +1589,60 @@ mod tests {
             Err(AppendError::Abandoned)
         ));
         assert!(matches!(writer.finish(), Err(AppendError::Abandoned)));
+    }
+
+    /// A folder of planted names making one save spawn a process for each: 65,536 of them used to mean 65,536 spawns.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_asks_about_a_limited_number_of_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut alive = std::process::Command::new("/bin/sleep").arg("120").spawn().unwrap();
+        let prefix = temporary_prefix(std::path::Path::new("doc.pdf"));
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+        for attempt in 0..40 {
+            let path = dir.path().join(format!("{prefix}{}-{attempt}.tmp", alive.id()));
+            std::fs::write(&path, b"planted").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        use std::os::unix::fs::MetadataExt;
+        let own_user = std::fs::metadata(dir.path()).unwrap().uid();
+        let probes = sweep_stale_temporaries(dir.path(), &prefix, own_user);
+        alive.kill().unwrap();
+        alive.wait().unwrap();
+        assert_eq!(probes, MAX_SWEEP_PROBES);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            40,
+            "a live process's files were removed"
+        );
+    }
+
+    /// A number that can't be a process being probed, or taken as gone: `ps -p 0` and a number past `pid_t` say nothing useful.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_number_that_could_be_a_process_counts_as_one() {
+        let prefix = ".append-0123456789abcdef-";
+        assert_eq!(temporary_owner(&format!("{prefix}123-0.tmp"), prefix), Some(123));
+        assert_eq!(temporary_owner(&format!("{prefix}0-0.tmp"), prefix), None);
+        assert_eq!(
+            temporary_owner(&format!("{prefix}2147483647-0.tmp"), prefix),
+            Some(2_147_483_647)
+        );
+        assert_eq!(temporary_owner(&format!("{prefix}2147483648-0.tmp"), prefix), None);
+        assert_eq!(temporary_owner(&format!("{prefix}99999999999-0.tmp"), prefix), None);
+    }
+
+    /// A process owned by someone else being taken as gone, because `kill -0` fails on those too: its file was in use.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_of_another_user_exists() {
+        assert_eq!(process_exists(1), Some(true));
+        assert_eq!(process_exists(std::process::id()), Some(true));
     }
 
     /// The temporary name surviving a power cut because its removal came after the folder sync, which left it as a second link that
