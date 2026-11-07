@@ -357,6 +357,8 @@ pub struct RewriteSummary {
     pub objects_dropped: u64,
     /// Stream data copied without being decoded, in bytes.
     pub stream_bytes_copied: u64,
+    /// Objects whose entry in the original's cross-reference data pointed a little off, and that were found nearby, as a viewer that rebuilds finds them.
+    pub objects_found_near_their_offset: u64,
     /// Bytes parsed and inflated to plan the file, which the rewrite's work allowance is counted in. Content decoded to search for names
     /// counts separately, against its own.
     pub bytes_examined: u64,

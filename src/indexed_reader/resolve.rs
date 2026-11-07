@@ -1771,7 +1771,7 @@ impl IndexedReader {
 }
 
 impl IndexedReader {
-    fn resolve_body_frame(
+    pub(super) fn resolve_body_frame(
         &self, id: crate::ObjectId, body_offset: u64, source_len: u64,
     ) -> IndexedReaderResult<ParsedObject> {
         let remaining = source_len.checked_sub(body_offset).ok_or(SourceError::OutOfBounds {

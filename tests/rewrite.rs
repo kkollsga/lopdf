@@ -2781,9 +2781,7 @@ fn the_page_count_is_checked_whatever_changed() {
     changes.remove_page(1);
     let mut output = Vec::new();
     let written = changes.write_unverified_to(RewritePolicy::new(), &mut output).unwrap();
-    let damaged = String::from_utf8_lossy(&output)
-        .replace("/Count 1", "/Count 2")
-        .into_bytes();
+    let damaged = replace_bytes(&output, b"/Count 1", b"/Count 2");
     assert!(matches!(
         written.verify(&reader, std::sync::Arc::new(BytesSource::from(damaged))),
         Err(RewriteError::VerificationFailed { .. })
@@ -3165,4 +3163,49 @@ fn what_the_document_keeps_of_its_own_is_reported() {
     let identity = rewrite(&bytes, |_| {}).1;
     assert_eq!(identity.document_data_kept.embedded_files, 1);
     assert!(identity.document_data_kept.xfa);
+}
+
+fn replace_bytes(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let at = find(bytes, from).expect("there's something to replace");
+    let mut replaced = bytes[..at].to_vec();
+    replaced.extend_from_slice(to);
+    replaced.extend_from_slice(&bytes[at + from.len()..]);
+    replaced
+}
+
+/// A kept page's content whose cross-reference offset is a few bytes off: viewers that rebuild find it and show it, and the rewrite dropped it as missing,
+/// leaving the page blank. It's found where it is now. One that isn't anywhere near is refused, not dropped.
+#[test]
+fn an_object_a_little_off_its_offset_is_found_and_one_nowhere_is_refused() {
+    let filler = vec![b'x'; 20_000];
+    let bytes = two_pages(
+        "",
+        &[deflated(5, "", b"(K_FOUND) Tj"), raw_stream(6, "", &filler)],
+        "/Contents 5 0 R",
+        "",
+    );
+    let at = find(&bytes, b"5 0 obj").unwrap();
+    let entry = format!("{at:010} 00000 n");
+    let off = format!("{:010} 00000 n", at + 3);
+    let shifted = replace_bytes(&bytes, entry.as_bytes(), off.as_bytes());
+    assert!(
+        open_bytes(&shifted).resolve_object((5, 0)).is_err(),
+        "the reader itself doesn't look nearby"
+    );
+    let (output, summary, after) = rewrite(&shifted, |_| {});
+    assert_eq!(summary.objects_found_near_their_offset, 1);
+    assert!(after.resolve_object((5, 0)).is_ok());
+    assert_markers(&output, &[], &["K_FOUND"]);
+
+    // In the middle of the filler, far from any header.
+    let far = find(&bytes, b"6 0 obj").unwrap() + 10_000;
+    let nowhere = replace_bytes(&bytes, entry.as_bytes(), format!("{far:010} 00000 n").as_bytes());
+    let reader = open_bytes(&nowhere);
+    let refused = RewriteChanges::new(&reader)
+        .unwrap()
+        .write_unverified_to(RewritePolicy::new(), std::io::sink());
+    assert!(
+        matches!(refused, Err(RewriteError::UnreadableObject { id: (5, 0), .. })),
+        "{refused:?}"
+    );
 }

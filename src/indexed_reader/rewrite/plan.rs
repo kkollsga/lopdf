@@ -205,6 +205,8 @@ pub(super) struct Plan<'c> {
     header_generations: HashMap<u32, u16>,
     /// Destination names that went, which links and bookmarks may still use.
     pub(super) dead_names: HashSet<Vec<u8>>,
+    /// Objects found near where their entry said, not at it.
+    pub(super) relocated: u64,
     /// Where each page of the original is in the new file, when pages are removed: for a destination given as a page's position.
     pub(super) page_positions: Option<Vec<Option<i64>>>,
     pub(super) report: RemovalReport,
@@ -412,6 +414,7 @@ impl<'c> Plan<'c> {
             list_arrays: HashSet::new(),
             header_generations: HashMap::new(),
             dead_names: HashSet::new(),
+            relocated: 0,
             page_positions: None,
             report: RemovalReport::default(),
             unsigned: !signatures.is_empty(),
@@ -647,12 +650,16 @@ impl<'c> Plan<'c> {
         }
         let (body_offset, source_len, parsed) = match framed {
             Ok(framed) => framed,
-            // The entry names nothing. Everyone reads that as null.
-            Err(
-                IndexedReaderError::MissingNormalObject { .. } | IndexedReaderError::MissingNormalObjectAtXref { .. },
-            ) => {
-                return Ok(None);
-            }
+            // The entry's offset doesn't hold the object. A viewer that rebuilds finds it nearby, if it's there, and shows it; so does
+            // this. One that isn't anywhere near is refused when it's reached, which a load is: what can't be found isn't quietly dropped.
+            Err(error @ IndexedReaderError::MissingNormalObjectAtXref { .. }) => match self.frame_nearby(id)? {
+                Some(framed) => {
+                    self.relocated += 1;
+                    framed
+                }
+                None => return Err(unreadable(error)),
+            },
+            Err(IndexedReaderError::MissingNormalObject { .. }) => return Ok(None),
             Err(error) => return Err(unreadable(error)),
         };
         self.charge(u64::try_from(parsed.consumed).unwrap_or(u64::MAX))?;
@@ -717,6 +724,53 @@ impl<'c> Plan<'c> {
                 .stream_by_scanning(id, dictionary, stream_start, source_len)
                 .map(Some),
             Ok(FramedStreamMetadata::Scalar(object)) => Ok(Some(Loaded::Plain(object))),
+        }
+    }
+
+    /// Look for an object's header within a few KiB of where its entry says it is, the way a viewer that rebuilds would find it, and frame it there.
+    fn frame_nearby(&mut self, id: crate::ObjectId) -> RewriteResult<Option<(u64, u64, ParsedObject)>> {
+        const WINDOW: u64 = 4 * 1_024;
+        let Some(ObjectLocation64::Normal { offset, .. }) = self.view.index.locations.get(&id.0).cloned() else {
+            return Ok(None);
+        };
+        let source_len = self.view.index.source_len;
+        let center = self.view.index.source_origin.saturating_add(offset).min(source_len);
+        let start = center.saturating_sub(WINDOW);
+        let window = self
+            .view
+            .source
+            .read_range(start, (source_len - start).min(2 * WINDOW), 2 * WINDOW)?;
+        self.charge(window.len() as u64)?;
+        let header = format!("{} {} obj", id.0, id.1);
+        let mut nearest: Option<usize> = None;
+        let mut at = 0;
+        while let Some(found) = window[at..]
+            .windows(header.len())
+            .position(|candidate| candidate == header.as_bytes())
+        {
+            let position = at + found;
+            let starts_token =
+                position == 0 || is_pdf_whitespace(window[position - 1]) || is_pdf_delimiter(window[position - 1]);
+            let distance = |position: usize| (start + position as u64).abs_diff(center);
+            if starts_token && nearest.is_none_or(|best| distance(position) < distance(best)) {
+                nearest = Some(position);
+            }
+            at = position + 1;
+        }
+        let Some(position) = nearest else {
+            return Ok(None);
+        };
+        let Some((actual, header_bytes)) = parse_indirect_header(&window[position..]) else {
+            return Ok(None);
+        };
+        if actual != id {
+            return Ok(None);
+        }
+        let body_offset = start + (position + header_bytes) as u64;
+        match self.view.resolve_body_frame(id, body_offset, source_len) {
+            Ok(parsed) => Ok(Some((body_offset, source_len, parsed))),
+            Err(IndexedReaderError::Source(error)) => Err(error.into()),
+            Err(_) => Ok(None),
         }
     }
 

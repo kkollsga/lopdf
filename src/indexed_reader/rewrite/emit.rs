@@ -487,6 +487,7 @@ pub(super) fn write_plan<W: AppendOutput>(
         objects_dropped: index_live.saturating_sub(kept_from_source),
         stream_bytes_copied: output.stream_bytes,
         bytes_examined: plan.work,
+        objects_found_near_their_offset: plan.relocated,
         removal: std::mem::take(&mut plan.report),
         document_data_kept: kept,
         removed_signatures: std::mem::take(&mut plan.signatures),
