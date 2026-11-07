@@ -125,6 +125,12 @@ pub enum AppendError {
     EmptyUpdate,
     #[error("an earlier write failed, so this update can't be finished")]
     Abandoned,
+    #[error("the file at {path:?} isn't the one this document was opened from, or it has changed since")]
+    TargetChanged { path: std::path::PathBuf },
+    #[error("there is already a file at {path:?}")]
+    TargetExists { path: std::path::PathBuf },
+    #[error("this document wasn't opened from a whole file on disk, so it can't replace one")]
+    TargetIdentityUnknown,
     #[error("the written file failed its check: {reason}")]
     VerificationFailed { reason: &'static str },
     #[error(transparent)]
@@ -969,23 +975,105 @@ fn check_dictionary(id: crate::ObjectId, dict: &Dictionary, depth: usize) -> App
     Ok(())
 }
 
-/// Write an update and put the result at `target` in one step: into a temporary file beside it, synced,
-/// checked with [`IndexedReader::verify_appended`], then renamed over it, so at no moment does `target`
-/// hold anything partial. `target` can be the file `reader` has open, and `reader` keeps reading the old
-/// bytes. Returns a reader of the new file alongside the summary.
+/// Where [`append_atomically`] puts a finished update. Replacing a file is the part that can lose someone's
+/// work, so which file is being replaced is stated, and checked.
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum AppendDestination<'p> {
+    /// Save: replace the file the reader has open. This path must still be that very file, with the device,
+    /// inode, length and modification time the reader saw, or the save fails with
+    /// [`TargetChanged`](AppendError::TargetChanged) rather than lose a newer version.
+    SameFile(&'p std::path::Path),
+    /// Save As to a path with nothing there. Fails with [`TargetExists`](AppendError::TargetExists) if there is.
+    NewFile(&'p std::path::Path),
+    /// Save As over another file, one the caller named deliberately, usually because the person agreed to
+    /// replace it. Fails with [`TargetChanged`](AppendError::TargetChanged) if it changes during the write.
+    OverwriteOther(&'p std::path::Path),
+}
+
+#[cfg(any(unix, windows))]
+impl AppendDestination<'_> {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::SameFile(path) | Self::NewFile(path) | Self::OverwriteOther(path) => path,
+        }
+    }
+
+    /// Whether the destination is as it has to be. Returns what's at an overwrite's path now, to compare later.
+    fn check(&self, reader: &IndexedReader) -> AppendResult<Option<std::fs::Metadata>> {
+        let changed = || AppendError::TargetChanged {
+            path: self.path().to_path_buf(),
+        };
+        match self {
+            Self::SameFile(path) => {
+                let now = if_present(std::fs::metadata(path))?.ok_or_else(changed)?;
+                match reader.whole_file_source().is_same_file(&now) {
+                    Some(true) => Ok(Some(now)),
+                    Some(false) => Err(changed()),
+                    None => Err(AppendError::TargetIdentityUnknown),
+                }
+            }
+            Self::NewFile(path) => match if_present(std::fs::symlink_metadata(path))? {
+                Some(_) => Err(AppendError::TargetExists {
+                    path: path.to_path_buf(),
+                }),
+                None => Ok(None),
+            },
+            Self::OverwriteOther(path) => Ok(if_present(std::fs::metadata(path))?),
+        }
+    }
+
+    /// The same test just before the rename, since a long write leaves plenty of time for another app to save.
+    /// A very small gap remains between this and the rename, which the standard library can't close.
+    fn check_again(&self, reader: &IndexedReader, seen: Option<&std::fs::Metadata>) -> AppendResult<()> {
+        let now = self.check(reader)?;
+        if let Self::OverwriteOther(path) = self {
+            let same = match (seen, now.as_ref()) {
+                (Some(seen), Some(now)) => crate::source::same_file_state(seen, now),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                return Err(AppendError::TargetChanged {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn if_present(read: std::io::Result<std::fs::Metadata>) -> std::io::Result<Option<std::fs::Metadata>> {
+    match read {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Write an update and put the result at a destination in one step: into a temporary file beside it, synced,
+/// checked with [`IndexedReader::verify_appended`], then moved into place, so at no moment does the path hold
+/// anything partial. `reader` keeps reading the old bytes. Returns a reader of the new file alongside the
+/// summary, and that reader is the one to use for the next save.
 ///
 /// # Errors
 ///
-/// Anything `build` returns, any refusal, write failure or failed check. The temporary file is removed
-/// and `target` isn't touched.
+/// Anything `build` returns, any refusal, write failure or failed check, and
+/// [`TargetChanged`](AppendError::TargetChanged), [`TargetExists`](AppendError::TargetExists) or
+/// [`TargetIdentityUnknown`](AppendError::TargetIdentityUnknown) from the destination. The temporary file is
+/// removed and the destination isn't touched.
 #[cfg(any(unix, windows))]
 pub fn append_atomically<F>(
-    reader: &IndexedReader, target: &std::path::Path, build: F,
+    reader: &IndexedReader, destination: AppendDestination<'_>, build: F,
 ) -> AppendResult<(AppendSummary, IndexedReader)>
 where
     F: FnOnce(&mut AppendWriter<'_, &mut std::fs::File>) -> AppendResult<()>,
 {
     reader.check_appendable()?;
+    let seen = destination.check(reader)?;
+    let target = destination.path();
     let (mut file, temporary) = TemporaryFile::create_beside(target)?;
     let summary = {
         let mut writer = AppendWriter::new(reader, &mut file)?;
@@ -997,10 +1085,14 @@ where
 
     let written = crate::source::FileSource::open(&temporary.path)?;
     let verified = reader.verify_appended(Arc::new(written), &summary)?;
+    destination.check_again(reader, seen.as_ref())?;
     if let Ok(existing) = std::fs::metadata(target) {
         std::fs::set_permissions(&temporary.path, existing.permissions())?;
     }
-    temporary.commit(target)?;
+    match destination {
+        AppendDestination::NewFile(_) => temporary.commit_new(target)?,
+        _ => temporary.commit(target)?,
+    }
     Ok((summary, verified))
 }
 
@@ -1044,15 +1136,46 @@ impl TemporaryFile {
         }
     }
 
+    /// Move into place at a path that has to stay empty. A hard link fails if the path has appeared, where a
+    /// rename would replace what's there. Where a file system has no hard links, this falls back to a last
+    /// look and a rename.
+    fn commit_new(self, target: &std::path::Path) -> AppendResult<()> {
+        match std::fs::hard_link(&self.path, target) {
+            Ok(()) => {
+                // Dropping `self` removes the temporary name, and the file stays under the new one.
+                sync_parent(target)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(AppendError::TargetExists {
+                path: target.to_path_buf(),
+            }),
+            Err(_) => {
+                if if_present(std::fs::symlink_metadata(target))?.is_some() {
+                    return Err(AppendError::TargetExists {
+                        path: target.to_path_buf(),
+                    });
+                }
+                self.commit(target).map_err(AppendError::Io)
+            }
+        }
+    }
+
     fn commit(mut self, target: &std::path::Path) -> std::io::Result<()> {
         std::fs::rename(&self.path, target)?;
         self.committed = true;
-        #[cfg(unix)]
-        if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        Ok(())
+        sync_parent(target)
     }
+}
+
+#[cfg(any(unix, windows))]
+fn sync_parent(target: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = target;
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]

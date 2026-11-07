@@ -106,6 +106,16 @@ pub trait RandomAccessSource: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether `metadata`, read from some path, describes the file this source has open, as it was when
+    /// this source was opened: same device, inode, length and modification time.
+    ///
+    /// `None` means this source can't tell, because it isn't a whole file on disk. A file replaced at the
+    /// same path gives `Some(false)`, which [`validate_unchanged`](Self::validate_unchanged) can't see,
+    /// since it looks only at the open descriptor.
+    fn is_same_file(&self, _metadata: &std::fs::Metadata) -> Option<bool> {
+        None
+    }
+
     /// Return whether the source is empty.
     fn is_empty(&self) -> SourceResult<bool> {
         Ok(self.len()? == 0)
@@ -281,6 +291,12 @@ struct FileIdentity {
     inode: u64,
 }
 
+/// Whether two metadata reads describe one unchanged file, by the same test [`FileSource`] uses.
+#[cfg(any(unix, windows))]
+pub(crate) fn same_file_state(first: &std::fs::Metadata, second: &std::fs::Metadata) -> bool {
+    FileIdentity::capture(first) == FileIdentity::capture(second)
+}
+
 #[cfg(any(unix, windows))]
 impl FileIdentity {
     fn capture(metadata: &std::fs::Metadata) -> Self {
@@ -363,6 +379,10 @@ impl RandomAccessSource for FileSource {
 
     fn validate_unchanged(&self) -> SourceResult<()> {
         self.check_identity()
+    }
+
+    fn is_same_file(&self, metadata: &std::fs::Metadata) -> Option<bool> {
+        Some(FileIdentity::capture(metadata) == self.identity)
     }
 }
 
@@ -449,5 +469,23 @@ mod tests {
         source.read_exact_at(0, &mut bytes).unwrap();
         assert_eq!(&bytes, b"old-source");
         source.validate_unchanged().unwrap();
+    }
+
+    /// A replaced file looking like the one that was opened. This is the check that keeps a save from
+    /// overwriting a newer file at the same path.
+    #[test]
+    fn is_same_file_sees_a_replaced_or_changed_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.pdf");
+        std::fs::write(&path, b"old-source").unwrap();
+        let source = FileSource::open(&path).unwrap();
+        assert_eq!(source.is_same_file(&std::fs::metadata(&path).unwrap()), Some(true));
+
+        let other = directory.path().join("other.pdf");
+        std::fs::write(&other, b"old-source").unwrap();
+        assert_eq!(source.is_same_file(&std::fs::metadata(&other).unwrap()), Some(false));
+
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(source.is_same_file(&std::fs::metadata(&path).unwrap()), Some(false));
     }
 }

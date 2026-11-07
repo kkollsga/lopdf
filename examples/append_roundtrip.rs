@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lopdf::{
-    AppendError, AppendResult, AppendWriter, FileSource, IndexedReader, Object, RandomAccessSource, append_atomically,
-    dictionary,
+    AppendDestination, AppendError, AppendResult, AppendWriter, FileSource, IndexedReader, Object, RandomAccessSource,
+    append_atomically, dictionary,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -204,7 +204,7 @@ fn round_trip(path: &Path, out: &Path) -> serde_json::Value {
 
     // Second update: replacing a file, through the atomic path.
     let second = out.join(format!("{name}.2.pdf"));
-    let again = append_atomically(&after, &second, |writer| {
+    let again = append_atomically(&after, AppendDestination::NewFile(&second), |writer| {
         writer.add_object(&Object::Dictionary(dictionary! { "RectoRoundTrip" => 2 }))?;
         Ok(())
     });
@@ -324,7 +324,7 @@ fn measure(mode: &str, out: &Path, path: &Path) {
             println!("appended {} bytes", summary.new_len - summary.previous_len);
         }
         "atomic" => {
-            let (summary, _) = append_atomically(&reader, &target, |writer| {
+            let (summary, _) = append_atomically(&reader, AppendDestination::NewFile(&target), |writer| {
                 small_edit(&reader, writer)?;
                 Ok(())
             })
