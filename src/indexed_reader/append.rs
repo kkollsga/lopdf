@@ -1191,7 +1191,8 @@ where
     let target = destination.real_path()?;
     let target = target.as_path();
     check_replaceable(target, options.allow_breaking_hard_links)?;
-    let (mut file, temporary) = TemporaryFile::create_beside(target)?;
+    let permissions = final_permissions(reader, target);
+    let (mut file, temporary) = TemporaryFile::create_beside(target, permissions.as_ref())?;
     let summary = {
         let mut writer = AppendWriter::new(reader, &mut file)?;
         build(&mut writer)?;
@@ -1199,8 +1200,8 @@ where
     };
     file.sync_all()?;
     drop(file);
-    if let Ok(existing) = std::fs::metadata(target) {
-        std::fs::set_permissions(&temporary.path, existing.permissions())?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(&temporary.path, permissions)?;
     }
     if let Some(step) = options.prepare {
         step(&temporary.path, target).map_err(AppendError::PrepareReplacement)?;
@@ -1218,6 +1219,109 @@ where
     Ok((summary, verified))
 }
 
+/// The permissions the finished file ends with: those of the file it replaces, or for a new file those of the file
+/// it's a copy of, so a private document's copy stays private. `None` if neither exists, as with a reader of bytes in
+/// memory, and then the file stays as private as it was created.
+#[cfg(any(unix, windows))]
+fn final_permissions(reader: &IndexedReader, target: &std::path::Path) -> Option<std::fs::Permissions> {
+    match std::fs::metadata(target) {
+        Ok(existing) => Some(existing.permissions()),
+        Err(_) => reader.whole_file_source().file_permissions(),
+    }
+}
+
+/// How long a dead process's temporary file stays before a later save removes it. A process with that number being gone
+/// proves little on a folder another machine can also write to, and an hour's copy of one file is far beyond any here.
+#[cfg(unix)]
+const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Folder entries one sweep looks at, so a huge folder can't make a save slow.
+#[cfg(unix)]
+const MAX_SWEEP_ENTRIES: usize = 65_536;
+/// Files one sweep removes.
+#[cfg(unix)]
+const MAX_SWEPT_FILES: usize = 16;
+
+#[cfg(any(unix, windows))]
+fn folder_of(target: &std::path::Path) -> &std::path::Path {
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    }
+}
+
+/// The start of every temporary name for this target: `.append-<16 hex digits>-`. A hash of the name rather than the name
+/// itself, because a name near the file system's 255 bytes has no room for anything more.
+#[cfg(any(unix, windows))]
+fn temporary_prefix(target: &std::path::Path) -> String {
+    let name = target
+        .file_name()
+        .map_or(&b"document"[..], std::ffi::OsStr::as_encoded_bytes);
+    let digest = Sha256::digest(name);
+    let mut prefix = String::from(".append-");
+    for byte in &digest[..8] {
+        prefix.push_str(&format!("{byte:02x}"));
+    }
+    prefix.push('-');
+    prefix
+}
+
+/// The process number in a temporary name for this target. Anything but exactly `<prefix><pid>-<attempt>.tmp` is `None`.
+#[cfg(unix)]
+fn temporary_owner(name: &str, prefix: &str) -> Option<u32> {
+    let (process, attempt) = name.strip_prefix(prefix)?.strip_suffix(".tmp")?.split_once('-')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if digits(process) && digits(attempt) {
+        process.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Remove what a crash left: temporary files for this same target, by this same user, from a process that's gone, and over
+/// an hour old. Only a regular file whose name fits the pattern exactly is ever touched, and any doubt leaves it alone,
+/// since a leftover costs some disk and a wrong removal costs a save in progress. Whether a process is alive is asked of
+/// `/bin/kill`, as the crate forbids the unsafe call, and only when a candidate has been found, which is rare.
+#[cfg(unix)]
+fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    let mut swept = 0;
+    for entry in entries.take(MAX_SWEEP_ENTRIES).flatten() {
+        let name = entry.file_name();
+        let Some(process) = name.to_str().and_then(|name| temporary_owner(name, prefix)) else {
+            continue;
+        };
+        if process == std::process::id() {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_TEMPORARY_AGE);
+        if !metadata.is_file() || metadata.uid() != own_user || !old_enough {
+            continue;
+        }
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &process.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // A tool that can't be run says nothing about the process.
+        if matches!(alive, Ok(status) if !status.success()) && std::fs::remove_file(entry.path()).is_ok() {
+            swept += 1;
+            if swept == MAX_SWEPT_FILES {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(any(unix, windows))]
 struct TemporaryFile {
     path: std::path::PathBuf,
@@ -1226,28 +1330,33 @@ struct TemporaryFile {
 
 #[cfg(any(unix, windows))]
 impl TemporaryFile {
-    fn create_beside(target: &std::path::Path) -> std::io::Result<(std::fs::File, Self)> {
-        let folder = match target.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => std::path::Path::new("."),
-        };
-        let stem = target
-            .file_name()
-            .map_or_else(|| std::ffi::OsString::from("document"), std::ffi::OsStr::to_os_string);
+    /// Create the temporary file, exclusively, and never more readable than the file it becomes: a private document's full
+    /// copy sits here for the whole write, and if the process dies, after it too.
+    fn create_beside(
+        target: &std::path::Path, permissions: Option<&std::fs::Permissions>,
+    ) -> std::io::Result<(std::fs::File, Self)> {
+        let folder = folder_of(target);
+        let prefix = temporary_prefix(target);
         let process = std::process::id();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(permissions.map_or(0o600, |permissions| permissions.mode() & 0o777));
+        }
+        #[cfg(not(unix))]
+        let _ = permissions;
         let mut attempt = 0_u32;
         loop {
-            let mut name = std::ffi::OsString::from(".");
-            name.push(&stem);
-            name.push(format!(".append-{process}-{attempt}.tmp"));
-            let path = folder.join(name);
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            let path = folder.join(format!("{prefix}{process}-{attempt}.tmp"));
+            match options.open(&path) {
                 Ok(file) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        sweep_stale_temporaries(folder, &prefix, file.metadata()?.uid());
+                    }
                     return Ok((file, Self { path, committed: false }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1_024 => {

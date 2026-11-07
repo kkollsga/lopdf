@@ -116,6 +116,12 @@ pub trait RandomAccessSource: Send + Sync + 'static {
         None
     }
 
+    /// The permissions of the file this source has open, if it is one. A copy of a private file shouldn't come out
+    /// readable by others.
+    fn file_permissions(&self) -> Option<std::fs::Permissions> {
+        None
+    }
+
     /// Return whether the source is empty.
     fn is_empty(&self) -> SourceResult<bool> {
         Ok(self.len()? == 0)
@@ -383,6 +389,10 @@ impl RandomAccessSource for FileSource {
 
     fn is_same_file(&self, metadata: &std::fs::Metadata) -> Option<bool> {
         Some(FileIdentity::capture(metadata) == self.identity)
+    }
+
+    fn file_permissions(&self) -> Option<std::fs::Permissions> {
+        self.file.metadata().ok().map(|metadata| metadata.permissions())
     }
 }
 

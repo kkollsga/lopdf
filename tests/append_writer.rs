@@ -2071,6 +2071,204 @@ mod atomic {
         assert_eq!(get(&path).as_deref(), Some("tagged again"));
     }
 
+    fn temporary_in(folder: &Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".append-"))
+    }
+
+    /// A private document's full copy sitting readable by others during the write, and after a crash. It used to be created
+    /// with the default mode, 0644 under the usual umask, and only tightened just before the rename.
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_file_is_never_more_readable_than_the_document() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = folder();
+        let path = file(dir.path(), "doc.pdf", &classic_pdf());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let reader = opened(&path);
+        let (_, reader) = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            |writer| {
+                let temporary = temporary_in(path.parent().unwrap()).expect("a temporary file while writing");
+                assert_eq!(mode_of(&temporary), 0o600, "readable by others during the write");
+                add_one(writer)
+            },
+        )
+        .unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+
+        // A Save As of a private document stays private, with nothing at the target to take a mode from.
+        let copy = dir.path().join("copy.pdf");
+        append_atomically(
+            &reader,
+            AppendDestination::NewFile(&copy),
+            AppendOptions::new(),
+            |writer| {
+                let temporary = temporary_in(copy.parent().unwrap()).expect("a temporary file while writing");
+                assert_eq!(
+                    mode_of(&temporary),
+                    0o600,
+                    "a private document's copy was readable during the write"
+                );
+                add_one(writer)
+            },
+        )
+        .unwrap();
+        assert_eq!(mode_of(&copy), 0o600, "a private document's copy came out readable");
+
+        // With no file to take a mode from at all, private is the safe answer.
+        let memory = dir.path().join("from-memory.pdf");
+        append_atomically(
+            &open(&classic_pdf()),
+            AppendDestination::NewFile(&memory),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
+        assert_eq!(mode_of(&memory), 0o600);
+    }
+
+    /// A mode the umask would narrow, group write here, being lost on save. Creation is narrowed by the umask, and the file
+    /// has to end with exactly the mode it had.
+    #[cfg(unix)]
+    #[test]
+    fn the_exact_mode_comes_back_after_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = folder();
+        let path = file(dir.path(), "doc.pdf", &classic_pdf());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let reader = opened(&path);
+        append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
+    }
+
+    /// A long file name failing to save: the temporary name was the file's name and more, so a name near the limit of 255
+    /// bytes gave ENAMETOOLONG.
+    #[test]
+    fn a_very_long_file_name_saves() {
+        let dir = folder();
+        let name = format!("{}.pdf", "n".repeat(250));
+        let path = file(dir.path(), &name, &classic_pdf());
+        let reader = opened(&path);
+        let (_, reader) = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
+        let other = dir.path().join(format!("{}.pdf", "m".repeat(250)));
+        append_atomically(
+            &reader,
+            AppendDestination::NewFile(&other),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
+        assert_eq!(entries(dir.path()).len(), 2);
+    }
+
+    /// A crash's leftover staying forever, or, far worse, the sweep touching any other file. Every near miss has to survive:
+    /// another document's temporary, a process still alive, a fresh file, a wrong suffix, a folder and a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_processs_temporary_is_swept_and_nothing_else_is() {
+        use std::time::{Duration, SystemTime};
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+        let other_doc = file(dir.path(), "other.pdf", &bytes);
+
+        // The real prefixes, from real saves.
+        let prefix_of = |target: &Path| {
+            let seen = std::cell::RefCell::new(String::new());
+            let options = AppendOptions::new().prepare_replacement(|temporary, _| {
+                *seen.borrow_mut() = temporary.file_name().unwrap().to_string_lossy().into_owned();
+                Ok(())
+            });
+            append_atomically(&opened(target), AppendDestination::SameFile(target), options, add_one).unwrap();
+            let name = seen.into_inner();
+            let split = name[".append-".len()..].find('-').unwrap();
+            name[..".append-".len() + split + 1].to_string()
+        };
+        let prefix = prefix_of(&path);
+        let other_prefix = prefix_of(&other_doc);
+        assert_ne!(prefix, other_prefix);
+        assert!(prefix.len() < 32, "a temporary name has to be short: {prefix}");
+
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let dead = child.id();
+        let alive = std::os::unix::process::parent_id();
+        let old = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        let put = |name: String, aged: bool| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"leftover").unwrap();
+            if aged {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        };
+
+        let stale = format!("{prefix}{dead}-0.tmp");
+        put(stale.clone(), true);
+        let mut kept = vec![
+            format!("{other_prefix}{dead}-0.tmp"),
+            format!("{prefix}{alive}-0.tmp"),
+            format!("{prefix}{dead}-0.tmp2"),
+            format!("{prefix}{dead}-x.tmp"),
+            format!("{prefix}x-0.tmp"),
+            format!("{prefix}{dead}.tmp"),
+            format!("{prefix}{dead}-0-0.tmp"),
+            format!("x{prefix}{dead}-0.tmp"),
+            format!(".append-{dead}-0.tmp"),
+            "doc.pdf.tmp".to_string(),
+        ];
+        for name in &kept {
+            put(name.clone(), true);
+        }
+        let fresh = format!("{prefix}{dead}-1.tmp");
+        put(fresh.clone(), false);
+        kept.push(fresh);
+        let inner = format!("{prefix}{dead}-2.tmp");
+        std::fs::create_dir(dir.path().join(&inner)).unwrap();
+        kept.push(inner);
+        let link = format!("{prefix}{dead}-3.tmp");
+        std::os::unix::fs::symlink(&other_doc, dir.path().join(&link)).unwrap();
+        kept.push(link);
+
+        append_atomically(
+            &opened(&path),
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
+
+        let now = entries(dir.path());
+        assert!(!now.contains(&stale), "the dead process's temporary is still there");
+        for name in &kept {
+            assert!(now.contains(name), "the sweep removed {name}");
+        }
+        assert!(now.contains(&"doc.pdf".to_string()) && now.contains(&"other.pdf".to_string()));
+        assert!(std::fs::read(&other_doc).unwrap().starts_with(&bytes));
+    }
+
     /// An update starting from a stale view: the file changed after the reader opened it, so the
     /// offsets it would write are wrong for what's there now.
     #[test]
