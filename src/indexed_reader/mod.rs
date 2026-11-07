@@ -21,7 +21,8 @@
 //!    `startxref` before it.
 //! 3. **Cross-reference walk.** Each section is parsed from a window that starts at `XREF_INITIAL_WINDOW` and grows to
 //!    at most `XREF_WINDOW_LIMIT`; xref streams decompress under `XREF_DECOMPRESSED_LIMIT`. The walk follows `/Prev`
-//!    until a revision repeats, bounded by `MAX_XREF_REVISIONS` revisions and `MAX_XREF_ENTRIES` entries. Newer
+//!    until a revision repeats, bounded by [`IndexedReaderOptions::max_xref_sections`] sections, `MAX_XREF_ENTRIES`
+//!    entries a section, and `MAX_XREF_WALK_BYTES` and `MAX_XREF_WALK_ENTRIES` for the whole walk. Newer
 //!    revisions win. Within one revision a `/XRefStm` supplement takes precedence over the classic section it
 //!    supplements, because a hybrid-reference file is required to mask its compressed objects as free in the classic
 //!    table (ISO 32000-1, 7.5.8.4).
@@ -235,6 +236,13 @@ const XREF_WINDOW_LIMIT: u64 = 16 * 1_024 * 1_024;
 const XREF_DECOMPRESSED_LIMIT: usize = 32 * 1_024 * 1_024;
 const MAX_XREF_ENTRIES: u64 = 1_000_000;
 const MAX_XREF_REVISIONS: usize = 1_024;
+/// Bytes one `/Prev` walk may read. Eight sections at the largest window, more than any real file needs, and small
+/// enough that a hostile chain of sections overlapping the same bytes gives up quickly.
+const MAX_XREF_WALK_BYTES: u64 = 256 * 1_024 * 1_024;
+/// Entries one `/Prev` walk may decode, across every section. This is PDFium's highest object number, so it can't refuse
+/// a file PDFium would draw whole, unless a chain keeps rewriting the same objects. Without it, a chain of deflated
+/// sections reaches 1,024 sections times `MAX_XREF_ENTRIES` entries from a 2 MiB file.
+const MAX_XREF_WALK_ENTRIES: u64 = 4 * 1_024 * 1_024;
 const MAX_XREF_FIELD_WIDTH: u64 = 8;
 const INDIRECT_HEADER_LIMIT: u64 = 256;
 const INITIAL_OBJECT_WINDOW: u64 = 4 * 1_024;

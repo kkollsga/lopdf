@@ -25,6 +25,12 @@ pub struct IndexedReaderOptions {
     pub page_tree_depth: usize,
     /// Maximum leaf pages retained in a derived page map.
     pub max_pages: usize,
+    /// Maximum cross-reference sections followed through `/Prev` at open.
+    ///
+    /// A longer chain fails with
+    /// [`RevisionLimitExceeded`](IndexedReaderError::RevisionLimitExceeded), and
+    /// isn't rescanned: a chain of this length is what a hostile file looks like.
+    pub max_xref_sections: usize,
     /// Optional raw PDF password. Debug output always redacts its value.
     pub password: Option<Vec<u8>>,
 }
@@ -40,6 +46,7 @@ impl std::fmt::Debug for IndexedReaderOptions {
             .field("reference_depth", &self.reference_depth)
             .field("page_tree_depth", &self.page_tree_depth)
             .field("max_pages", &self.max_pages)
+            .field("max_xref_sections", &self.max_xref_sections)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -55,6 +62,7 @@ impl Default for IndexedReaderOptions {
             reference_depth: DEFAULT_LENGTH_DEPTH_LIMIT,
             page_tree_depth: DEFAULT_PAGE_TREE_DEPTH_LIMIT,
             max_pages: DEFAULT_PAGE_COUNT_LIMIT,
+            max_xref_sections: MAX_XREF_REVISIONS,
             password: None,
         }
     }

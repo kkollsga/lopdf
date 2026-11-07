@@ -1075,7 +1075,7 @@ fn open_bytes(pdf: &[u8]) -> PdfIndex {
 fn open_without_recovery(source: Arc<dyn RandomAccessSource>) -> IndexedReaderResult<PdfIndex> {
     let source_len = source.len()?;
     let (source_origin, version) = read_header(source.as_ref(), source_len)?;
-    PdfIndex::open_from_xref(&source, source_len, source_origin, &version)
+    PdfIndex::open_from_xref(&source, source_len, source_origin, &version, MAX_XREF_REVISIONS)
 }
 
 fn fixture_startxref(pdf: &[u8]) -> u64 {

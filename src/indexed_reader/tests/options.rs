@@ -12,6 +12,7 @@ fn public_options_wire_every_exposed_resolver_and_page_limit() {
         reference_depth: 7,
         page_tree_depth: 0,
         max_pages: 11,
+        max_xref_sections: 1,
         password: None,
     };
     let limits = ResolverLimits::from(&options);

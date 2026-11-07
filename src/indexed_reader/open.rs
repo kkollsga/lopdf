@@ -32,6 +32,78 @@ pub(crate) struct PdfIndex {
     /// Whether this index came from a body rescan rather than a cross-reference
     /// section, so a caller can count and report the provenance of the open.
     pub(crate) recovered: bool,
+    /// What the `/Prev` walk saw that the append writer has to refuse.
+    pub(crate) chain: XrefChainFacts,
+}
+
+/// What the `/Prev` walk saw, kept so a writer doesn't have to walk it again.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct XrefChainFacts {
+    /// A `/Prev` led back to a section already read. The walk stops there, as the
+    /// eager reader's does, so sections beyond the loop were never seen.
+    pub(crate) has_loop: bool,
+    /// A revision whose `/XRefStm` two kinds of reader would read differently: a
+    /// supplement that redefines a live classic entry, or one on a stream section.
+    pub(crate) ambiguous_hybrid: Option<u32>,
+    /// Sections the walk read.
+    pub(crate) sections: usize,
+}
+
+/// The bounds on one walk of the `/Prev` chain.
+///
+/// The section count alone doesn't bound the work: a section's window can overlap
+/// its neighbours and a deflated section can name a million numbers in a few KiB,
+/// so a small file can still ask for gigabytes of reads or of index entries.
+pub(super) struct XrefWalkBudget {
+    max_sections: usize,
+    sections: usize,
+    bytes: u64,
+    entries: u64,
+}
+
+impl XrefWalkBudget {
+    pub(super) fn new(max_sections: usize) -> Self {
+        Self {
+            max_sections,
+            sections: 0,
+            bytes: 0,
+            entries: 0,
+        }
+    }
+
+    pub(super) fn charge_section(&mut self) -> IndexedReaderResult<()> {
+        self.sections = self.sections.saturating_add(1);
+        if self.sections > self.max_sections {
+            return Err(IndexedReaderError::RevisionLimitExceeded {
+                limit: self.max_sections,
+            });
+        }
+        Ok(())
+    }
+
+    fn charge_read(&mut self, length: u64) -> IndexedReaderResult<()> {
+        self.bytes = self.bytes.saturating_add(length);
+        if self.bytes > MAX_XREF_WALK_BYTES {
+            return Err(IndexedReaderError::StructureLimitExceeded {
+                structure: "cross-reference chain",
+                limit: MAX_XREF_WALK_BYTES,
+            });
+        }
+        Ok(())
+    }
+
+    fn charge_entries(&mut self, count: usize) -> IndexedReaderResult<()> {
+        self.entries = self
+            .entries
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        if self.entries > MAX_XREF_WALK_ENTRIES {
+            return Err(IndexedReaderError::EntryLimitExceeded {
+                count: self.entries,
+                limit: MAX_XREF_WALK_ENTRIES,
+            });
+        }
+        Ok(())
+    }
 }
 
 fn authenticate_password(
@@ -66,10 +138,15 @@ fn authenticate_password(
 }
 
 impl PdfIndex {
+    #[cfg(test)]
     pub(crate) fn open(source: Arc<dyn RandomAccessSource>) -> IndexedReaderResult<Self> {
+        Self::open_limited(source, MAX_XREF_REVISIONS)
+    }
+
+    pub(crate) fn open_limited(source: Arc<dyn RandomAccessSource>, max_sections: usize) -> IndexedReaderResult<Self> {
         let source_len = source.len()?;
         let (source_origin, version) = read_header(source.as_ref(), source_len)?;
-        match Self::open_from_xref(&source, source_len, source_origin, &version) {
+        match Self::open_from_xref(&source, source_len, source_origin, &version, max_sections) {
             Ok(index) => Ok(index),
             Err(error) if error_admits_xref_recovery(&error) => {
                 // The cross-reference machinery is unusable, but the body may be
@@ -85,7 +162,7 @@ impl PdfIndex {
     }
 
     pub(super) fn open_from_xref(
-        source: &Arc<dyn RandomAccessSource>, source_len: u64, source_origin: u64, version: &str,
+        source: &Arc<dyn RandomAccessSource>, source_len: u64, source_origin: u64, version: &str, max_sections: usize,
     ) -> IndexedReaderResult<Self> {
         let version = version.to_owned();
         let xref_start = read_startxref(source.as_ref(), source_len)?;
@@ -116,27 +193,20 @@ impl PdfIndex {
         let mut newest_trailer = None;
         let mut newest_type = None;
         let mut declared_size = 0_u64;
-        let mut revisions = 0_usize;
+        let mut budget = XrefWalkBudget::new(max_sections);
+        let mut chain = XrefChainFacts::default();
 
         while let Some(offset) = next {
             if !seen.insert(offset) {
+                chain.has_loop = true;
                 break;
             }
-            revisions = revisions
-                .checked_add(1)
-                .ok_or(IndexedReaderError::RevisionLimitExceeded {
-                    limit: MAX_XREF_REVISIONS,
-                })?;
-            if revisions > MAX_XREF_REVISIONS {
-                return Err(IndexedReaderError::RevisionLimitExceeded {
-                    limit: MAX_XREF_REVISIONS,
-                });
-            }
+            budget.charge_section()?;
 
             let physical = source_origin
                 .checked_add(offset)
                 .ok_or(IndexedReaderError::InvalidXref { offset })?;
-            let section = read_xref_section(source.as_ref(), source_len, physical)?;
+            let section = read_xref_section(source.as_ref(), source_len, physical, &mut budget)?;
             if newest_trailer.is_none() {
                 newest_type = Some(section.kind);
                 newest_trailer = Some(section.trailer.clone());
@@ -154,9 +224,12 @@ impl PdfIndex {
                 let hybrid_physical = source_origin
                     .checked_add(hybrid)
                     .ok_or(IndexedReaderError::InvalidTrailerOffset { key: "XRefStm" })?;
-                let supplement = read_xref_section(source.as_ref(), source_len, hybrid_physical)?;
+                let supplement = read_xref_section(source.as_ref(), source_len, hybrid_physical, &mut budget)?;
                 if supplement.kind != IndexXrefType::Stream {
                     return Err(IndexedReaderError::InvalidXref { offset: hybrid });
+                }
+                if section.kind == IndexXrefType::Stream {
+                    chain.ambiguous_hybrid.get_or_insert(0);
                 }
                 // Definitions only, on the same rule the eager `Xref::supersede`
                 // states: a `/Index` run is contiguous, so a supplement pads the
@@ -167,7 +240,10 @@ impl PdfIndex {
                 // be able to read on its own.
                 for (id, entry) in supplement.entries {
                     if !matches!(entry, ObjectLocation64::Free { .. }) {
-                        entries.insert(id, entry);
+                        let replaced = entries.insert(id, entry);
+                        if matches!(replaced, Some(ObjectLocation64::Normal { .. })) {
+                            chain.ambiguous_hybrid.get_or_insert(id);
+                        }
                     }
                 }
             }
@@ -176,6 +252,7 @@ impl PdfIndex {
             next = trailer_offset(&section.trailer, b"Prev", "Prev")?;
         }
 
+        chain.sections = budget.sections;
         let trailer = newest_trailer.ok_or(IndexedReaderError::InvalidXref { offset: xref_start })?;
         Ok(Self {
             version,
@@ -189,14 +266,18 @@ impl PdfIndex {
             encryption_state: None,
             encrypt_object_id: None,
             recovered: false,
+            chain,
         })
     }
 }
 
-struct XrefSection64 {
-    kind: IndexXrefType,
+pub(super) struct XrefSection64 {
+    pub(super) kind: IndexXrefType,
     pub(super) entries: BTreeMap<u32, ObjectLocation64>,
-    trailer: Dictionary,
+    pub(super) trailer: Dictionary,
+    /// Bytes from the section's first byte to just past its trailer dictionary or
+    /// its `endstream`.
+    pub(super) length: u64,
 }
 
 fn merge_newest(target: &mut BTreeMap<u32, ObjectLocation64>, entries: BTreeMap<u32, ObjectLocation64>) {
@@ -318,6 +399,7 @@ fn recover_index(
         encryption_state: None,
         encrypt_object_id: None,
         recovered: true,
+        chain: XrefChainFacts::default(),
     })
 }
 
@@ -550,8 +632,8 @@ pub(super) fn read_startxref(source: &dyn RandomAccessSource, source_len: u64) -
         .ok_or(IndexedReaderError::InvalidStartXref { limit: TAIL_SCAN_LIMIT })
 }
 
-fn read_xref_section(
-    source: &dyn RandomAccessSource, source_len: u64, physical_offset: u64,
+pub(super) fn read_xref_section(
+    source: &dyn RandomAccessSource, source_len: u64, physical_offset: u64, budget: &mut XrefWalkBudget,
 ) -> IndexedReaderResult<XrefSection64> {
     if physical_offset >= source_len {
         return Err(IndexedReaderError::InvalidXref {
@@ -566,6 +648,7 @@ fn read_xref_section(
     let maximum = remaining.min(XREF_WINDOW_LIMIT);
     let mut length = maximum.min(XREF_INITIAL_WINDOW);
     loop {
+        budget.charge_read(length)?;
         let window = source.read_range(physical_offset, length, length)?;
         let result = if starts_with_token(&window, b"xref") {
             parse_classic_xref(&window, physical_offset)
@@ -573,7 +656,10 @@ fn read_xref_section(
             parse_xref_stream(&window, physical_offset)
         };
         match result {
-            Ok(section) => return Ok(section),
+            Ok(section) => {
+                budget.charge_entries(section.entries.len())?;
+                return Ok(section);
+            }
             Err(IndexedReaderError::IncompleteXref { .. }) if length < maximum => {
                 length = length.saturating_mul(2).min(maximum);
             }
@@ -619,6 +705,7 @@ fn parse_classic_xref(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSec
                 kind: IndexXrefType::Table,
                 entries,
                 trailer,
+                length: consumed_length(window, &cursor),
             });
         }
 
@@ -705,13 +792,20 @@ fn parse_xref_stream(window: &[u8], offset: u64) -> IndexedReaderResult<XrefSect
             Err(IndexedReaderError::InvalidXref { offset })
         };
     }
+    let length = consumed_length(window, &cursor);
     let mut stream = Stream::new(dictionary.clone(), content);
     if stream.is_compressed() {
         stream
             .decompress_with_limit(XREF_DECOMPRESSED_LIMIT)
             .map_err(IndexedReaderError::XrefDecompression)?;
     }
-    decode_xref_stream64(stream, offset)
+    let mut section = decode_xref_stream64(stream, offset)?;
+    section.length = length;
+    Ok(section)
+}
+
+fn consumed_length(window: &[u8], cursor: &TokenCursor<'_>) -> u64 {
+    u64::try_from(window.len().saturating_sub(cursor.remaining().len())).unwrap_or(u64::MAX)
 }
 
 fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexedReaderResult<XrefSection64> {
@@ -793,6 +887,7 @@ fn decode_xref_stream64(stream: Stream, offset: u64) -> IndexedReaderResult<Xref
         kind: IndexXrefType::Stream,
         entries,
         trailer,
+        length: 0,
     })
 }
 
@@ -833,7 +928,7 @@ fn trailer_unsigned(dictionary: &Dictionary, key: &[u8]) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
-fn trailer_offset(dictionary: &Dictionary, key: &[u8], name: &'static str) -> IndexedReaderResult<Option<u64>> {
+pub(super) fn trailer_offset(dictionary: &Dictionary, key: &[u8], name: &'static str) -> IndexedReaderResult<Option<u64>> {
     match dictionary.get(key) {
         Ok(object) => object
             .as_i64()
@@ -895,7 +990,7 @@ impl IndexedReader {
     fn from_erased_source(
         source: Arc<dyn RandomAccessSource>, mut options: IndexedReaderOptions,
     ) -> IndexedReaderResult<Self> {
-        let index = PdfIndex::open(Arc::clone(&source))?;
+        let index = PdfIndex::open_limited(Arc::clone(&source), options.max_xref_sections)?;
         let limits = ResolverLimits::from(&options);
         let password = options.password.take();
         let mut reader = Self {
