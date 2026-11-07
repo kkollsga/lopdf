@@ -1137,7 +1137,8 @@ impl<'h> AppendOptions<'h> {
     /// crate can't. It gets the temporary file's path, then the target's, where nothing may exist yet for a new file.
     /// If it fails, the temporary file is removed, the target isn't touched, and the save fails with
     /// [`PrepareReplacement`](AppendError::PrepareReplacement). The check after it reads every original byte again,
-    /// so a step that damages the file fails the save too.
+    /// so a step that damages the file fails the save too. The file is writable by its owner during the step, and takes its final
+    /// mode after it, so a step can't change the mode.
     pub fn prepare_replacement(
         mut self, step: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()> + 'h,
     ) -> Self {
@@ -1269,11 +1270,17 @@ where
     };
     file.sync_all()?;
     drop(file);
-    if let Some(permissions) = permissions {
-        std::fs::set_permissions(&temporary.path, permissions)?;
-    }
     if let Some(step) = options.prepare {
         step(&temporary.path, target).map_err(AppendError::PrepareReplacement)?;
+        // With write access, since Windows' flush needs it. The file's still writable here, whatever its final mode.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary.path)?
+            .sync_all()?;
+    }
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(&temporary.path, permissions)?;
+        #[cfg(unix)]
         std::fs::File::open(&temporary.path)?.sync_all()?;
     }
 
@@ -1441,7 +1448,8 @@ impl TemporaryFile {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            options.mode(permissions.map_or(0o600, |permissions| permissions.mode() & 0o777));
+            // Writable by its owner for now, whatever it ends up as: a prepare step can't set attributes on a read-only file on macOS.
+            options.mode(permissions.map_or(0o600, |permissions| (permissions.mode() & 0o777) | 0o200));
         }
         #[cfg(not(unix))]
         let _ = permissions;

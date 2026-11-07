@@ -2556,6 +2556,47 @@ mod atomic {
         assert_eq!(saved.durability_warning.is_some(), unreadable);
     }
 
+    /// A Save As of a read-only document failing in the attribute step, because the temporary file was read-only from the moment it was made, and
+    /// macOS refuses `setxattr` on one. The step gets a file it can change, and the document's own mode comes back afterwards.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_prepare_step_works_on_a_copy_of_a_read_only_document() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let dir = folder();
+        let source = file(dir.path(), "read-only.pdf", &classic_pdf());
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let copy = dir.path().join("copy.pdf");
+        let attribute = "com.example.append-test";
+        let options = AppendOptions::new().prepare_replacement(|temporary, _| {
+            let output = Command::new("/usr/bin/xattr")
+                .args(["-w", attribute, "kept"])
+                .arg(temporary)
+                .output()?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ))
+            }
+        });
+        let reader = opened(&source);
+        append_atomically(&reader, AppendDestination::NewFile(&copy), options, add_one)
+            .unwrap_or_else(|error| panic!("{error}: {:?}", std::error::Error::source(&error)));
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "the document's mode didn't come back"
+        );
+        let read = Command::new("/usr/bin/xattr")
+            .args(["-p", attribute])
+            .arg(&copy)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&read.stdout).trim(), "kept");
+    }
+
     /// An update starting from a stale view: the file changed after the reader opened it, so the
     /// offsets it would write are wrong for what's there now.
     #[test]
