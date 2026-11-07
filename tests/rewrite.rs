@@ -3174,9 +3174,9 @@ fn replace_bytes(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 }
 
 /// A kept page's content whose cross-reference offset is a few bytes off: viewers that rebuild find it and show it, and the rewrite dropped it as missing,
-/// leaving the page blank. It's found where it is now. One that isn't anywhere near is refused, not dropped.
+/// leaving the page blank. It's found where it is now. One that isn't anywhere near reads as null, as viewers read it, and is listed.
 #[test]
-fn an_object_a_little_off_its_offset_is_found_and_one_nowhere_is_refused() {
+fn an_object_a_little_off_its_offset_is_found_and_one_nowhere_is_listed() {
     let filler = vec![b'x'; 20_000];
     let bytes = two_pages(
         "",
@@ -3200,14 +3200,9 @@ fn an_object_a_little_off_its_offset_is_found_and_one_nowhere_is_refused() {
     // In the middle of the filler, far from any header.
     let far = find(&bytes, b"6 0 obj").unwrap() + 10_000;
     let nowhere = replace_bytes(&bytes, entry.as_bytes(), format!("{far:010} 00000 n").as_bytes());
-    let reader = open_bytes(&nowhere);
-    let refused = RewriteChanges::new(&reader)
-        .unwrap()
-        .write_unverified_to(RewritePolicy::new(), std::io::sink());
-    assert!(
-        matches!(refused, Err(RewriteError::UnreadableObject { id: (5, 0), .. })),
-        "{refused:?}"
-    );
+    let (_, summary, after) = rewrite(&nowhere, |_| {});
+    assert_eq!(summary.objects_missing, vec![(5, 0)]);
+    assert!(!dict(&after, 3).has(b"Contents"));
 }
 
 /// From the fuzz target: a page whose entry is a little off, which this reader doesn't see and a viewer that rebuilds does. The rewrite finds it, so the
@@ -3227,7 +3222,12 @@ fn a_page_found_near_its_offset_counts() {
 /// out: the check after writing has to catch it.
 #[test]
 fn a_copy_that_still_reads_as_signed_fails_its_check() {
-    let bytes = two_pages("", &[raw_stream(5, "", b"BT (x) Tj ET % /ByteRange [0 1 2 3]")], "/Contents 5 0 R", "");
+    let bytes = two_pages(
+        "",
+        &[raw_stream(5, "", b"BT (x) Tj ET % /ByteRange [0 1 2 3]")],
+        "/Contents 5 0 R",
+        "",
+    );
     let reader = open_bytes(&bytes);
     assert_eq!(reader.signatures().unwrap().len(), 1);
     let mut output = Vec::new();
@@ -3236,5 +3236,9 @@ fn a_copy_that_still_reads_as_signed_fails_its_check() {
         .write_unverified_to(RewritePolicy::new().remove_signatures(), &mut output)
         .unwrap();
     let checked = written.verify(&reader, std::sync::Arc::new(BytesSource::from(output)));
-    assert!(matches!(checked, Err(RewriteError::VerificationFailed { .. })), "{:?}", checked.err());
+    assert!(
+        matches!(checked, Err(RewriteError::VerificationFailed { .. })),
+        "{:?}",
+        checked.err()
+    );
 }

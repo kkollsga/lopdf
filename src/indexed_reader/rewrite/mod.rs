@@ -89,7 +89,8 @@
 //!   owner's decision 27): every signature goes, with what a viewer would show of it, and [`RewriteSummary::removed_signatures`] says which.
 //!   Nothing here ever says one is valid.
 //! - **An object that can be reached and can't be read,** which would otherwise be lost without a word. One whose entry is a little off
-//!   is found within 4 KiB, as a viewer that rebuilds finds it. An entry the index has as missing reads as `null` everywhere.
+//!   is found within 4 KiB, as a viewer that rebuilds finds it. One whose entry points at nothing and that isn't nearby reads as `null`, as it
+//!   does in PDFium and MuPDF, and [`RewriteSummary::objects_missing`] lists it.
 //! - **Removing every page,** or a page tree the reader refuses.
 
 use std::io::{Read, Write};
@@ -365,6 +366,9 @@ pub struct RewriteSummary {
     pub stream_bytes_copied: u64,
     /// Objects whose entry in the original's cross-reference data pointed a little off, and that were found nearby, as a viewer that rebuilds finds them.
     pub objects_found_near_their_offset: u64,
+    /// Objects something reachable refers to whose entry points at something else, and that aren't nearby either. They read as null, as PDFium and
+    /// MuPDF read them, so the references to them go. Whatever they were isn't in the original file where anyone can find it.
+    pub objects_missing: Vec<crate::ObjectId>,
     /// Bytes parsed and inflated to plan the file, which the rewrite's work allowance is counted in. Content decoded to search for names
     /// counts separately, against its own.
     pub bytes_examined: u64,

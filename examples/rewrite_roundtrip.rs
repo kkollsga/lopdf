@@ -65,6 +65,7 @@ fn describe(summary: &RewriteSummary) -> serde_json::Value {
         "bytes_examined": summary.bytes_examined,
         "removed_signatures": summary.removed_signatures.len(),
         "objects_found_near_their_offset": summary.objects_found_near_their_offset,
+        "objects_missing": summary.objects_missing.len(),
         "document_data_kept": {
             "embedded_files": summary.document_data_kept.embedded_files,
             "metadata_streams": summary.document_data_kept.metadata_streams,

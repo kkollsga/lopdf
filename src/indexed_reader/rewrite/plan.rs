@@ -1,5 +1,7 @@
 //! What's in the new file: loading objects through the changes, dropping what refers to something gone, and the walk.
 
+use std::collections::BTreeSet;
+
 use super::removal::PageRemoval;
 use super::resources::Pruner;
 use super::*;
@@ -207,6 +209,8 @@ pub(super) struct Plan<'c> {
     pub(super) dead_names: HashSet<Vec<u8>>,
     /// Objects found near where their entry said, not at it.
     pub(super) relocated: u64,
+    /// Objects whose entry points at something else and that aren't nearby either: read as null.
+    pub(super) missing: BTreeSet<u32>,
     /// Where each page of the original is in the new file, when pages are removed: for a destination given as a page's position.
     pub(super) page_positions: Option<Vec<Option<i64>>>,
     pub(super) report: RemovalReport,
@@ -415,6 +419,7 @@ impl<'c> Plan<'c> {
             header_generations: HashMap::new(),
             dead_names: HashSet::new(),
             relocated: 0,
+            missing: BTreeSet::new(),
             page_positions: None,
             report: RemovalReport::default(),
             unsigned: !signatures.is_empty(),
@@ -651,13 +656,16 @@ impl<'c> Plan<'c> {
         let (body_offset, source_len, parsed) = match framed {
             Ok(framed) => framed,
             // The entry's offset doesn't hold the object. A viewer that rebuilds finds it nearby, if it's there, and shows it; so does
-            // this. One that isn't anywhere near is refused when it's reached, which a load is: what can't be found isn't quietly dropped.
-            Err(error @ IndexedReaderError::MissingNormalObjectAtXref { .. }) => match self.frame_nearby(id)? {
+            // this. One that isn't near is read as null, as PDFium and MuPDF read it, and counted, so it isn't dropped without a word.
+            Err(IndexedReaderError::MissingNormalObjectAtXref { .. }) => match self.frame_nearby(id)? {
                 Some(framed) => {
                     self.relocated += 1;
                     framed
                 }
-                None => return Err(unreadable(error)),
+                None => {
+                    self.missing.insert(id.0);
+                    return Ok(None);
+                }
             },
             Err(IndexedReaderError::MissingNormalObject { .. }) => return Ok(None),
             Err(error) => return Err(unreadable(error)),
