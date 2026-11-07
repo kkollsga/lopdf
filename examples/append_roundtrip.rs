@@ -3,6 +3,7 @@
 //!   append_roundtrip corpus <out-dir> <file>...     Two updates per file, every object compared, a JSON line each.
 //!   append_roundtrip measure <mode> <out-dir> <file>   One update, timed. Modes: open, atomic.
 //!   append_roundtrip revisions <file>...            A file's revisions, a JSON line each.
+//!   append_roundtrip resave <folder> <file>         Save As into a folder, then Save three times, for trying a file system.
 //!
 //! Wrap `measure` in `/usr/bin/time -l` for the whole process's peak footprint.
 
@@ -37,6 +38,7 @@ fn main() {
             }
         }
         Some("measure") if args.len() == 4 => measure(&args[1], Path::new(&args[2]), Path::new(&args[3])),
+        Some("resave") if args.len() == 3 => resave(Path::new(&args[1]), Path::new(&args[2])),
         Some("revisions") if args.len() >= 2 => {
             for path in &args[1..] {
                 let chain =
@@ -338,4 +340,44 @@ fn measure(mode: &str, out: &Path, path: &Path) {
         other => panic!("unknown mode {other}"),
     }
     println!("{}", phases.join(", "));
+}
+
+fn resave(folder: &Path, path: &Path) {
+    let reader = open(path).unwrap();
+    let target = folder.join("resave.pdf");
+    let add = |writer: &mut AppendWriter<'_, lopdf::TemporaryOutput<'_>>| {
+        writer.add_object(&Object::Integer(1))?;
+        Ok(())
+    };
+    let mut saved = append_atomically(&reader, AppendDestination::NewFile(&target), AppendOptions::new(), add).unwrap();
+    println!("save as: ok, warning {:?}", saved.durability_warning);
+    for round in 1..=3 {
+        let readable = saved.reader.resolve_object((1, 0)).is_ok() || !saved.reader.object_ids().is_empty();
+        match append_atomically(
+            &saved.reader,
+            AppendDestination::SameFile(&target),
+            AppendOptions::new(),
+            add,
+        ) {
+            Ok(next) => {
+                println!(
+                    "save {round}: ok, returned reader readable {readable}, warning {:?}",
+                    next.durability_warning
+                );
+                saved = next;
+            }
+            Err(error) => {
+                println!("save {round}: refused: {error}");
+                break;
+            }
+        }
+    }
+    let chain = open(&target).unwrap().revisions().unwrap();
+    println!("revisions {}, regular {}", chain.revisions.len(), chain.is_regular());
+    let leftovers = std::fs::read_dir(folder)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".append-"))
+        .count();
+    println!("temporary names left: {leftovers}");
 }

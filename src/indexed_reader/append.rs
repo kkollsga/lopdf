@@ -177,6 +177,8 @@ pub struct AppendSummary {
     /// The objects the caller wrote, in number order. A cross-reference stream's own object isn't
     /// among them.
     pub objects: Vec<AppendedObject>,
+    /// SHA-256 of every byte the update added, which is everything from `previous_len` to `new_len`.
+    pub added_bytes_sha256: [u8; 32],
 }
 
 impl IndexedReader {
@@ -238,7 +240,8 @@ impl IndexedReader {
     /// Compares every original byte, in small pieces. Checks that the new file's chain starts at
     /// the update and reaches the old one, that its trailer carries what the old one had, that every
     /// object written is where the summary says and parses, and that every other object is exactly
-    /// where it was. A written stream's data isn't read, only its dictionary and framing.
+    /// where it was. Then every added byte is compared with what was written, by hash and in small pieces. So nothing is left unread, on
+    /// either side of the join, and none of it is held in memory.
     ///
     /// # Errors
     ///
@@ -342,11 +345,27 @@ impl IndexedReader {
         if !matches!(reader.resolve_object(root), Ok(Object::Dictionary(_))) {
             return failed("/Root no longer resolves");
         }
+        // Last, because it only says that something changed, and the checks above say what. In pieces, however large the update.
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
+        let mut position = summary.previous_len;
+        while position < summary.new_len {
+            let step =
+                usize::try_from(summary.new_len - position).map_or(COPY_CHUNK_BYTES, |left| left.min(COPY_CHUNK_BYTES));
+            reader
+                .whole_file_source()
+                .read_exact_at(position, &mut buffer[..step])?;
+            hash.update(&buffer[..step]);
+            position += u64::try_from(step).unwrap_or(u64::MAX);
+        }
+        if <[u8; 32]>::from(hash.finalize()) != summary.added_bytes_sha256 {
+            return failed("the added bytes aren't what was written");
+        }
         Ok(reader)
     }
 
     /// Whether a reader gets a whole object back. A stream's dictionary and framing are parsed and its
-    /// data isn't read, so this costs at most one object's parsing window, however large the stream.
+    /// data isn't held, so this costs at most one object's parsing window, however large the stream.
     fn written_object_parses(&self, id: crate::ObjectId) -> bool {
         match self.resolve_stream_descriptor(id) {
             Ok(stream) => matches!(stream.encoded_length(), EncodedStreamLength::Known(_)),
@@ -805,6 +824,7 @@ impl<'r, W: AppendOutput> AppendWriter<'r, W> {
         }
         self.emit(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
         self.sink.flush().map_err(AppendError::Io)?;
+        let added_bytes_sha256 = self.sink.hash.clone().finalize().into();
         let size = trailer
             .get(b"Size")
             .and_then(Object::as_i64)
@@ -832,6 +852,7 @@ impl<'r, W: AppendOutput> AppendWriter<'r, W> {
             prev: self.reader.index.xref_start,
             size,
             objects,
+            added_bytes_sha256,
         })
     }
 
@@ -1137,8 +1158,8 @@ impl<'h> AppendOptions<'h> {
     /// A step that runs on the finished temporary file before it's checked and moved into place, to copy what this
     /// crate can't. It gets the temporary file's path, then the target's, where nothing may exist yet for a new file.
     /// If it fails, the temporary file is removed, the target isn't touched, and the save fails with
-    /// [`PrepareReplacement`](AppendError::PrepareReplacement). The check after it reads every original byte again,
-    /// so a step that damages the file fails the save too. The file is writable by its owner during the step, and takes its final
+    /// [`PrepareReplacement`](AppendError::PrepareReplacement). The check after it reads every byte of the file again,
+    /// so a step that damages the file in any way fails the save too. The file is writable by its owner during the step, and takes its final
     /// mode after it, so a step can't change the mode.
     pub fn prepare_replacement(
         mut self, step: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()> + 'h,

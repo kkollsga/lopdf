@@ -49,11 +49,12 @@ It refuses, before writing anything: an index rebuilt by a scan, encryption, a h
 table or sits on a stream section, and a `/Root` that isn't a reference to a dictionary. New object numbers
 stop at PDFium's limit of 4,194,304, and a table's offsets at 10 digits. An array or dictionary nested to the
 parser's 100th level is refused, and a string's parentheses past that depth go out escaped, so what's written
-can always be read. `verify_appended` parses every object written, without reading a stream's data, and
-compares what the trailer carries.
+can always be read. `verify_appended` compares every original byte, parses every object written, compares what the
+trailer carries, and checks every added byte against a hash, all in small pieces.
 
-There is no way to append to a file in place. `AppendWriter` takes a new, empty output, and a file on disk goes
-through `append_atomically`, which says where the result goes:
+There is no way to append to a file in place, and no way to give `AppendWriter` a file: its output is a sealed trait,
+implemented for memory, `Sink`, and a temporary file only `append_atomically` can make. A file on disk goes through
+`append_atomically`, which says where the result goes:
 
 - `AppendDestination::SameFile` is Save. The path has to still be the file the reader opened: same device,
   inode, length and modification time, checked before the write and just before the rename, or `TargetChanged`.
@@ -67,10 +68,12 @@ bits and nothing else:** extended attributes, including Finder tags and `com.app
 birth time are lost unless `AppendOptions::prepare_replacement` copies them, which runs on the finished temporary
 file before it's checked and moved. The crate forbids unsafe code and can't copy them itself.
 
-The temporary file is created exclusively, at the mode of the file it becomes, and named from a hash of the target's
-name. A later save for the same target removes a leftover whose process is gone, if it's a regular file of this user's,
-over an hour old, and its name fits the pattern exactly. After the rename, only `AppendedFile::durability_warning` can
-report a problem, since the file is already in place.
+The temporary file is created exclusively, no more readable than the file it becomes, writable by its owner until the
+prepare step has run, and named from a hash of the target's name. A later save for the same target removes a leftover whose
+process is gone, if it's a regular file of this user's, over an hour old, and its name fits the pattern exactly, asking `ps`
+about at most 16 processes. One of these names that's a link to the target itself is removed whatever its age, since it isn't
+a hard link anyone made. After the rename, only `AppendedFile::durability_warning` can report a problem, since the file is
+already in place.
 
 A small gap remains between the last check and the rename, which safe code can't close.
 
@@ -78,10 +81,11 @@ A file whose last byte isn't a line ending gets `\n%line-ending-added\n` before 
 the revision list can give back the original's exact length. A revision's range ends past the line ending
 after its `%%EOF`, and `eof_marker_end` gives the end before it. A range exists only if a `startxref` names
 the section, the sections run forward through the file, and every section down its chain, and any `/XRefStm`, is
-inside it. A linearized file's two sections count as one revision, as do sections closed by one `startxref`.
+inside it. A linearized file's two sections count as one revision, as do sections closed by the very same `startxref`. Any other section
+sitting inside bytes an earlier revision holds has no range, and `is_regular` is false.
 `open_revision` refuses bytes that would need a rescan. Revisions are listed on request and nothing about them is
 held open.
 
 One walk of the `/Prev` chain is bounded at `max_xref_sections` sections, 4,194,304 different numbers, 33,554,432
-entries listed, and four times the file's length read, plus 8 MiB. No chain of sections that don't overlap can reach
+entries declared, charged before they're decoded, 256 MiB inflated, and four times the file's length read, plus 8 MiB. No chain of sections that don't overlap can reach
 the last. None of these fall back to a rescan.

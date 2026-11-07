@@ -753,9 +753,9 @@ fn the_verifier_catches_an_object_that_doesnt_parse() {
     assert!(matches!(result.err(), Some(AppendError::VerificationFailed { reason }) if reason.contains("read back")),);
 }
 
-/// A large stream being read whole to verify it: the data stays on disk, and only its framing is parsed.
+/// A large stream being held in memory to verify it: however long the update, it's read in small pieces.
 #[test]
-fn the_verifier_checks_a_stream_without_reading_its_data() {
+fn the_verifier_reads_a_stream_in_small_pieces() {
     let reader = open(&classic_pdf());
     let mut output = Vec::new();
     let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
@@ -765,18 +765,45 @@ fn the_verifier_checks_a_stream_without_reading_its_data() {
         .write_stream_from(id, &Dictionary::new(), body.len() as u64, &mut body.as_slice())
         .unwrap();
     let summary = writer.finish().unwrap();
-    let previous = summary.previous_len;
     let source = Arc::new(CountingSource {
         inner: BytesSource::from(output),
         largest_read: AtomicU64::new(0),
         total_read: AtomicU64::new(0),
     });
     reader.verify_appended(source.clone(), &summary).unwrap();
-    let read = source.total_read.load(Ordering::Relaxed);
+    let largest = source.largest_read.load(Ordering::Relaxed);
     assert!(
-        read < previous + 2 * 1_024 * 1_024,
-        "the check read {read} bytes of a file with an 8 MiB stream"
+        largest <= 256 * 1_024,
+        "the check read {largest} bytes at once from a file with an 8 MiB stream"
     );
+}
+
+/// A same-length change to a written stream's data passing the check, since it parses just as well. A disk or a prepare step can do that, and the
+/// change would reach the document.
+#[test]
+fn the_verifier_catches_a_changed_byte_in_a_written_stream() {
+    let reader = open(&classic_pdf());
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
+    let added = writer
+        .add_object(&Object::Stream(Stream::new(Dictionary::new(), b"the data".to_vec())))
+        .unwrap();
+    let summary = writer.finish().unwrap();
+    assert!(
+        reader
+            .verify_appended(Arc::new(BytesSource::from(output.clone())), &summary)
+            .is_ok()
+    );
+
+    let start = added.offset as usize;
+    let at = start
+        + output[start..]
+            .windows(8)
+            .position(|window| window == b"the data")
+            .unwrap();
+    output[at] ^= 1;
+    let result = reader.verify_appended(Arc::new(BytesSource::from(output)), &summary);
+    assert!(matches!(result.err(), Some(AppendError::VerificationFailed { reason }) if reason.contains("added bytes")));
 }
 
 /// Objects with no valid PDF spelling reaching the file, or bad numbers quietly shadowing real objects.
@@ -2302,6 +2329,27 @@ mod atomic {
             std::fs::write(temporary, damaged)
         });
         let result = append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one);
+        assert!(matches!(result.err(), Some(AppendError::VerificationFailed { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// A prepare step changing a stream's data without changing its length, which the doc says fails the save and didn't.
+    #[test]
+    fn a_prepare_step_that_changes_a_written_stream_fails_the_save() {
+        let dir = folder();
+        let bytes = classic_pdf();
+        let path = file(dir.path(), "doc.pdf", &bytes);
+        let reader = opened(&path);
+        let options = AppendOptions::new().prepare_replacement(|temporary, _| {
+            let mut changed = std::fs::read(temporary)?;
+            let at = changed.windows(8).rposition(|window| window == b"the data").unwrap();
+            changed[at] ^= 1;
+            std::fs::write(temporary, changed)
+        });
+        let result = append_atomically(&reader, AppendDestination::SameFile(&path), options, |writer| {
+            writer.add_object(&Object::Stream(Stream::new(Dictionary::new(), b"the data".to_vec())))?;
+            Ok(())
+        });
         assert!(matches!(result.err(), Some(AppendError::VerificationFailed { .. })));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
