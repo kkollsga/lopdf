@@ -64,6 +64,18 @@ fn describe(summary: &RewriteSummary) -> serde_json::Value {
         "stream_bytes_copied": summary.stream_bytes_copied,
         "bytes_examined": summary.bytes_examined,
         "removed_signatures": summary.removed_signatures.len(),
+        "objects_found_near_their_offset": summary.objects_found_near_their_offset,
+        "document_data_kept": {
+            "embedded_files": summary.document_data_kept.embedded_files,
+            "metadata_streams": summary.document_data_kept.metadata_streams,
+            "info_entries": summary.document_data_kept.info_entries,
+            "javascript": summary.document_data_kept.javascript,
+            "piece_info": summary.document_data_kept.piece_info,
+            "document_parts": summary.document_data_kept.document_parts,
+            "xfa": summary.document_data_kept.xfa,
+            "page_position_destinations": summary.document_data_kept.page_position_destinations,
+            "hidden_layers": summary.document_data_kept.hidden_layers,
+        },
         "removal": {
             "pages": summary.removal.pages.len(),
             "page_tree_nodes": summary.removal.page_tree_nodes,
@@ -78,6 +90,8 @@ fn describe(summary: &RewriteSummary) -> serde_json::Value {
             "optional_content_groups": summary.removal.optional_content_groups,
             "resource_names_pruned": summary.removal.resource_names_pruned,
             "resources_left_whole": summary.removal.resources_left_whole.len(),
+            "resource_dictionaries_unlisted": summary.removal.resource_dictionaries_unlisted,
+            "structure_text_spanning_removed_pages": summary.removal.structure_text_spanning_removed_pages,
         },
     })
 }
