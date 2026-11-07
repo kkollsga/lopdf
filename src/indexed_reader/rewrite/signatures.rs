@@ -6,8 +6,6 @@ use super::*;
 const MAX_REPORTED_SIGNATURES: usize = 4_096;
 /// Form fields looked at for signature names.
 const MAX_FIELDS_LOOKED_AT: usize = 1_000_000;
-/// How far past `/ByteRange` its four numbers can be, in the search over the raw file.
-const BYTE_RANGE_WINDOW: usize = 128;
 
 /// What kind of signature it says it is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,38 +199,32 @@ impl IndexedReader {
         }
     }
 
-    /// Every `/ByteRange [a b c d]` in the file's bytes, read in pieces.
+    /// Every `/ByteRange` name in the file's bytes, however it's spelled and wherever a piece of the read ends. The names are read
+    /// by a tokenizer that carries a name over from one piece to the next, so nothing about where the pieces fall can hide one. What follows each is
+    /// read afterwards from a window of its own: a signature counts whatever its value turns out to be.
     fn collect_byte_range_signatures(&self, found: &mut Vec<IndexedSignature>) -> IndexedReaderResult<()> {
-        const KEY: &[u8] = b"/ByteRange";
         let source = self.source.as_ref();
         let length = self.index.source_len;
-        let overlap = KEY.len() + BYTE_RANGE_WINDOW;
-        let mut buffer = vec![0_u8; COPY_CHUNK_BYTES + overlap];
-        let mut position = 0_u64;
         let mut hits = Vec::new();
+        let mut names = NameScanner::default();
+        let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
+        let mut position = 0_u64;
         while position < length {
-            let step = usize::try_from(length - position).map_or(buffer.len(), |left| left.min(buffer.len()));
+            let step = usize::try_from(length - position).map_or(COPY_CHUNK_BYTES, |left| left.min(COPY_CHUNK_BYTES));
             source.read_exact_at(position, &mut buffer[..step])?;
-            let window = &buffer[..step];
-            let last_chunk = position + step as u64 >= length;
-            // A match in the overlap is found whole by the next piece.
-            let limit = if last_chunk { step } else { COPY_CHUNK_BYTES };
-            let mut at = 0;
-            while let Some(found_at) = find_bytes(&window[at..limit.min(step)], KEY) {
-                let hit = at + found_at;
-                if let Some(range) = parse_byte_range(&window[hit + KEY.len()..]) {
-                    hits.push((position + hit as u64, range));
+            names.feed(&buffer[..step], position, |start, name| {
+                if name == b"ByteRange" && hits.len() < MAX_REPORTED_SIGNATURES {
+                    hits.push(start);
                 }
-                at = hit + KEY.len();
-                if at >= limit.min(step) {
-                    break;
-                }
-            }
-            if last_chunk {
-                break;
-            }
-            position += COPY_CHUNK_BYTES as u64;
+            });
+            position += step as u64;
         }
+        names.finish(|start, name| {
+            if name == b"ByteRange" && hits.len() < MAX_REPORTED_SIGNATURES {
+                hits.push(start);
+            }
+        });
+        drop(buffer);
         if hits.is_empty() {
             return Ok(());
         }
@@ -249,13 +241,12 @@ impl IndexedReader {
             })
             .collect();
         starts.sort_unstable();
-        for (at, range) in hits {
+        for at in hits {
             if found.len() >= MAX_REPORTED_SIGNATURES {
                 break;
             }
-            if found.iter().any(|known| known.byte_range == Some(range)) {
-                continue;
-            }
+            let window = source.read_range(at, (length - at).min(VALUE_WINDOW), VALUE_WINDOW)?;
+            let range = parse_byte_range(&window);
             let holder = starts
                 .partition_point(|(offset, _, _)| *offset <= at)
                 .checked_sub(1)
@@ -264,51 +255,132 @@ impl IndexedReader {
                 let (_, _, parsed) = self.frame_at_header_generation((*number, *generation)).1.ok()?;
                 parsed.object.as_dict().ok().cloned()
             });
-            let in_this_object = dict.as_ref().is_some_and(|dict| {
-                is_signature_dictionary(dict).is_some()
-                    && dict.get(b"ByteRange").and_then(Object::as_array).is_ok_and(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_i64().ok())
-                            .map(|value| value as u64)
-                            .eq(range)
-                    })
-            });
-            if let (true, Some(dict), Some((_, number, generation))) = (in_this_object, &dict, holder) {
-                let kind = is_signature_dictionary(dict).unwrap_or(IndexedSignatureKind::Signature);
-                found.push(signature_from(dict, Some((*number, *generation)), None, kind, true));
-            } else {
-                found.push(IndexedSignature {
-                    object: None,
-                    field_name: None,
-                    sub_filter: None,
-                    stated_name: None,
-                    byte_range: Some(range),
-                    kind: IndexedSignatureKind::Signature,
-                    in_newest_revision: false,
-                });
+            let signature_here = dict.as_ref().and_then(is_signature_dictionary);
+            match (signature_here, &dict, holder) {
+                (Some(kind), Some(dict), Some((_, number, generation))) => {
+                    let id = (*number, *generation);
+                    if !found.iter().any(|known| known.object == Some(id)) {
+                        found.push(signature_from(dict, Some(id), None, kind, true));
+                    }
+                }
+                _ => {
+                    if range.is_some() && found.iter().any(|known| known.byte_range == range) {
+                        continue;
+                    }
+                    found.push(IndexedSignature {
+                        object: None,
+                        field_name: None,
+                        sub_filter: None,
+                        stated_name: None,
+                        byte_range: range,
+                        kind: IndexedSignatureKind::Signature,
+                        in_newest_revision: false,
+                    });
+                }
             }
         }
         Ok(())
     }
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+/// Bytes read after a `/ByteRange` for its value: room for a lot of white space and comments.
+const VALUE_WINDOW: u64 = 16 * 1_024;
+/// Longer than any name worth reading. A longer one can't be `/ByteRange` however it's escaped.
+const MAX_NAME_BYTES: usize = 3 * 64;
+
+/// Names in a run of bytes given in pieces. A name can start in one piece and end in the next.
+#[derive(Default)]
+struct NameScanner {
+    name: Option<(u64, Vec<u8>)>,
 }
 
-/// The four numbers of a `/ByteRange` that starts here. Whitespace between them may be anything PDF allows.
+impl NameScanner {
+    /// `found` gets the offset just past each name, and the name decoded.
+    fn feed(&mut self, bytes: &[u8], offset: u64, mut found: impl FnMut(u64, &[u8])) {
+        for (at, byte) in bytes.iter().enumerate() {
+            let regular = !is_pdf_whitespace(*byte) && !is_pdf_delimiter(*byte);
+            match &mut self.name {
+                Some((_, name)) if regular => {
+                    if name.len() <= MAX_NAME_BYTES {
+                        name.push(*byte);
+                    }
+                }
+                Some(_) => {
+                    if let Some((start, name)) = self.name.take() {
+                        found(start + 1 + name.len() as u64, &decode_name(&name));
+                    }
+                }
+                None => {}
+            }
+            if *byte == b'/' {
+                self.name = Some((offset + at as u64, Vec::new()));
+            }
+        }
+    }
+
+    fn finish(&mut self, mut found: impl FnMut(u64, &[u8])) {
+        if let Some((start, name)) = self.name.take() {
+            found(start + 1 + name.len() as u64, &decode_name(&name));
+        }
+    }
+}
+
+/// A name's bytes with `#xx` escapes decoded.
+fn decode_name(raw: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    while at < raw.len() {
+        let hex = (raw[at] == b'#')
+            .then(|| raw.get(at + 1..at + 3))
+            .flatten()
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+        match hex {
+            Some(byte) => {
+                decoded.push(byte);
+                at += 3;
+            }
+            None => {
+                decoded.push(raw[at]);
+                at += 1;
+            }
+        }
+    }
+    decoded
+}
+
+/// The four numbers of a `/ByteRange` value that starts here, past any white space and comments.
 fn parse_byte_range(bytes: &[u8]) -> Option<[u64; 4]> {
-    let mut cursor = TokenCursor::new(bytes.get(..BYTE_RANGE_WINDOW.min(bytes.len()))?);
-    cursor.skip_space();
-    cursor.remaining().starts_with(b"[").then_some(())?;
-    cursor.take(1)?;
+    let skip = |bytes: &[u8], mut at: usize| {
+        loop {
+            while at < bytes.len() && is_pdf_whitespace(bytes[at]) {
+                at += 1;
+            }
+            if bytes.get(at) == Some(&b'%') {
+                while at < bytes.len() && !matches!(bytes[at], b'\r' | b'\n') {
+                    at += 1;
+                }
+                continue;
+            }
+            return at;
+        }
+    };
+    let mut at = skip(bytes, 0);
+    if bytes.get(at) != Some(&b'[') {
+        return None;
+    }
+    at += 1;
     let mut numbers = [0_u64; 4];
     for number in &mut numbers {
-        *number = cursor.unsigned()?;
+        at = skip(bytes, at);
+        let start = at;
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            at += 1;
+        }
+        *number = std::str::from_utf8(&bytes[start..at]).ok()?.parse().ok()?;
     }
-    cursor.skip_space();
-    cursor.remaining().starts_with(b"]").then_some(numbers)
+    at = skip(bytes, at);
+    (bytes.get(at) == Some(&b']')).then_some(numbers)
 }
 
 impl Plan<'_> {

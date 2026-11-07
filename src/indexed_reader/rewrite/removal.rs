@@ -903,15 +903,18 @@ impl Plan<'_> {
                             label.set(key.to_vec(), value.clone());
                         }
                     }
+                    // Checked: a hostile range starts anywhere and numbers from anything. A number no viewer can show goes.
                     let first = dict.get(b"St").and_then(Object::as_i64).unwrap_or(1);
-                    let number = first.saturating_add(position - start);
-                    if number != 1 {
+                    let number = position.checked_sub(*start).and_then(|offset| first.checked_add(offset));
+                    if let Some(number) = number.filter(|number| (2..=i64::from(i32::MAX)).contains(number)) {
                         label.set("St", number);
                     }
                 } else {
                     // Before any range: a viewer shows the position, plainly numbered.
                     label.set("S", Object::Name(b"D".to_vec()));
-                    label.set("St", position.saturating_add(1));
+                    if let Some(number) = position.checked_add(1).filter(|number| *number <= i64::from(i32::MAX)) {
+                        label.set("St", number);
+                    }
                 }
                 nums.push(Object::Integer(new_index));
                 nums.push(Object::Dictionary(label));

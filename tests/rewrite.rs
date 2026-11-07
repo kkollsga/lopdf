@@ -2500,3 +2500,86 @@ fn damaged_files_never_panic_and_never_give_a_bad_result() {
         "only {produced} of 900 damaged files got through: the check isn't reaching the writer"
     );
 }
+
+// ---- From the first review. ----
+
+/// A hostile /PageLabels key subtracted without a check: the debug build panicked, and the release build wrote a label number that wraps.
+#[test]
+fn hostile_page_label_numbers_neither_panic_nor_wrap() {
+    for nums in [
+        "[-9223372036854775808 << /S /D >>]",
+        "[0 << /S /D /St 9223372036854775807 >> 1 << /S /D >>]",
+        "[0 << /S /D /St -5 >>]",
+        "[9223372036854775807 << /S /D >>]",
+    ] {
+        let mut builder = Builder::new(500);
+        let objects = vec![
+            obj(1, &format!("<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums {nums} >> >>")),
+            obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 9 9] >>"),
+            obj(3, "<< /Type /Page /Parent 2 0 R >>"),
+            obj(4, "<< /Type /Page /Parent 2 0 R >>"),
+            obj(5, "<< /Type /Page /Parent 2 0 R >>"),
+        ];
+        builder.place(Form::Table, &objects, 100);
+        builder.finish_revision(Form::Table, "/Root 1 0 R");
+        let (_, _, after) = rewrite(&builder.bytes, remove_second_page);
+        let catalog = dict(&after, 1);
+        let labels = catalog.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
+        for value in labels.iter().filter_map(|value| value.as_dict().ok()) {
+            if let Ok(start) = value.get(b"St") {
+                let start = start.as_i64().unwrap();
+                assert!((1..=i64::from(i32::MAX)).contains(&start), "{nums}: /St {start}");
+            }
+        }
+    }
+}
+
+fn signed_in_old_revision_at(byte_range_at: usize, key: &str, value: &str) -> Vec<u8> {
+    // An old revision's signature dictionary that nothing reaches any more, with its key at an exact offset.
+    let mut builder = Builder::new(500);
+    let head = obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    builder.write_obj(&head);
+    builder.write_obj(&obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 9 9] >>"));
+    builder.write_obj(&obj(3, "<< /Type /Page /Parent 2 0 R >>"));
+    let prefix = "7 0 obj\n<< /Type /Sig /Contents <00> ";
+    let pad = byte_range_at - builder.bytes.len() - prefix.len() - 2;
+    builder.bytes.extend_from_slice(format!("% {}\n", "x".repeat(pad.saturating_sub(1))).as_bytes());
+    assert!(builder.bytes.len() + prefix.len() <= byte_range_at);
+    while builder.bytes.len() + prefix.len() < byte_range_at {
+        builder.bytes.push(b' ');
+    }
+    builder.offsets.insert(7, builder.bytes.len() as u64);
+    builder.bytes.extend_from_slice(prefix.as_bytes());
+    assert_eq!(builder.bytes.len(), byte_range_at);
+    builder.bytes.extend_from_slice(format!("{key}{value} >>\nendobj\n").as_bytes());
+    builder.finish_revision(Form::Table, "/Root 1 0 R");
+    builder.free.push(7);
+    builder.place(Form::Table, &[obj(1, "<< /Type /Catalog /Pages 2 0 R >>")], 100);
+    builder.finish_revision(Form::Table, "/Root 1 0 R");
+    builder.bytes
+}
+
+/// A /ByteRange the search of the file's bytes didn't see, which let a signed file be replaced in place: one starting in the last bytes of a 64 KiB piece,
+/// spelled with an escape, given by reference, or with a lot of white space before its numbers. Every start around each of the first few boundaries.
+#[test]
+fn every_byte_range_in_the_file_is_found_wherever_it_is() {
+    for boundary in [65_536_usize, 131_072] {
+        for at in boundary - 40..boundary + 12 {
+            let bytes = signed_in_old_revision_at(at, "/ByteRange", " [0 10 20 30]");
+            let found = open_bytes(&bytes).signatures().unwrap();
+            assert_eq!(found.len(), 1, "/ByteRange at {at}");
+            assert_eq!(found[0].byte_range, Some([0, 10, 20, 30]), "at {at}");
+        }
+    }
+    let whitespace = format!("{}[0 10 20 30]", " \r\n\t".repeat(200));
+    for (key, value) in [
+        ("/Byte#52ange", " [0 10 20 30]"),
+        ("/ByteRange", " 9 0 R"),
+        ("/ByteRange", whitespace.as_str()),
+        ("/ByteRange", "%comment\n[0 10 20 30]"),
+    ] {
+        let bytes = signed_in_old_revision_at(5_000, key, value);
+        let found = open_bytes(&bytes).signatures().unwrap();
+        assert_eq!(found.len(), 1, "{key}{value:.40}");
+    }
+}
