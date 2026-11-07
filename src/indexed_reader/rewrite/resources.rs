@@ -272,9 +272,14 @@ pub(super) fn every_name(bytes: &[u8], mut found: impl FnMut(&[u8])) {
 /// A stream's decoded bytes, all of them or none. The general decoder gives what it can of a damaged stream, which is right for showing
 /// it and wrong here: names past the damage wouldn't be seen, a viewer might get further, and a page would lose what it uses. Nothing past
 /// `limit` is ever produced.
-fn decode_all_or_nothing(dict: &Dictionary, content: &[u8], limit: usize, inflated: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn decode_all_or_nothing(dict: &Dictionary, content: &[u8], limit: usize, output: &mut Vec<u8>) -> Option<()> {
+    output.clear();
     if !dict.has(b"Filter") {
-        return (content.len() <= limit).then(|| content.to_vec());
+        if content.len() > limit {
+            return None;
+        }
+        output.extend_from_slice(content);
+        return Some(());
     }
     let flate = |name: &[u8]| name == b"FlateDecode" || name == b"Fl";
     let filters: Vec<Vec<u8>> = Stream::new(dict.clone(), Vec::new())
@@ -287,12 +292,17 @@ fn decode_all_or_nothing(dict: &Dictionary, content: &[u8], limit: usize, inflat
         // Predictors aren't something content streams use. Whatever this is, it isn't looked into.
         return None;
     }
-    let mut bytes: Option<Vec<u8>> = None;
+    if let [only] = filters.as_slice()
+        && flate(only)
+    {
+        // The usual case, straight into the reused buffer.
+        return inflate_whole_into(content, limit, output);
+    }
+    let mut bytes = content.to_vec();
     for filter in &filters {
-        let input = bytes.as_deref().unwrap_or(content);
-        let output = if flate(filter) {
-            inflate_whole_into(input, limit, inflated)?;
-            inflated.clone()
+        bytes = if flate(filter) {
+            inflate_whole_into(&bytes, limit, output)?;
+            std::mem::take(output)
         } else {
             let mut stage = Dictionary::new();
             stage.set("Filter", Object::Name(filter.clone()));
@@ -301,13 +311,11 @@ fn decode_all_or_nothing(dict: &Dictionary, content: &[u8], limit: usize, inflat
             {
                 stage.set("DecodeParms", parameters.clone());
             }
-            Stream::new(stage, input.to_vec())
-                .decompressed_content_with_limit(limit)
-                .ok()?
+            Stream::new(stage, bytes).decompressed_content_with_limit(limit).ok()?
         };
-        bytes = Some(output);
     }
-    bytes
+    *output = bytes;
+    Some(())
 }
 
 /// Inflate to the end of the deflate stream, or not at all: truncated data doesn't count.
@@ -893,27 +901,27 @@ impl Plan<'_> {
                 dict.set(key.to_vec(), value);
             }
         }
-        let decoded = if readable {
+        let mut decoded = std::mem::take(&mut pruner.inflated);
+        let complete = readable && {
             pruner.decoded = pruner.decoded.saturating_add(raw.len() as u64);
-            decode_all_or_nothing(&dict, &raw, limit, &mut pruner.inflated)
-        } else {
-            None
+            decode_all_or_nothing(&dict, &raw, limit, &mut decoded).is_some()
         };
         pruner.raw = raw;
-        let Some(decoded) = decoded else {
+        if !complete {
+            pruner.inflated = decoded;
             if left < limit_stream {
                 // Out of allowance, not out of luck: everything stays whole from here.
                 pruner.give_up();
             }
             pruner.names.insert(number, None);
             return Ok(None);
-        };
+        }
         pruner.decoded = pruner.decoded.saturating_add(decoded.len() as u64);
         let mut names = BTreeSet::new();
         every_name(&decoded, |name| {
             names.insert(name.to_vec());
         });
-        drop(decoded);
+        pruner.inflated = decoded;
         let names: Rc<[Vec<u8>]> = names.into_iter().collect();
         if pruner.remembered_names + names.len() <= MAX_REMEMBERED_NAMES {
             pruner.remembered_names += names.len();

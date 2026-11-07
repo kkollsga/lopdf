@@ -133,6 +133,9 @@ struct ParsedCache {
     entries: HashMap<u32, Loaded>,
     order: VecDeque<(u32, u64)>,
     weight: u64,
+    /// The last big one, by itself: parsing a big object again costs more than keeping one, and a hostile file names the same one from
+    /// everywhere. Freed and parsed again, its large blocks pile up in the process's footprint.
+    big: Option<(u32, Loaded)>,
 }
 
 impl ParsedCache {
@@ -140,12 +143,19 @@ impl ParsedCache {
     const MAX_ENTRY_WEIGHT: u64 = 16 * 1_024;
 
     fn get(&self, number: u32) -> Option<Loaded> {
-        self.entries.get(&number).cloned()
+        match &self.big {
+            Some((big, loaded)) if *big == number => Some(loaded.clone()),
+            _ => self.entries.get(&number).cloned(),
+        }
     }
 
     fn insert(&mut self, number: u32, loaded: &Loaded, weight: u64) {
         let weight = weight.max(64);
-        if weight > Self::MAX_ENTRY_WEIGHT || self.entries.contains_key(&number) {
+        if weight > Self::MAX_ENTRY_WEIGHT {
+            self.big = Some((number, loaded.clone()));
+            return;
+        }
+        if self.entries.contains_key(&number) {
             return;
         }
         while self.weight + weight > Self::MAX_WEIGHT
