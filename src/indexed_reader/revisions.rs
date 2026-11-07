@@ -136,7 +136,7 @@ impl IndexedReader {
         let source = self.whole_file_source();
         let origin = self.index.source_origin;
         let source_len = self.index.source_len;
-        let mut budget = XrefWalkBudget::new(self.options.max_xref_sections);
+        let mut budget = XrefWalkBudget::new(self.options.max_xref_sections, source_len);
         let mut seen = HashSet::new();
         let mut sections = Vec::new();
         let mut next = Some(self.index.xref_start);

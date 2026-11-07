@@ -896,3 +896,31 @@ fn xref_stream_framing_matches_eager_reader() {
         ));
     }
 }
+
+/// Sections listing the same million numbers again and again running with no limit, since the limit on different numbers can't
+/// see them. Building that many entries takes minutes on a debug build, so this holds the budget to its limit directly.
+#[test]
+fn the_walk_stops_at_its_limit_on_rows_listed() {
+    let mut budget = XrefWalkBudget::new(MAX_XREF_REVISIONS, 0);
+    budget
+        .charge_rows(usize::try_from(MAX_XREF_WALK_ROWS).unwrap())
+        .unwrap();
+    assert!(matches!(
+        budget.charge_rows(1),
+        Err(IndexedReaderError::EntryLimitExceeded {
+            limit: MAX_XREF_WALK_ROWS,
+            ..
+        })
+    ));
+}
+
+/// The read limit being a fixed figure, which refused real files with large tables, or scaling so loosely that overlapping sections
+/// get to read as much as they like. It has to allow four times the file and no more.
+#[test]
+fn the_walk_may_read_four_times_the_file_and_no_more() {
+    let megabyte = 1_024 * 1_024;
+    let mut budget = XrefWalkBudget::new(MAX_XREF_REVISIONS, 100 * megabyte);
+    budget.charge_read(400 * megabyte).unwrap();
+    budget.charge_read(XREF_WALK_READ_ALLOWANCE).unwrap();
+    assert!(budget.charge_read(1).is_err());
+}

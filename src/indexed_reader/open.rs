@@ -56,18 +56,22 @@ pub(crate) struct XrefChainFacts {
 /// so a small file can still ask for gigabytes of reads or of index entries.
 pub(super) struct XrefWalkBudget {
     max_sections: usize,
+    max_bytes: u64,
     sections: usize,
     bytes: u64,
-    entries: u64,
+    rows: u64,
 }
 
 impl XrefWalkBudget {
-    pub(super) fn new(max_sections: usize) -> Self {
+    pub(super) fn new(max_sections: usize, source_len: u64) -> Self {
         Self {
             max_sections,
+            max_bytes: source_len
+                .saturating_mul(XREF_WALK_READS_PER_FILE_BYTE)
+                .saturating_add(XREF_WALK_READ_ALLOWANCE),
             sections: 0,
             bytes: 0,
-            entries: 0,
+            rows: 0,
         }
     }
 
@@ -81,23 +85,23 @@ impl XrefWalkBudget {
         Ok(())
     }
 
-    fn charge_read(&mut self, length: u64) -> IndexedReaderResult<()> {
+    pub(super) fn charge_read(&mut self, length: u64) -> IndexedReaderResult<()> {
         self.bytes = self.bytes.saturating_add(length);
-        if self.bytes > MAX_XREF_WALK_BYTES {
+        if self.bytes > self.max_bytes {
             return Err(IndexedReaderError::StructureLimitExceeded {
                 structure: "cross-reference chain",
-                limit: MAX_XREF_WALK_BYTES,
+                limit: self.max_bytes,
             });
         }
         Ok(())
     }
 
-    fn charge_entries(&mut self, count: usize) -> IndexedReaderResult<()> {
-        self.entries = self.entries.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-        if self.entries > MAX_XREF_WALK_ENTRIES {
+    pub(super) fn charge_rows(&mut self, count: usize) -> IndexedReaderResult<()> {
+        self.rows = self.rows.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        if self.rows > MAX_XREF_WALK_ROWS {
             return Err(IndexedReaderError::EntryLimitExceeded {
-                count: self.entries,
-                limit: MAX_XREF_WALK_ENTRIES,
+                count: self.rows,
+                limit: MAX_XREF_WALK_ROWS,
             });
         }
         Ok(())
@@ -191,7 +195,7 @@ impl PdfIndex {
         let mut newest_trailer = None;
         let mut newest_type = None;
         let mut declared_size = 0_u64;
-        let mut budget = XrefWalkBudget::new(max_sections);
+        let mut budget = XrefWalkBudget::new(max_sections, source_len);
         let mut chain = XrefChainFacts::default();
 
         while let Some(offset) = next {
@@ -246,6 +250,13 @@ impl PdfIndex {
                 }
             }
             merge_newest(&mut locations, entries);
+            let numbers = u64::try_from(locations.len()).unwrap_or(u64::MAX);
+            if numbers > MAX_XREF_NUMBERS {
+                return Err(IndexedReaderError::EntryLimitExceeded {
+                    count: numbers,
+                    limit: MAX_XREF_NUMBERS,
+                });
+            }
 
             next = trailer_offset(&section.trailer, b"Prev", "Prev")?;
         }
@@ -655,7 +666,7 @@ pub(super) fn read_xref_section(
         };
         match result {
             Ok(section) => {
-                budget.charge_entries(section.entries.len())?;
+                budget.charge_rows(section.entries.len())?;
                 return Ok(section);
             }
             Err(IndexedReaderError::IncompleteXref { .. }) if length < maximum => {

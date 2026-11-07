@@ -130,6 +130,40 @@ fn deflated_sections_cant_grow_the_index_without_limit() {
     );
 }
 
+/// The bounds refusing a real file with no way back. Counting each number every time it was listed stopped a 200,000-object file at about
+/// 21 updates that list every number, which some producers write, and a fixed 256 MiB read limit stopped it as well, since growing the
+/// window for each table of a little over 4 MiB reads about 16 MiB.
+#[test]
+fn a_large_file_with_many_full_updates_opens() {
+    let objects = 220_000_u64;
+    let updates = 21;
+    let mut table = Vec::with_capacity(objects as usize * 20 + 32);
+    table.extend_from_slice(format!("xref\n1 {objects}\n").as_bytes());
+    for _ in 0..objects {
+        table.extend_from_slice(b"0000000009 00000 n \n");
+    }
+    let mut bytes = BODY.to_vec();
+    let mut prev = None;
+    let mut last = 0;
+    for _ in 0..updates {
+        last = bytes.len();
+        bytes.extend_from_slice(&table);
+        let chained = prev.map_or(String::new(), |prev: usize| format!("/Prev {prev}"));
+        bytes.extend_from_slice(
+            format!(
+                "trailer<</Size {}/Root 1 0 R{chained}>>\nstartxref\n{last}\n%%EOF\n",
+                objects + 1
+            )
+            .as_bytes(),
+        );
+        prev = Some(last);
+    }
+    let _ = last;
+    let reader = IndexedReader::open(BytesSource::from(bytes)).unwrap();
+    assert!(!reader.index_stats().unwrap().recovered());
+    assert_eq!(reader.object_ids().len(), objects as usize);
+}
+
 /// The bound catching real files: a chain of ordinary updates has to open at any length up to the cap.
 #[test]
 fn a_chain_of_ordinary_updates_opens_at_the_cap() {
