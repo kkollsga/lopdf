@@ -3221,3 +3221,20 @@ fn a_page_found_near_its_offset_counts() {
         assert!(property::check_rewrite_on_any_bytes(bytes));
     }
 }
+
+/// A copy that was to be unsigned and still holds something that reads as a signature getting through, because only the plan was trusted. Here it's text
+/// in an unfiltered content stream that spells a /ByteRange, which the search of the file's bytes counts, on the side of refusing, and the removal can't take
+/// out: the check after writing has to catch it.
+#[test]
+fn a_copy_that_still_reads_as_signed_fails_its_check() {
+    let bytes = two_pages("", &[raw_stream(5, "", b"BT (x) Tj ET % /ByteRange [0 1 2 3]")], "/Contents 5 0 R", "");
+    let reader = open_bytes(&bytes);
+    assert_eq!(reader.signatures().unwrap().len(), 1);
+    let mut output = Vec::new();
+    let written = RewriteChanges::new(&reader)
+        .unwrap()
+        .write_unverified_to(RewritePolicy::new().remove_signatures(), &mut output)
+        .unwrap();
+    let checked = written.verify(&reader, std::sync::Arc::new(BytesSource::from(output)));
+    assert!(matches!(checked, Err(RewriteError::VerificationFailed { .. })), "{:?}", checked.err());
+}
