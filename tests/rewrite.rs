@@ -2995,3 +2995,23 @@ fn removed_content_reached_another_way_goes_or_is_reported() {
         );
     }
 }
+
+/// One huge object named from every page, in an object stream: members weren't charged against the work allowance, so the same array was parsed
+/// for every page, without end. Now it's parsed a bounded number of times, whatever the number of pages.
+#[test]
+fn a_huge_object_named_from_every_page_is_parsed_a_bounded_number_of_times() {
+    const PAGES: u32 = 400;
+    let mut builder = Builder::new(PAGES + 100);
+    let mut objects = vec![obj(1, "<< /Type /Catalog /Pages 2 0 R >>"), obj(3, &format!("[{}]", "0 ".repeat(200_000)))];
+    let kids: Vec<String> = (0..PAGES).map(|page| format!("{} 0 R", 10 + page)).collect();
+    objects.push(obj(2, &format!("<< /Type /Pages /Kids [{}] /Count {PAGES} /MediaBox [0 0 9 9] >>", kids.join(" "))));
+    for page in 0..PAGES {
+        objects.push(obj(10 + page, "<< /Type /Page /Parent 2 0 R /Annots 3 0 R >>"));
+    }
+    builder.place(Form::Compressed, &objects, 10_000);
+    builder.finish_revision(Form::Compressed, "/Root 1 0 R");
+    let (_, summary, after) = rewrite(&builder.bytes, remove_second_page);
+    assert_eq!(after.page_count().unwrap(), PAGES as usize - 1);
+    // About 400 KB of array: a few passes over it, not one for each page.
+    assert!(summary.bytes_examined < 16 * 1_024 * 1_024, "{} bytes examined", summary.bytes_examined);
+}
