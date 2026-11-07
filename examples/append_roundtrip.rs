@@ -1,7 +1,7 @@
 //! Round trips real PDFs through the append writer, and measures it. Doesn't touch its inputs.
 //!
 //!   append_roundtrip corpus <out-dir> <file>...     Two updates per file, every object compared, a JSON line each.
-//!   append_roundtrip measure <mode> <out-dir> <file>   One update, timed. Modes: open, copy, atomic, tail.
+//!   append_roundtrip measure <mode> <out-dir> <file>   One update, timed. Modes: open, copy, atomic.
 //!   append_roundtrip revisions <file>...            A file's revisions, a JSON line each.
 //!
 //! Wrap `measure` in `/usr/bin/time -l` for the whole process's peak footprint.
@@ -64,7 +64,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: append_roundtrip corpus <out-dir> <file>... | measure <open|copy|atomic|tail> <out-dir> <file>"
+                "usage: append_roundtrip corpus <out-dir> <file>... | measure <open|copy|atomic> <out-dir> <file>"
             );
             std::process::exit(2);
         }
@@ -331,20 +331,6 @@ fn measure(mode: &str, out: &Path, path: &Path) {
             .unwrap();
             lap("copy, write, sync, verify, rename");
             println!("appended {} bytes", summary.new_len - summary.previous_len);
-        }
-        "tail" => {
-            std::fs::copy(path, &target).unwrap();
-            lap("clone the file");
-            let mut file = std::fs::OpenOptions::new().append(true).open(&target).unwrap();
-            let mut writer = AppendWriter::tail_only(&reader, &mut file).unwrap();
-            small_edit(&reader, &mut writer).unwrap();
-            let summary = writer.finish().unwrap();
-            drop(file);
-            lap("append");
-            println!("appended {} bytes", summary.new_len - summary.previous_len);
-            let source: Arc<dyn RandomAccessSource> = Arc::new(FileSource::open(&target).unwrap());
-            reader.verify_appended(source, &summary).unwrap();
-            lap("verify");
         }
         other => panic!("unknown mode {other}"),
     }

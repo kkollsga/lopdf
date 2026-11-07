@@ -6,7 +6,7 @@
 //!
 //! - **Memory** is proportional to what's written: about 40 bytes for each new object, a 64 KiB
 //!   output buffer, and one 64 KiB buffer while copying. The original file is read in 64 KiB
-//!   pieces, and not at all if the caller appends to the file itself ([`AppendWriter::tail_only`]).
+//!   pieces.
 //! - **Objects go out as they're given**, so a large stream can be written from any [`Read`] and is
 //!   never in memory whole ([`AppendWriter::write_stream_from`]).
 //! - **The cross-reference section matches the file's own form.** A table for a table or a hybrid
@@ -370,12 +370,23 @@ impl<W: Write> Write for Sink<W> {
     }
 }
 
-/// An incremental update being written. Build one with [`new`](Self::new) or
-/// [`tail_only`](Self::tail_only), write objects, and call [`finish`](Self::finish).
+/// An incremental update being written. Build one with [`new`](Self::new), write objects, and call
+/// [`finish`](Self::finish). For a file on disk, use [`append_atomically`], which handles all of this.
 ///
-/// Dropping it unfinished leaves `out` holding a partial tail with no `startxref`. If `out` is the
-/// original file, readers still find the old `%%EOF`, but the bytes stay, so write to a temporary
-/// file where that matters: [`append_atomically`] does.
+/// `out` has to be a new, empty output. Nothing here can check that: pointing it at the file the reader
+/// has open would damage that file. There is deliberately no way to append to a file in place, which
+/// can't be made safe through a [`Write`]: nothing can see where its cursor is or who else is appending.
+///
+/// Dropping it unfinished leaves `out` holding a partial update with no `startxref`.
+///
+/// ```compile_fail,E0599
+/// // The in-place route this type used to offer. Keep it gone: a file opened without append mode had
+/// // its header overwritten, and `finish` returned Ok.
+/// # use lopdf::{AppendWriter, BytesSource, IndexedReader};
+/// # fn demo(reader: &IndexedReader) {
+/// let _ = AppendWriter::tail_only(reader, Vec::new());
+/// # }
+/// ```
 pub struct AppendWriter<'r, W: Write> {
     reader: &'r IndexedReader,
     sink: Sink<W>,
@@ -407,21 +418,6 @@ impl<'r, W: Write> AppendWriter<'r, W> {
             CopyError::Source(error) => AppendError::Source(error),
             CopyError::Sink(error) => AppendError::Io(error),
         })?;
-        writer.begin_tail()?;
-        Ok(writer)
-    }
-
-    /// Start an update where `out` already holds the file, a file opened to append to, say. Only the
-    /// new bytes are written, and the original isn't read beyond its last byte.
-    ///
-    /// A reader still open on a file appended to this way reports
-    /// [`SourceChanged`](SourceError::SourceChanged) from then on, and needs reopening.
-    ///
-    /// # Errors
-    ///
-    /// Any refusal from [`IndexedReader::check_appendable`], and any read or write failure.
-    pub fn tail_only(reader: &'r IndexedReader, out: W) -> AppendResult<Self> {
-        let mut writer = Self::start(reader, out)?;
         writer.begin_tail()?;
         Ok(writer)
     }

@@ -1121,11 +1121,10 @@ fn padded_pdf(padding: usize) -> Vec<u8> {
     pdf.finish(xref)
 }
 
-/// The writer loading the whole file, on a path where 330 MiB inputs exist. With the file's bytes at
-/// 8 MiB, an append to the file itself has to read about as little as an open does, and a copy has to
-/// read in small pieces only.
+/// The writer loading the whole file, on a path where 330 MiB inputs exist. The copy has to read in small
+/// pieces, and one read each, not more.
 #[test]
-fn the_original_is_read_in_small_pieces_and_not_at_all_for_a_tail() {
+fn the_original_is_read_in_small_pieces() {
     let bytes = padded_pdf(8 * 1_024 * 1_024);
     let source = Arc::new(CountingSource {
         inner: BytesSource::from(bytes.clone()),
@@ -1134,30 +1133,27 @@ fn the_original_is_read_in_small_pieces_and_not_at_all_for_a_tail() {
     });
     let reader = IndexedReader::open_shared(source.clone(), IndexedReaderOptions::default()).unwrap();
     let opened = source.total_read.load(Ordering::Relaxed);
-    let opened_largest = source.largest_read.load(Ordering::Relaxed);
     assert!(opened < 256 * 1_024, "open read {opened} bytes");
 
-    let mut tail = Vec::new();
-    let mut writer = AppendWriter::tail_only(&reader, &mut tail).unwrap();
-    writer.add_object(&Object::Integer(1)).unwrap();
-    writer.finish().unwrap();
-    let appended = source.total_read.load(Ordering::Relaxed) - opened;
-    assert!(appended < 64 * 1_024, "a tail-only update read {appended} bytes");
-    assert_eq!(source.largest_read.load(Ordering::Relaxed), opened_largest);
-    assert!(tail.len() < 1_024, "a one-object update wrote {} bytes", tail.len());
-
-    let mut whole = bytes.clone();
-    whole.extend_from_slice(&tail);
-    assert!(!open(&whole).index_stats().unwrap().recovered());
-    assert_eq!(open(&whole).resolve_object((6, 0)).unwrap(), Object::Integer(1));
-
     source.largest_read.store(0, Ordering::Relaxed);
-    let mut copy = std::io::sink();
-    let mut writer = AppendWriter::new(&reader, &mut copy).unwrap();
+    let mut output = Vec::new();
+    let mut writer = AppendWriter::new(&reader, &mut output).unwrap();
     writer.add_object(&Object::Integer(1)).unwrap();
     writer.finish().unwrap();
+    assert!(output.starts_with(&bytes));
+    assert!(
+        output.len() - bytes.len() < 1_024,
+        "a one-object update wrote {} bytes",
+        output.len() - bytes.len()
+    );
     let largest = source.largest_read.load(Ordering::Relaxed);
     assert!(largest <= 64 * 1_024, "the prefix copy made a {largest}-byte read");
+    let copied = source.total_read.load(Ordering::Relaxed) - opened;
+    assert!(
+        copied < bytes.len() as u64 + 256 * 1_024,
+        "the copy read {copied} bytes of an {}-byte file",
+        bytes.len()
+    );
 }
 
 /// A cached reader's copy passing through its cache, which would empty it for nothing.
