@@ -1164,10 +1164,33 @@ fn if_present(read: std::io::Result<std::fs::Metadata>) -> std::io::Result<Optio
     }
 }
 
+/// A save that happened. The new file is in place even if `durability_warning` is set.
+#[cfg(any(unix, windows))]
+#[non_exhaustive]
+pub struct AppendedFile {
+    /// What the update wrote.
+    pub summary: AppendSummary,
+    /// A reader of the new file, which is the one to use for the next save.
+    pub reader: IndexedReader,
+    /// The file was replaced, but syncing its folder failed, so a power cut in the next moments could bring the old
+    /// name back. The save still succeeded, and saying it failed would be wrong: the file on disk is the new one.
+    pub durability_warning: Option<std::io::Error>,
+}
+
+#[cfg(any(unix, windows))]
+impl std::fmt::Debug for AppendedFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppendedFile")
+            .field("summary", &self.summary)
+            .field("durability_warning", &self.durability_warning)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Write an update and put the result at a destination in one step: into a temporary file beside it, synced,
 /// checked with [`IndexedReader::verify_appended`], then moved into place, so at no moment does the path hold
-/// anything partial. `reader` keeps reading the old bytes. Returns a reader of the new file alongside the
-/// summary, and that reader is the one to use for the next save.
+/// anything partial. `reader` keeps reading the old bytes.
 ///
 /// Only the file's name and mode bits carry over to a replaced file: see [`AppendOptions`].
 ///
@@ -1178,11 +1201,12 @@ fn if_present(read: std::io::Result<std::fs::Metadata>) -> std::io::Result<Optio
 /// [`TargetIdentityUnknown`](AppendError::TargetIdentityUnknown), [`TargetNotAFile`](AppendError::TargetNotAFile),
 /// [`TargetReadOnly`](AppendError::TargetReadOnly) or [`TargetHasHardLinks`](AppendError::TargetHasHardLinks).
 /// [`PrepareReplacement`](AppendError::PrepareReplacement) if that step fails. The temporary file is removed and
-/// the destination isn't touched.
+/// the destination isn't touched. Once the file is in place, the result is never an error: see
+/// [`AppendedFile::durability_warning`].
 #[cfg(any(unix, windows))]
 pub fn append_atomically<F>(
     reader: &IndexedReader, destination: AppendDestination<'_>, options: AppendOptions<'_>, build: F,
-) -> AppendResult<(AppendSummary, IndexedReader)>
+) -> AppendResult<AppendedFile>
 where
     F: FnOnce(&mut AppendWriter<'_, &mut std::fs::File>) -> AppendResult<()>,
 {
@@ -1212,11 +1236,15 @@ where
     let verified = reader.verify_appended(Arc::new(written), &summary)?;
     destination.check_again(reader, seen.as_ref())?;
     check_replaceable(target, options.allow_breaking_hard_links)?;
-    match destination {
+    let durability_warning = match destination {
         AppendDestination::NewFile(_) => temporary.commit_new(target)?,
         _ => temporary.commit(target)?,
-    }
-    Ok((summary, verified))
+    };
+    Ok(AppendedFile {
+        summary,
+        reader: verified,
+        durability_warning,
+    })
 }
 
 /// The permissions the finished file ends with: those of the file it replaces, or for a new file those of the file
@@ -1370,13 +1398,10 @@ impl TemporaryFile {
     /// Move into place at a path that has to stay empty. A hard link fails if the path has appeared, where a
     /// rename would replace what's there. Where a file system has no hard links, this falls back to a last
     /// look and a rename.
-    fn commit_new(self, target: &std::path::Path) -> AppendResult<()> {
+    fn commit_new(self, target: &std::path::Path) -> AppendResult<Option<std::io::Error>> {
         match std::fs::hard_link(&self.path, target) {
-            Ok(()) => {
-                // Dropping `self` removes the temporary name, and the file stays under the new one.
-                sync_parent(target)?;
-                Ok(())
-            }
+            // Dropping `self` removes the temporary name, and the file stays under the new one.
+            Ok(()) => Ok(sync_parent(target).err()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(AppendError::TargetExists {
                 path: target.to_path_buf(),
             }),
@@ -1391,19 +1416,18 @@ impl TemporaryFile {
         }
     }
 
-    fn commit(mut self, target: &std::path::Path) -> std::io::Result<()> {
+    /// Move into place. A failure from here on is only about durability, since the file is already there.
+    fn commit(mut self, target: &std::path::Path) -> std::io::Result<Option<std::io::Error>> {
         std::fs::rename(&self.path, target)?;
         self.committed = true;
-        sync_parent(target)
+        Ok(sync_parent(target).err())
     }
 }
 
 #[cfg(any(unix, windows))]
 fn sync_parent(target: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
-    if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    std::fs::File::open(folder_of(target))?.sync_all()?;
     #[cfg(not(unix))]
     let _ = target;
     Ok(())
@@ -1415,5 +1439,18 @@ impl Drop for TemporaryFile {
         if !self.committed {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::*;
+
+    /// A bare file name having an empty parent, which used to skip the folder sync without a word.
+    #[test]
+    fn a_bare_file_name_syncs_the_current_folder() {
+        assert_eq!(folder_of(std::path::Path::new("doc.pdf")), std::path::Path::new("."));
+        assert_eq!(folder_of(std::path::Path::new("a/doc.pdf")), std::path::Path::new("a"));
+        assert_eq!(folder_of(std::path::Path::new("/doc.pdf")), std::path::Path::new("/"));
     }
 }

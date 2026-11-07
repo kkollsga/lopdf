@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lopdf::{
-    AppendDestination, AppendError, AppendOptions, AppendResult, AppendWriter, FileSource, IndexedReader, Object,
-    RandomAccessSource, append_atomically, dictionary,
+    AppendDestination, AppendError, AppendOptions, AppendResult, AppendWriter, AppendedFile, FileSource, IndexedReader,
+    Object, RandomAccessSource, append_atomically, dictionary,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -213,7 +213,11 @@ fn round_trip(path: &Path, out: &Path) -> serde_json::Value {
             Ok(())
         },
     );
-    let (summary_two, final_reader) = match again {
+    let AppendedFile {
+        summary: summary_two,
+        reader: final_reader,
+        ..
+    } = match again {
         Ok(done) => done,
         Err(error) => return json!({"status": "second_failed", "error": error.to_string()}),
     };
@@ -329,7 +333,7 @@ fn measure(mode: &str, out: &Path, path: &Path) {
             println!("appended {} bytes", summary.new_len - summary.previous_len);
         }
         "atomic" => {
-            let (summary, _) = append_atomically(
+            let summary = append_atomically(
                 &reader,
                 AppendDestination::NewFile(&target),
                 AppendOptions::new(),
@@ -338,7 +342,8 @@ fn measure(mode: &str, out: &Path, path: &Path) {
                     Ok(())
                 },
             )
-            .unwrap();
+            .unwrap()
+            .summary;
             lap("copy, write, sync, verify, rename");
             println!("appended {} bytes", summary.new_len - summary.previous_len);
         }

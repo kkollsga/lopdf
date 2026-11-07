@@ -1488,7 +1488,7 @@ fn a_signed_range_is_unchanged_and_named_by_its_revision() {
 #[cfg(any(unix, windows))]
 mod atomic {
     use super::*;
-    use lopdf::{AppendDestination, AppendOptions, FileSource, append_atomically};
+    use lopdf::{AppendDestination, AppendOptions, AppendedFile, FileSource, append_atomically};
     use std::path::Path;
 
     fn folder() -> tempfile::TempDir {
@@ -1528,7 +1528,11 @@ mod atomic {
         let bytes = classic_pdf();
         let path = file(dir.path(), "doc.pdf", &bytes);
         let reader = opened(&path);
-        let (summary, reopened) = append_atomically(
+        let AppendedFile {
+            summary,
+            reader: reopened,
+            ..
+        } = append_atomically(
             &reader,
             AppendDestination::SameFile(&path),
             AppendOptions::new(),
@@ -1556,13 +1560,14 @@ mod atomic {
         let path = file(dir.path(), "doc.pdf", &classic_pdf());
         let mut reader = opened(&path);
         for round in 1..=3 {
-            let (_, next) = append_atomically(
+            let next = append_atomically(
                 &reader,
                 AppendDestination::SameFile(&path),
                 AppendOptions::new(),
                 add_one,
             )
-            .unwrap_or_else(|error| panic!("save {round}: {error}"));
+            .unwrap_or_else(|error| panic!("save {round}: {error}"))
+            .reader;
             reader = next;
         }
         assert_eq!(opened(&path).revisions().unwrap().revisions.len(), 4);
@@ -1796,13 +1801,14 @@ mod atomic {
         );
         assert!(matches!(result.err(), Some(AppendError::TargetIdentityUnknown)));
 
-        let (_, newer) = append_atomically(
+        let newer = append_atomically(
             &opened(&path),
             AppendDestination::SameFile(&path),
             AppendOptions::new(),
             add_one,
         )
-        .unwrap();
+        .unwrap()
+        .reader;
         let chain = newer.revisions().unwrap();
         let earlier = newer
             .open_revision(&chain.revisions[0], IndexedReaderOptions::default())
@@ -1832,13 +1838,14 @@ mod atomic {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let reader = opened(&link);
 
-        let (summary, _) = append_atomically(
+        let summary = append_atomically(
             &reader,
             AppendDestination::SameFile(&link),
             AppendOptions::new(),
             add_one,
         )
-        .unwrap();
+        .unwrap()
+        .summary;
         assert!(
             std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
             "the link was replaced"
@@ -1984,7 +1991,9 @@ mod atomic {
             seen.set(finished.len() as u64);
             Ok(())
         });
-        let (summary, _) = append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one).unwrap();
+        let summary = append_atomically(&reader, AppendDestination::SameFile(&path), options, add_one)
+            .unwrap()
+            .summary;
         assert_eq!(seen.get(), summary.new_len);
     }
 
@@ -2050,13 +2059,14 @@ mod atomic {
         set(&path, "tagged");
         let reader = opened(&path);
 
-        let (_, reader) = append_atomically(
+        let reader = append_atomically(
             &reader,
             AppendDestination::SameFile(&path),
             AppendOptions::new(),
             add_one,
         )
-        .unwrap();
+        .unwrap()
+        .reader;
         assert_eq!(get(&path), None, "the docs say an attribute is lost without the step");
 
         set(&path, "tagged again");
@@ -2089,7 +2099,7 @@ mod atomic {
         let path = file(dir.path(), "doc.pdf", &classic_pdf());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let reader = opened(&path);
-        let (_, reader) = append_atomically(
+        let reader = append_atomically(
             &reader,
             AppendDestination::SameFile(&path),
             AppendOptions::new(),
@@ -2099,7 +2109,8 @@ mod atomic {
                 add_one(writer)
             },
         )
-        .unwrap();
+        .unwrap()
+        .reader;
         assert_eq!(mode_of(&path), 0o600);
 
         // A Save As of a private document stays private, with nothing at the target to take a mode from.
@@ -2161,13 +2172,14 @@ mod atomic {
         let name = format!("{}.pdf", "n".repeat(250));
         let path = file(dir.path(), &name, &classic_pdf());
         let reader = opened(&path);
-        let (_, reader) = append_atomically(
+        let reader = append_atomically(
             &reader,
             AppendDestination::SameFile(&path),
             AppendOptions::new(),
             add_one,
         )
-        .unwrap();
+        .unwrap()
+        .reader;
         let other = dir.path().join(format!("{}.pdf", "m".repeat(250)));
         append_atomically(
             &reader,
@@ -2267,6 +2279,37 @@ mod atomic {
         }
         assert!(now.contains(&"doc.pdf".to_string()) && now.contains(&"other.pdf".to_string()));
         assert!(std::fs::read(&other_doc).unwrap().starts_with(&bytes));
+    }
+
+    /// A failed folder sync reporting a failed save, after the rename already replaced the file. The person would think
+    /// their save was lost and might redo it. A folder that can be written and entered but not read makes it real.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_folder_sync_after_the_rename_is_a_warning_not_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = folder();
+        let inner = dir.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let bytes = classic_pdf();
+        let path = file(&inner, "doc.pdf", &bytes);
+        let reader = opened(&path);
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let unreadable = std::fs::File::open(&inner).is_err();
+        let result = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            add_one,
+        );
+        let on_disk = std::fs::read(&path);
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let saved = result.unwrap_or_else(|error| panic!("the file was replaced and this says it failed: {error}"));
+        assert!(
+            on_disk.unwrap().len() as u64 == saved.summary.new_len,
+            "the file wasn't replaced"
+        );
+        // Running as root, the folder can be read after all, and there's nothing to warn about.
+        assert_eq!(saved.durability_warning.is_some(), unreadable);
     }
 
     /// An update starting from a stale view: the file changed after the reader opened it, so the
