@@ -1000,6 +1000,18 @@ impl AppendDestination<'_> {
         }
     }
 
+    /// The path to move the finished file to. A rename over a symbolic link replaces the link and leaves the
+    /// real file as it was, so an existing target is followed to the file it names. A link that names nothing
+    /// fails here, rather than be replaced by a file. A new file's path has nothing to follow.
+    fn real_path(&self) -> std::io::Result<std::path::PathBuf> {
+        let path = self.path();
+        match self {
+            Self::NewFile(_) => Ok(path.to_path_buf()),
+            _ if if_present(std::fs::symlink_metadata(path))?.is_some() => std::fs::canonicalize(path),
+            _ => Ok(path.to_path_buf()),
+        }
+    }
+
     /// Whether the destination is as it has to be. Returns what's at an overwrite's path now, to compare later.
     fn check(&self, reader: &IndexedReader) -> AppendResult<Option<std::fs::Metadata>> {
         let changed = || AppendError::TargetChanged {
@@ -1073,7 +1085,8 @@ where
 {
     reader.check_appendable()?;
     let seen = destination.check(reader)?;
-    let target = destination.path();
+    let target = destination.real_path()?;
+    let target = target.as_path();
     let (mut file, temporary) = TemporaryFile::create_beside(target)?;
     let summary = {
         let mut writer = AppendWriter::new(reader, &mut file)?;

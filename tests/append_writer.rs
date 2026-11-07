@@ -1733,6 +1733,55 @@ mod atomic {
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
+    /// A save through a symbolic link replacing the link: the real file stayed old, the link pointed at nothing of
+    /// the document's history, and the save said Ok.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_symbolic_link_updates_the_real_file() {
+        let dir = folder();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let bytes = classic_pdf();
+        let real = file(&elsewhere, "real.pdf", &bytes);
+        let link = dir.path().join("link.pdf");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let reader = opened(&link);
+
+        let (summary, _) = append_atomically(&reader, AppendDestination::SameFile(&link), add_one).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link was replaced"
+        );
+        let on_disk = std::fs::read(&real).unwrap();
+        assert_eq!(
+            on_disk.len() as u64,
+            summary.new_len,
+            "the real file didn't get the update"
+        );
+        assert_eq!(entries(&elsewhere), ["real.pdf"]);
+        assert_eq!(entries(dir.path()), ["elsewhere", "link.pdf"]);
+    }
+
+    /// A link to nothing being replaced by a file, or followed to a location nobody chose.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symbolic_link_is_refused_every_way() {
+        let dir = folder();
+        let source = file(dir.path(), "doc.pdf", &classic_pdf());
+        let link = dir.path().join("link.pdf");
+        std::os::unix::fs::symlink(dir.path().join("missing.pdf"), &link).unwrap();
+        let reader = opened(&source);
+
+        let new = append_atomically(&reader, AppendDestination::NewFile(&link), add_one);
+        assert!(matches!(new.err(), Some(AppendError::TargetExists { .. })));
+        let same = append_atomically(&reader, AppendDestination::SameFile(&link), add_one);
+        assert!(matches!(same.err(), Some(AppendError::TargetChanged { .. })));
+        let other = append_atomically(&reader, AppendDestination::OverwriteOther(&link), add_one);
+        assert!(other.is_err());
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(entries(dir.path()), ["doc.pdf", "link.pdf"]);
+    }
+
     /// An update starting from a stale view: the file changed after the reader opened it, so the
     /// offsets it would write are wrong for what's there now.
     #[test]
