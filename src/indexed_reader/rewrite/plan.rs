@@ -811,10 +811,15 @@ impl<'c> Plan<'c> {
     }
 
     fn enqueue_top_level(&mut self, number: u32, object: Object, next: &mut Vec<u32>) -> RewriteResult<()> {
-        if let Object::Dictionary(dict) = &object {
-            self.note_signature_dictionary(Some(number), dict);
+        let Object::Dictionary(dict) = &object else {
+            return self.enqueue_references(&object, next);
+        };
+        self.note_signature_dictionary(Some(number), dict);
+        self.note_list_arrays(dict);
+        for (_, value) in dict.iter() {
+            self.enqueue_references(value, next)?;
         }
-        self.enqueue_references(&object, next)
+        Ok(())
     }
 
     fn roots(&mut self) -> RewriteResult<Vec<u32>> {

@@ -89,3 +89,36 @@ held open.
 One walk of the `/Prev` chain is bounded at `max_xref_sections` sections, 4,194,304 different numbers, 33,554,432
 entries declared, charged before they're decoded, 256 MiB inflated, and four times the file's length read, plus 8 MiB. No chain of sections that don't overlap can reach
 the last. None of these fall back to a rescan.
+
+# Rewrite contract
+
+`RewriteChanges` and `rewrite_atomically` write a whole new file from an open `IndexedReader`, holding only what the new trailer can
+reach, without loading the original. The module docs in `src/indexed_reader/rewrite/mod.rs` say what happens to each kind of reference
+to a removed page. This is what the tests in `tests/rewrite.rs` and `src/indexed_reader/rewrite/tests.rs` hold it to.
+
+**Old data is gone.** The main test gives everything that should go a marker of its own, and searches the raw bytes and every inflated
+stream of the result for each, plainly, in hex and as UTF-16, with a search that doesn't use a reader. Everything that should stay has a marker
+too. That runs for a classic table, a cross-reference stream with object streams, and a hybrid.
+
+**The output's form.** A file with only tables and no object streams stays that way, since whatever reads it today may not read anything newer.
+Any other gets a single cross-reference stream and new object streams of at most 100 members or 64 KiB, or it would grow by every object it had compressed.
+Past 500,000 objects a table can't be read back, so those get the stream form, and past 900,000 a rewrite is refused. Object numbers and generations stay, so references need no rewriting
+and what a caller holds stays valid. A linearized file isn't linearized any more. The trailer carries `/Root`, `/Info` and `/ID`, and nothing else.
+
+**Stream data isn't decoded,** except to look for names in a `/Resources` dictionary a removed page shared with kept pages. There, only a stream decoded to its end
+counts, since the general decoder gives what it can of a damaged one, and any doubt leaves that dictionary whole and says so in
+`RemovalReport::resources_left_whole`. A wrong `/Length` is replaced by what's found the way a viewer finds it, by looking for `endstream`.
+
+**Destinations** are `AppendDestination`, with the same checks, temporary file, sync order and `prepare_replacement`. `verify_rewritten` hashes every byte of
+the finished file, opens it, and requires one section, no `/Prev`, no rescan, every object where it was written and readable, nothing dead, and the
+right pages. A failure at any step, or a kill, leaves what was at the destination byte for byte. A kill can't remove its temporary file, and a later save to that target does, once it's an hour old and its process is gone.
+
+**Signatures.** A file with one is refused unless `RewritePolicy::allow_breaking_signatures` asks for it, and even then never over the signed file itself. Signatures are
+found by form field, by `/Perms`, by every `/ByteRange` in the file's bytes, which covers old revisions, and by anything the walk comes across. They stay in the new file, so that a viewer says they're broken.
+Nothing here checks one or says one is valid.
+
+**Refused:** encryption, a rebuilt index, a `/Prev` loop, an ambiguous hybrid, removing every page, and an object that can be reached and can't be read.
+
+**Known limits.** Reals pass through this crate's `f32`, as they do in PDFium. A structure element that spans kept and removed pages keeps its own `/ActualText` and `/Alt`, which may
+describe both. A destination that uses a page index in place of a reference isn't renumbered, or removed with its page. `/DPartRoot` and web-capture structures keep their shape with the removed page's references dropped. What's the
+document's stays: the catalog's `/Metadata` and `/PieceInfo`, `/Info`, `/Names` `/EmbeddedFiles` and `/JavaScript`, even if only a removed page used them.

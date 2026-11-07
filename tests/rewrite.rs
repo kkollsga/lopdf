@@ -491,6 +491,33 @@ fn destination_names_go_with_their_page() {
     assert!(dict(&after, 33).has(b"OldKeep"));
 }
 
+/// An annotation on a removed page staying because something else names it: a form's /Fields with no /P to give it away, a kept annotation's /Popup, a structure
+/// element's object reference. It has to go whatever else points at it. And one that a kept page lists too going with the page that's removed.
+#[test]
+fn an_annotation_goes_with_its_page_whatever_else_names_it_unless_a_kept_page_lists_it() {
+    let bytes = two_pages(
+        "/AcroForm << /Fields [10 0 R] >> /StructTreeRoot << /K [13 0 R] >>",
+        &[
+            obj(10, "<< /Type /Annot /Subtype /Widget /Rect [0 0 9 9] /FT /Tx /V (M_NO_P) >>"),
+            obj(11, "<< /Type /Annot /Subtype /Text /Rect [0 0 9 9] /Popup 12 0 R /Contents (K_MARKUP) >>"),
+            obj(12, "<< /Type /Annot /Subtype /Popup /Rect [0 0 9 9] /Contents (M_POPUP_THERE) >>"),
+            obj(13, "<< /S /Figure /K [<< /Type /OBJR /Obj 14 0 R >> << /Type /OBJR /Obj 15 0 R >>] >>"),
+            obj(14, "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /Contents (M_STAMP) >>"),
+            obj(15, "<< /Type /Annot /Subtype /Stamp /Rect [0 0 9 9] /Contents (K_ON_BOTH) >>"),
+        ],
+        "/Annots [11 0 R 15 0 R]",
+        "/Annots [10 0 R 12 0 R 14 0 R 15 0 R]",
+    );
+    let (output, summary, after) = rewrite(&bytes, remove_second_page);
+    assert_markers(&output, &["M_NO_P", "M_POPUP_THERE", "M_STAMP"], &["K_MARKUP", "K_ON_BOTH"]);
+    assert_eq!(summary.removal.annotations, 3);
+    assert!(!dict(&after, 1).has(b"AcroForm"));
+    assert!(!dict(&after, 11).has(b"Popup"));
+    let element = dict(&after, 13);
+    assert_eq!(element.get(b"K").unwrap().as_array().unwrap().len(), 1);
+    assert!(!gone(&after, 15));
+}
+
 /// A link or bookmark that goes by name through an action, not /Dest, whose name went, staying with nowhere to go.
 #[test]
 fn a_go_to_by_name_counts_as_going_there() {
@@ -1405,10 +1432,14 @@ fn a_signature_only_an_old_revision_holds_counts() {
     builder.finish_revision(Form::Compressed, "/Root 1 0 R");
     let reader = open_bytes(&builder.bytes);
     let changes = RewriteChanges::new(&reader).unwrap();
-    assert!(matches!(
-        changes.write_to(RewritePolicy::new(), std::io::sink()),
-        Err(RewriteError::SignaturesWouldBreak { .. })
-    ));
+    let refused = changes.write_to(RewritePolicy::new(), std::io::sink());
+    match refused {
+        Err(RewriteError::SignaturesWouldBreak { signatures }) => {
+            assert_eq!(signatures.len(), 1, "{signatures:?}");
+            assert_eq!(signatures[0].object, Some((6, 0)));
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The refusals: an encrypted file written in the clear, a rebuilt index or a /Prev loop whose reachable objects aren't known for certain.
