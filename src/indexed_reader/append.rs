@@ -384,24 +384,68 @@ impl<W: Write> Write for Sink<W> {
     }
 }
 
-/// An incremental update being written. Build one with [`new`](Self::new), write objects, and call
-/// [`finish`](Self::finish). For a file on disk, use [`append_atomically`], which handles all of this.
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// What an [`AppendWriter`] can write to: memory, nothing, or the temporary file [`append_atomically`] made. This is sealed, and a
+/// [`File`](std::fs::File) isn't one, so that no caller can point the writer at a file: an update can't overwrite the file it came from, or
+/// land anywhere that isn't checked first. That's what makes this the only way the indexed route changes a file.
+pub trait AppendOutput: Write + sealed::Sealed {}
+
+impl sealed::Sealed for Vec<u8> {}
+impl AppendOutput for Vec<u8> {}
+impl sealed::Sealed for &mut Vec<u8> {}
+impl AppendOutput for &mut Vec<u8> {}
+impl sealed::Sealed for std::io::Sink {}
+impl AppendOutput for std::io::Sink {}
+
+/// The temporary file [`append_atomically`] is writing. Only it can make one.
+#[cfg(any(unix, windows))]
+pub struct TemporaryOutput<'f> {
+    file: &'f mut std::fs::File,
+}
+
+#[cfg(any(unix, windows))]
+impl Write for TemporaryOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl sealed::Sealed for TemporaryOutput<'_> {}
+#[cfg(any(unix, windows))]
+impl AppendOutput for TemporaryOutput<'_> {}
+
+/// An incremental update being written. For a file on disk, use [`append_atomically`], which handles all of this and hands you a
+/// writer. Otherwise, build one with [`new`](Self::new) over memory, write objects, and call [`finish`](Self::finish).
 ///
-/// `out` has to be a new, empty output. Nothing here can check that: pointing it at the file the reader
-/// has open would damage that file. There is deliberately no way to append to a file in place, which
-/// can't be made safe through a [`Write`]: nothing can see where its cursor is or who else is appending.
+/// Dropping it unfinished leaves the output holding a partial update with no `startxref`.
 ///
-/// Dropping it unfinished leaves `out` holding a partial update with no `startxref`.
+/// Both of these have to keep failing to compile. `compile_fail` with an error code only checks that code on nightly: on stable, any
+/// compile error passes, which is good enough to keep them gone only as long as CI's nightly run stays.
+///
+/// ```compile_fail,E0277
+/// // A file. `File::create` would have truncated the original before this line even ran.
+/// # use lopdf::{AppendWriter, IndexedReader};
+/// # fn demo(reader: &IndexedReader, file: std::fs::File) {
+/// let _ = AppendWriter::new(reader, file);
+/// # }
+/// ```
 ///
 /// ```compile_fail,E0599
-/// // The in-place route this type used to offer. Keep it gone: a file opened without append mode had
-/// // its header overwritten, and `finish` returned Ok.
-/// # use lopdf::{AppendWriter, BytesSource, IndexedReader};
+/// // The in-place route this type used to offer. A file opened without append mode had its header overwritten, and `finish` returned Ok.
+/// # use lopdf::{AppendWriter, IndexedReader};
 /// # fn demo(reader: &IndexedReader) {
 /// let _ = AppendWriter::tail_only(reader, Vec::new());
 /// # }
 /// ```
-pub struct AppendWriter<'r, W: Write> {
+pub struct AppendWriter<'r, W: AppendOutput> {
     reader: &'r IndexedReader,
     sink: Sink<W>,
     previous_len: u64,
@@ -414,7 +458,7 @@ pub struct AppendWriter<'r, W: Write> {
     abandoned: bool,
 }
 
-impl<'r, W: Write> AppendWriter<'r, W> {
+impl<'r, W: AppendOutput> AppendWriter<'r, W> {
     /// Start an update on a new output: the whole of the original file is copied to `out` first, in
     /// small pieces.
     ///
@@ -1209,7 +1253,7 @@ pub fn append_atomically<F>(
     reader: &IndexedReader, destination: AppendDestination<'_>, options: AppendOptions<'_>, build: F,
 ) -> AppendResult<AppendedFile>
 where
-    F: FnOnce(&mut AppendWriter<'_, &mut std::fs::File>) -> AppendResult<()>,
+    F: FnOnce(&mut AppendWriter<'_, TemporaryOutput<'_>>) -> AppendResult<()>,
 {
     reader.check_appendable()?;
     let seen = destination.check(reader)?;
@@ -1219,7 +1263,7 @@ where
     let permissions = final_permissions(reader, target);
     let (mut file, temporary) = TemporaryFile::create_beside(target, permissions.as_ref())?;
     let summary = {
-        let mut writer = AppendWriter::new(reader, &mut file)?;
+        let mut writer = AppendWriter::new(reader, TemporaryOutput { file: &mut file })?;
         build(&mut writer)?;
         writer.finish()?
     };
@@ -1482,6 +1526,48 @@ impl Drop for TemporaryFile {
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
+
+    /// A write failure being swallowed, which would leave a file with a gap under offsets that assume none. A failing output can only be
+    /// built in here, since the outputs are sealed.
+    #[test]
+    fn a_failed_write_abandons_the_update() {
+        struct FailsAfter(usize);
+        impl Write for FailsAfter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 < bytes.len() {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                self.0 -= bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl sealed::Sealed for FailsAfter {}
+        impl AppendOutput for FailsAfter {}
+
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let catalog = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n1 1\n{catalog:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let length = bytes.len();
+        let reader = IndexedReader::open(crate::source::BytesSource::from(bytes)).unwrap();
+        let mut writer = AppendWriter::new(&reader, FailsAfter(length)).unwrap();
+        let big = Object::Stream(Stream::new(Dictionary::new(), vec![0; 256 * 1_024]));
+        assert!(matches!(writer.add_object(&big), Err(AppendError::Io(_))));
+        assert!(matches!(
+            writer.add_object(&Object::Integer(1)),
+            Err(AppendError::Abandoned)
+        ));
+        assert!(matches!(writer.finish(), Err(AppendError::Abandoned)));
+    }
 
     /// The temporary name surviving a power cut because its removal came after the folder sync, which left it as a second link that
     /// blocked every later save. By the time the folder is synced, the name has to be gone.

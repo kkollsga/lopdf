@@ -1,7 +1,7 @@
 //! Round trips real PDFs through the append writer, and measures it. Doesn't touch its inputs.
 //!
 //!   append_roundtrip corpus <out-dir> <file>...     Two updates per file, every object compared, a JSON line each.
-//!   append_roundtrip measure <mode> <out-dir> <file>   One update, timed. Modes: open, copy, atomic.
+//!   append_roundtrip measure <mode> <out-dir> <file>   One update, timed. Modes: open, atomic.
 //!   append_roundtrip revisions <file>...            A file's revisions, a JSON line each.
 //!
 //! Wrap `measure` in `/usr/bin/time -l` for the whole process's peak footprint.
@@ -9,12 +9,11 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use lopdf::{
-    AppendDestination, AppendError, AppendOptions, AppendResult, AppendWriter, AppendedFile, FileSource, IndexedReader,
-    Object, RandomAccessSource, append_atomically, dictionary,
+    AppendDestination, AppendOptions, AppendOutput, AppendResult, AppendWriter, AppendedFile, FileSource,
+    IndexedReader, Object, append_atomically, dictionary,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -63,9 +62,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!(
-                "usage: append_roundtrip corpus <out-dir> <file>... | measure <open|copy|atomic> <out-dir> <file>"
-            );
+            eprintln!("usage: append_roundtrip corpus <out-dir> <file>... | measure <open|atomic> <out-dir> <file>");
             std::process::exit(2);
         }
     }
@@ -77,7 +74,7 @@ fn open(path: &Path) -> Result<IndexedReader, String> {
 }
 
 /// A new object, and `/Info`'s `/Keywords` set, the two smallest real edits. Returns the new object's number.
-fn small_edit<W: Write>(reader: &IndexedReader, writer: &mut AppendWriter<'_, W>) -> AppendResult<u32> {
+fn small_edit<W: AppendOutput>(reader: &IndexedReader, writer: &mut AppendWriter<'_, W>) -> AppendResult<u32> {
     let added = writer.add_object(&Object::Dictionary(dictionary! {
         "RectoRoundTrip" => true,
         "Note" => Object::string_literal("added by append_roundtrip"),
@@ -159,26 +156,26 @@ fn round_trip(path: &Path, out: &Path) -> serde_json::Value {
         .as_ref()
         .is_some_and(|chain| chain.revisions.iter().any(|revision| revision.linearized));
 
-    // First update: to a new file through the streaming writer.
+    // First update: to a new file, which also checks it before it's in place.
     let first = out.join(format!("{name}.1.pdf"));
-    let mut file = File::create(&first).unwrap();
-    let edited = (|| {
-        let mut writer = AppendWriter::new(&reader, &mut file)?;
-        let added = small_edit(&reader, &mut writer)?;
-        Ok::<_, AppendError>((added, writer.finish()?))
-    })();
-    drop(file);
-    let (added, summary) = match edited {
+    let mut added = None;
+    let edited = append_atomically(
+        &reader,
+        AppendDestination::NewFile(&first),
+        AppendOptions::new(),
+        |writer| {
+            added = Some(small_edit(&reader, writer)?);
+            Ok(())
+        },
+    );
+    let AppendedFile {
+        summary, reader: after, ..
+    } = match edited {
         Ok(done) => done,
-        Err(error) => {
-            let _ = std::fs::remove_file(&first);
-            return json!({"status": "write_failed", "error": error.to_string()});
-        }
+        Err(error) => return json!({"status": "write_failed", "error": error.to_string()}),
     };
-    let source: Arc<dyn RandomAccessSource> = Arc::new(FileSource::open(&first).unwrap());
-    let after = match reader.verify_appended(source, &summary) {
-        Ok(after) => after,
-        Err(error) => return json!({"status": "verify_failed", "error": error.to_string()}),
+    let Some(added) = added else {
+        return json!({"status": "write_failed", "error": "nothing was added"});
     };
 
     // Every object, before against after.
@@ -323,15 +320,6 @@ fn measure(mode: &str, out: &Path, path: &Path) {
     lap("open+check");
     match mode {
         "open" => {}
-        "copy" => {
-            let mut file = File::create(&target).unwrap();
-            let mut writer = AppendWriter::new(&reader, &mut file).unwrap();
-            lap("copy prefix");
-            small_edit(&reader, &mut writer).unwrap();
-            let summary = writer.finish().unwrap();
-            lap("write tail");
-            println!("appended {} bytes", summary.new_len - summary.previous_len);
-        }
         "atomic" => {
             let summary = append_atomically(
                 &reader,

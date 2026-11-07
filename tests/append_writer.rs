@@ -1007,34 +1007,6 @@ fn a_huge_size_refuses_new_numbers_and_still_allows_changes() {
     assert_eq!(open(&output).resolve_object((4, 0)).unwrap(), Object::Integer(1));
 }
 
-/// A write failure being swallowed, which would leave a file with a gap under offsets that assume none.
-#[test]
-fn a_failed_write_abandons_the_update() {
-    struct FailsAfter(usize);
-    impl Write for FailsAfter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.0 < bytes.len() {
-                return Err(std::io::Error::other("disk full"));
-            }
-            self.0 -= bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let bytes = classic_pdf();
-    let reader = open(&bytes);
-    let mut writer = AppendWriter::new(&reader, FailsAfter(bytes.len())).unwrap();
-    let big = Object::Stream(Stream::new(Dictionary::new(), vec![0; 256 * 1_024]));
-    assert!(matches!(writer.add_object(&big), Err(AppendError::Io(_))));
-    assert!(matches!(
-        writer.add_object(&Object::Integer(1)),
-        Err(AppendError::Abandoned)
-    ));
-    assert!(matches!(writer.finish(), Err(AppendError::Abandoned)));
-}
-
 // ---- Truncated and hostile input. ----
 
 /// A panic, or a wrong file, on any cut of a real structure. Every length of every form.
@@ -1707,7 +1679,7 @@ mod atomic {
         IndexedReader::open(FileSource::open(path).unwrap()).unwrap()
     }
 
-    fn add_one(writer: &mut AppendWriter<'_, &mut std::fs::File>) -> lopdf::AppendResult<()> {
+    fn add_one(writer: &mut AppendWriter<'_, lopdf::TemporaryOutput<'_>>) -> lopdf::AppendResult<()> {
         writer.add_object(&Object::Integer(9))?;
         Ok(())
     }

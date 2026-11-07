@@ -55,9 +55,9 @@ pub use encryption::{EncryptionState, EncryptionVersion, Permissions};
 pub use error::{DecompressError, Error, ParseError, Result};
 pub use incremental_document::IncrementalDocument;
 #[cfg(any(unix, windows))]
-pub use indexed_reader::{AppendDestination, AppendOptions, AppendedFile, append_atomically};
+pub use indexed_reader::{AppendDestination, AppendOptions, AppendedFile, TemporaryOutput, append_atomically};
 pub use indexed_reader::{
-    AppendError, AppendResult, AppendSummary, AppendWriter, AppendedObject,
+    AppendError, AppendOutput, AppendResult, AppendSummary, AppendWriter, AppendedObject,
     BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES, BoundedObjectStream, EncodedStreamLength,
     EncodedStreamLengthUnavailableReason, EncodedStreamProtection, EncodedStreamReader, IndexedObjectCacheStats,
     IndexedObjectLocation, IndexedObjectStreamCacheStats, IndexedReader, IndexedReaderCacheOptions,
