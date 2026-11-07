@@ -1436,6 +1436,86 @@ fn a_revision_with_no_marker_or_out_of_order_has_no_range() {
     );
 }
 
+/// A `/Prev` pointing past a revision's own marker. The newest revision used to get a range that its own chain runs out
+/// of, `revision_ending_at` called it whole, and `open_revision` answered with a rescan and Ok. A signature report built on
+/// that would say a signature covers a whole revision when no such revision exists.
+#[test]
+fn a_prev_past_the_revisions_end_gives_it_no_range() {
+    let mut pdf = Pdf::base();
+    let newest = pdf.table(&format!("<< /Size 6 /Root 1 0 R /Prev {:010} >>", 0));
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{newest}\n%%EOF\n").as_bytes());
+    let end = pdf.bytes.len() as u64;
+    let beyond = pdf.table(TRAILER);
+    // No marker of its own, and the file's last startxref names the first section.
+    let mut bytes = pdf.finish(newest);
+    let prev_at = find_last(&bytes[..beyond as usize], b"/Prev ") + b"/Prev ".len();
+    bytes[prev_at..prev_at + 10].copy_from_slice(format!("{beyond:010}").as_bytes());
+    let reader = open(&bytes);
+    assert!(!reader.index_stats().unwrap().recovered());
+    let chain = reader.revisions().unwrap();
+    assert!(!chain.is_regular());
+    assert!(
+        chain.revisions.iter().all(|revision| revision.range.is_none()),
+        "{chain:?}"
+    );
+    assert!(
+        chain.revision_ending_at(end).is_none(),
+        "a prefix that can't be read was called a whole revision"
+    );
+}
+
+/// A `/XRefStm` past the revision's end, the same trap by the other pointer.
+#[test]
+fn an_xref_supplement_past_the_revisions_end_gives_it_no_range() {
+    let mut pdf = Pdf::base();
+    let older = pdf.table(TRAILER);
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{older}\n%%EOF\n").as_bytes());
+    let boundary = pdf.bytes.len();
+    let section = pdf.table(&format!("<< /Size 6 /Root 1 0 R /Prev {older} /XRefStm {:010} >>", 0));
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{section}\n%%EOF\n").as_bytes());
+    let end = pdf.bytes.len() as u64;
+    let supplement = pdf.bytes.len() as u64;
+    pdf.bytes
+        .extend_from_slice(b"9 0 obj\n<< /Type /XRef /Size 10 /W [1 4 2] /Index [9 1] /Length 7 >>\nstream\n");
+    pdf.bytes.extend_from_slice(&[1, 0, 0, 0, 9, 0, 0]);
+    pdf.bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let mut bytes = pdf.finish(section);
+    let at = boundary + find_last(&bytes[boundary..end as usize], b"/XRefStm ") + b"/XRefStm ".len();
+    bytes[at..at + 10].copy_from_slice(format!("{supplement:010}").as_bytes());
+    let chain = open(&bytes).revisions().unwrap();
+    assert!(
+        chain.revisions[0].range.is_some(),
+        "the older revision doesn't depend on it"
+    );
+    assert_eq!(chain.revisions[1].startxref, section);
+    assert_eq!(chain.revisions[1].range, None);
+    assert!(chain.revision_ending_at(end).is_none());
+}
+
+/// `open_revision` answering with a rescan and Ok, on bytes that aren't the revision they were asked to be.
+#[test]
+fn open_revision_refuses_bytes_that_need_a_rescan() {
+    let original = classic_pdf();
+    let (output, _, _) = small_update(&open(&original));
+    let reader = open(&output);
+    let chain = reader.revisions().unwrap();
+    assert!(
+        reader
+            .open_revision(&chain.revisions[0], IndexedReaderOptions::default())
+            .is_ok()
+    );
+    let mut made_up = chain.revisions[0].clone();
+    let cut = find_last(&original, b"startxref") as u64;
+    made_up.range = Some(0..cut);
+    assert!(matches!(
+        reader.open_revision(&made_up, IndexedReaderOptions::default()),
+        Err(IndexedReaderError::RevisionRangeUnavailable { index: 0 })
+    ));
+}
+
 fn find_last(bytes: &[u8], pattern: &[u8]) -> usize {
     bytes
         .windows(pattern.len())

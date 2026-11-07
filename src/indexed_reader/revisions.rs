@@ -106,6 +106,8 @@ struct SectionFacts {
     kind: IndexedXrefKind,
     prev: Option<u64>,
     entry_count: u64,
+    /// The last place this section needs a reader to reach: itself, or its `/XRefStm`.
+    reach: u64,
     marker: Option<EndMarker>,
 }
 
@@ -158,19 +160,22 @@ impl IndexedReader {
             let after = physical
                 .checked_add(section.length)
                 .ok_or(IndexedReaderError::InvalidXref { offset })?;
+            let supplement = trailer_offset(&section.trailer, b"XRefStm", "XRefStm")?;
             sections.push(SectionFacts {
                 offset,
                 kind,
                 prev,
                 entry_count: u64::try_from(section.entries.len()).unwrap_or(u64::MAX),
+                reach: offset.max(supplement.unwrap_or(0)),
                 marker: read_end_marker(source.as_ref(), source_len, after)?,
             });
             next = prev;
         }
 
-        let mut revisions = group_sections(&sections);
+        let (mut revisions, mut reaches) = group_sections(&sections);
         revisions.reverse();
-        settle_ranges(&mut revisions, origin);
+        reaches.reverse();
+        settle_ranges(&mut revisions, &reaches, origin);
         let trailing_bytes = revisions
             .last()
             .and_then(|newest| newest.range.as_ref())
@@ -207,7 +212,7 @@ impl IndexedReader {
     /// # Errors
     ///
     /// [`RevisionRangeUnavailable`](IndexedReaderError::RevisionRangeUnavailable) if the revision has
-    /// no proved range, and otherwise whatever opening those bytes as a file gives.
+    /// no proved range, or if those bytes open only by a rescan. Otherwise, whatever opening them as a file gives.
     pub fn open_revision(
         &self, revision: &IndexedRevision, options: IndexedReaderOptions,
     ) -> IndexedReaderResult<IndexedReader> {
@@ -219,7 +224,12 @@ impl IndexedReader {
             inner: Arc::clone(self.whole_file_source()),
             len: range.end,
         };
-        Self::open_shared(Arc::new(prefix), options)
+        let reader = Self::open_shared(Arc::new(prefix), options)?;
+        // A rescan would answer with some reading of those bytes, which isn't the file as it was.
+        if reader.index.recovered {
+            return Err(IndexedReaderError::RevisionRangeUnavailable { index: revision.index });
+        }
+        Ok(reader)
     }
 
     /// The source for a pass over much of the file. It skips the reader's chunk cache, which that
@@ -232,9 +242,10 @@ impl IndexedReader {
     }
 }
 
-/// Newest first, as the walk found them.
-fn group_sections(sections: &[SectionFacts]) -> Vec<IndexedRevision> {
+/// Newest first, as the walk found them, with how far into the file each revision's sections reach.
+fn group_sections(sections: &[SectionFacts]) -> (Vec<IndexedRevision>, Vec<u64>) {
     let mut revisions = Vec::with_capacity(sections.len());
+    let mut reaches = Vec::with_capacity(sections.len());
     let mut position = 0;
     while let Some(section) = sections.get(position) {
         let linearized_tail = sections.get(position + 1).filter(|tail| {
@@ -281,23 +292,35 @@ fn group_sections(sections: &[SectionFacts]) -> Vec<IndexedRevision> {
                 .saturating_add(linearized_tail.map_or(0, |tail| tail.entry_count)),
             linearized: linearized_tail.is_some(),
         });
-        position += 1 + together + usize::from(linearized_tail.is_some());
+        let used = 1 + together + usize::from(linearized_tail.is_some());
+        reaches.push(
+            sections[position..position + used]
+                .iter()
+                .map(|used| used.reach)
+                .max()
+                .unwrap_or(0),
+        );
+        position += used;
     }
-    revisions
+    (revisions, reaches)
 }
 
-/// Number the revisions and give each its start, the end of the one before. A revision whose
-/// section isn't inside the bytes it would add has no range, since a reader of that prefix
-/// wouldn't find it. Only a linearized file's first revision starts its section early.
-fn settle_ranges(revisions: &mut [IndexedRevision], origin: u64) {
+/// Number the revisions and give each its start, the end of the one before. A revision has no range if its
+/// section isn't inside the bytes it would add, or if anything down its chain, a `/Prev` or a `/XRefStm`, is
+/// past its end: a reader of that prefix wouldn't find them, and a signature report must never call such a
+/// prefix whole. Only a linearized file's first revision starts its section early.
+fn settle_ranges(revisions: &mut [IndexedRevision], reaches: &[u64], origin: u64) {
     let mut last_end = 0_u64;
+    let mut chain_reach = 0_u64;
     for (index, revision) in revisions.iter_mut().enumerate() {
         revision.index = index;
         let end = revision.range.as_ref().map(|range| range.end);
         let section = origin.saturating_add(revision.startxref);
+        chain_reach = chain_reach.max(reaches.get(index).copied().unwrap_or(u64::MAX));
+        let reached = origin.saturating_add(chain_reach);
         let provable = end.is_some_and(|end| {
             let after_previous = index == 0 || last_end <= section;
-            end > last_end && section < end && after_previous && (!revision.linearized || index == 0)
+            reached < end && end > last_end && section < end && after_previous && (!revision.linearized || index == 0)
         });
         if provable {
             let end = end.unwrap_or(last_end);
