@@ -878,7 +878,9 @@ impl<'c> Plan<'c> {
         {
             // Whatever is left of a signature that the removal didn't reach by its field: a dictionary in an object stream, a widget
             // somewhere else.
-            let is_signature_field = matches!(dict.get(b"FT"), Ok(Object::Name(name)) if name == b"Sig");
+            // A signature field with a value; a blank one, which nobody has signed, isn't a signature and stays.
+            let is_signature_field = matches!(dict.get(b"FT"), Ok(Object::Name(name)) if name == b"Sig")
+                && (dict.has(b"V") || dict.has(b"Lock") || dict.has(b"SV"));
             if super::signatures::is_signature_dictionary(dict).is_some() || is_signature_field {
                 let dict = dict.clone();
                 self.note_signature_dictionary(Some(number), &dict);

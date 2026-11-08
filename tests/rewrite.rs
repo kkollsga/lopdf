@@ -1890,6 +1890,54 @@ fn usage_rights_are_classed_as_such_and_removed_with_consent() {
     assert_markers(&output, &["UR3", "ByteRange"], &[]);
 }
 
+/// A blank signature field, with no value, removed with the signatures, as on an IRS form whose usage rights go in place, or a copy with a person's signature
+/// taken off: it isn't a signature, and a form loses the place a person was to sign. It stays, with its widget, and `SignaturesExist` with it, while
+/// `AppendOnly`, which is about signatures there are, goes, and the signed field goes as before.
+#[test]
+fn a_blank_signature_field_stays() {
+    let mut builder = Builder::new(500);
+    let objects = vec![
+        obj(1, "<< /Type /Catalog /Pages 2 0 R /Perms << /UR3 7 0 R >> /AcroForm << /SigFlags 3 /Fields [5 0 R 8 0 R] >> >>"),
+        obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 9 9] >>"),
+        obj(3, "<< /Type /Page /Parent 2 0 R /Annots [5 0 R 8 0 R] >>"),
+        obj(5, "<< /Type /Annot /Subtype /Widget /FT /Sig /T (SignHere) /Rect [0 0 90 20] /P 3 0 R >>"),
+        Obj {
+            number: 7,
+            generation: 0,
+            body: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Reference [<< /TransformMethod /UR3 >>] /ByteRange [0 1 2 3] /Contents <00> >>".to_vec(),
+            is_stream: true,
+        },
+        obj(8, "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signed) /V 9 0 R /Rect [0 0 90 20] /P 3 0 R >>"),
+        Obj {
+            number: 9,
+            generation: 0,
+            body: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 4 5 6] /Contents <00> >>".to_vec(),
+            is_stream: true,
+        },
+    ];
+    builder.place(Form::Table, &objects, 100);
+    builder.finish_revision(Form::Table, "/Root 1 0 R");
+    let (output, _summary, after) = rewrite_with(&builder.bytes, RewritePolicy::new().remove_signatures(), |_| {});
+    assert!(after.signatures().unwrap().is_empty());
+    let catalog = dict(&after, 1);
+    let acro = catalog.get(b"AcroForm").unwrap().as_dict().unwrap();
+    assert_eq!(
+        acro.get(b"Fields").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((5, 0))],
+        "the blank one stays, the signed one goes"
+    );
+    assert_eq!(
+        acro.get(b"SigFlags").unwrap().as_i64().unwrap(),
+        1,
+        "SignaturesExist stays with it, AppendOnly goes"
+    );
+    assert_eq!(
+        dict(&after, 3).get(b"Annots").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((5, 0))]
+    );
+    assert_markers(&output, &["ByteRange", "UR3"], &["SignHere"]);
+}
+
 /// A signature the newest revision no longer mentions being missed, so that its signed bytes are replaced without a word, as they would be if
 /// only the current form fields were looked at. Or one in an object stream, which no real signer can write but a hostile file can.
 #[test]
@@ -3209,11 +3257,15 @@ fn an_object_a_little_off_its_offset_is_found_and_one_nowhere_is_listed() {
 /// copy has a page more than the reader counted, which the property check took for a page appearing from nowhere.
 #[test]
 fn a_page_found_near_its_offset_counts() {
-    for bytes in [
-        &include_bytes!("../assets/rewrite/page_found_nearby.pdf")[..],
-        &include_bytes!("../assets/rewrite/page_found_nearby_removal.pdf")[..],
-    ] {
-        assert!(property::check_rewrite_on_any_bytes(bytes));
+    // `.gitignore` has `*.pdf`, so these fuzz finds aren't in a fresh checkout until they're added with `git add -f`: read at run time, so the rest of this
+    // file still builds without them, and say so when they're missing.
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/rewrite");
+    for name in ["page_found_nearby.pdf", "page_found_nearby_removal.pdf"] {
+        let Ok(bytes) = std::fs::read(folder.join(name)) else {
+            eprintln!("skipped: assets/rewrite/{name} isn't in this checkout");
+            continue;
+        };
+        assert!(property::check_rewrite_on_any_bytes(&bytes));
     }
 }
 

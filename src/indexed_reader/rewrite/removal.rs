@@ -1119,15 +1119,27 @@ impl Plan<'_> {
         self.signature_removal.security_store = catalog.remove(b"DSS").is_some();
         let holder = reference(&catalog, b"AcroForm");
         if let Some(mut form) = self.deref_dict(catalog.get(b"AcroForm").ok())? {
-            self.signature_removal.signature_flags = form.remove(b"SigFlags").is_some();
+            let flags = form.remove(b"SigFlags");
+            self.signature_removal.signature_flags = flags.is_some();
             let fields = self.deref_array(form.get(b"Fields").ok())?;
             let had_fields = !fields.is_empty();
             let mut kept = Vec::new();
             let mut seen = HashSet::new();
+            let mut blank = 0;
             for field in fields {
-                if self.unsigned_field_stays(&field, false, 0, &mut seen)? {
+                if self.unsigned_field_stays(&field, false, 0, &mut seen, &mut blank)? {
                     kept.push(field);
                 }
+            }
+            // A blank signature field isn't a signature, and stays (RectoPDF's coordinator, 2026-11-08): `SignaturesExist` stays with it, as viewers offer
+            // to sign by it, and `AppendOnly`, which is about signatures there are, goes.
+            if blank > 0
+                && let Some(flags) = flags
+                    .as_ref()
+                    .and_then(|flags| flags.as_i64().ok())
+                    .filter(|flags| flags & 1 == 1)
+            {
+                form.set("SigFlags", Object::Integer(flags & 1));
             }
             if had_fields && kept.is_empty() {
                 catalog.remove(b"AcroForm");
@@ -1145,9 +1157,10 @@ impl Plan<'_> {
         self.store_edit(self.root, catalog)
     }
 
-    /// Whether a field stays once signatures are gone. A signature field goes with everything under it and its value; a field left with no kids goes too.
+    /// Whether a field stays once signatures are gone. A signed signature field goes with everything under it and its value; a field left with no kids goes too.
+    /// A blank signature field, with no value, isn't a signature: it stays, with its widgets, and `blank` counts it.
     fn unsigned_field_stays(
-        &mut self, field: &Object, inherited_signature: bool, depth: usize, seen: &mut HashSet<u32>,
+        &mut self, field: &Object, inherited_signature: bool, depth: usize, seen: &mut HashSet<u32>, blank: &mut u64,
     ) -> RewriteResult<bool> {
         let number = match field {
             Object::Reference((number, _)) => Some(*number),
@@ -1166,6 +1179,17 @@ impl Plan<'_> {
             _ => inherited_signature,
         };
         let kids = self.deref_array(dict.get(b"Kids").ok())?;
+        // Blank only as itself: under a signed field, everything goes with it.
+        if signature
+            && !inherited_signature
+            && !dict.has(b"V")
+            && !dict.has(b"Lock")
+            && !dict.has(b"SV")
+            && !self.any_kid_signed(&kids, depth)?
+        {
+            *blank += 1;
+            return Ok(true);
+        }
         if signature {
             if let Some(number) = number {
                 self.dead.set(number);
@@ -1178,7 +1202,7 @@ impl Plan<'_> {
             }
             for kid in kids {
                 if depth < MAX_TREE_DEPTH {
-                    self.unsigned_field_stays(&kid, true, depth + 1, seen)?;
+                    self.unsigned_field_stays(&kid, true, depth + 1, seen, blank)?;
                 }
             }
             return Ok(false);
@@ -1188,11 +1212,30 @@ impl Plan<'_> {
         }
         let mut any = false;
         for kid in kids {
-            any |= self.unsigned_field_stays(&kid, false, depth + 1, seen)?;
+            any |= self.unsigned_field_stays(&kid, false, depth + 1, seen, blank)?;
         }
         if !any && let Some(number) = number {
             self.dead.set(number);
         }
         Ok(any)
+    }
+
+    /// Whether anything under a signature field has a value, so it's signed, however its value was put on a kid.
+    fn any_kid_signed(&mut self, kids: &[Object], depth: usize) -> RewriteResult<bool> {
+        if depth >= MAX_TREE_DEPTH {
+            return Ok(true);
+        }
+        for kid in kids {
+            if let Some(dict) = self.deref_dict(Some(kid))? {
+                if dict.has(b"V") {
+                    return Ok(true);
+                }
+                let grandkids = self.deref_array(dict.get(b"Kids").ok())?;
+                if !grandkids.is_empty() && self.any_kid_signed(&grandkids, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }
