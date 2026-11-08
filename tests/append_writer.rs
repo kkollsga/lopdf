@@ -2199,7 +2199,7 @@ mod atomic {
 
         let seen = std::cell::RefCell::new(String::new());
         let options = AppendOptions::new().prepare_replacement(|temporary, _| {
-            *seen.borrow_mut() = temporary.file_name().unwrap().to_string_lossy().into_owned();
+            *seen.borrow_mut() = temporary_name(temporary);
             Ok(())
         });
         let reader = append_atomically(&opened(&path), AppendDestination::SameFile(&path), options, add_one)
@@ -2354,7 +2354,7 @@ mod atomic {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
-    /// The docs being wrong in either direction: attributes are lost without the step, and the step can keep them.
+    /// The docs being wrong in either direction: a Save keeps attributes, as it starts from a clone; a new file loses them without the step; and the step can keep them.
     /// Uses the real `xattr` tool and a real quarantine-shaped attribute, on the real file system.
     #[cfg(target_os = "macos")]
     #[test]
@@ -2393,7 +2393,24 @@ mod atomic {
         )
         .unwrap()
         .reader;
-        assert_eq!(get(&path), None, "the docs say an attribute is lost without the step");
+        assert_eq!(
+            get(&path).as_deref(),
+            Some("tagged"),
+            "a Save starts from a clone of the file, which keeps its attributes"
+        );
+        let copy = dir.path().join("copy.pdf");
+        append_atomically(
+            &reader,
+            AppendDestination::NewFile(&copy),
+            AppendOptions::new(),
+            add_one,
+        )
+        .unwrap();
+        assert_eq!(
+            get(&copy),
+            None,
+            "a Save As is a new file, and the docs say an attribute is lost without the step"
+        );
 
         set(&path, "tagged again");
         let options = AppendOptions::new().prepare_replacement(|temporary, target| {
@@ -2407,11 +2424,23 @@ mod atomic {
         assert_eq!(get(&path).as_deref(), Some("tagged again"));
     }
 
+    /// The temporary file being written: a Save's is the clone in its own private folder, and anything else's is a file beside the target.
     fn temporary_in(folder: &Path) -> Option<std::path::PathBuf> {
-        std::fs::read_dir(folder)
+        let found = std::fs::read_dir(folder)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".append-"))
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".append-"))?;
+        Some(if found.is_dir() { found.join("clone") } else { found })
+    }
+
+    /// The name that says whose a temporary file is: a Save's clone goes by its folder's.
+    fn temporary_name(temporary: &Path) -> String {
+        let named = if temporary.file_name().is_some_and(|name| name == "clone") {
+            temporary.parent().unwrap()
+        } else {
+            temporary
+        };
+        named.file_name().unwrap().to_string_lossy().into_owned()
     }
 
     /// A private document's full copy sitting readable by others during the write, and after a crash. It used to be created
@@ -2532,7 +2561,7 @@ mod atomic {
         let prefix_of = |target: &Path| {
             let seen = std::cell::RefCell::new(String::new());
             let options = AppendOptions::new().prepare_replacement(|temporary, _| {
-                *seen.borrow_mut() = temporary.file_name().unwrap().to_string_lossy().into_owned();
+                *seen.borrow_mut() = temporary_name(temporary);
                 Ok(())
             });
             append_atomically(&opened(target), AppendDestination::SameFile(target), options, add_one).unwrap();

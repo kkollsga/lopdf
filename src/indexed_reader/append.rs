@@ -499,6 +499,13 @@ impl<'r, W: AppendOutput> AppendWriter<'r, W> {
         Ok(writer)
     }
 
+    /// Start an update on an output that already holds the whole original, as a clone of it does: only the update is written.
+    pub(super) fn over_copy(reader: &'r IndexedReader, out: W) -> AppendResult<Self> {
+        let mut writer = Self::start(reader, out)?;
+        writer.begin_tail()?;
+        Ok(writer)
+    }
+
     fn start(reader: &'r IndexedReader, out: W) -> AppendResult<Self> {
         reader.check_appendable()?;
         let source = reader.whole_file_source();
@@ -1132,11 +1139,12 @@ impl AppendDestination<'_> {
 
 /// How [`append_atomically`] treats the file it replaces.
 ///
-/// **A replaced file is a new file.** It gets the old one's name and mode bits, and nothing else unless the
-/// caller carries it over: extended attributes, including Finder tags and `com.apple.quarantine`, ACLs, owner
-/// and birth time are all lost. Losing the quarantine flag on a downloaded PDF is a security loss. This crate
-/// forbids unsafe code and can't copy them, so an app that replaces people's files should do so in
-/// [`prepare_replacement`](Self::prepare_replacement).
+/// **A Save starts from a clone of the file**, so only the update is written, and on macOS it keeps the original's mode,
+/// extended attributes and ACL, as a clone or a copy there does. **A new file, or another file replaced, is a new file:** it
+/// gets the old one's name and mode bits, and nothing else unless the caller carries it over: extended attributes, including
+/// Finder tags and `com.apple.quarantine`, ACLs, owner and birth time are all lost. Losing the quarantine flag on a downloaded
+/// PDF is a security loss. This crate forbids unsafe code and can't copy them, so an app that writes people's files should do so in
+/// [`prepare_replacement`](Self::prepare_replacement), on a Save too, as other platforms' copies may not keep them.
 #[cfg(any(unix, windows))]
 #[derive(Default)]
 #[must_use]
@@ -1284,9 +1292,27 @@ where
     let target = target.as_path();
     check_replaceable(target, options.allow_breaking_hard_links)?;
     let permissions = final_permissions(reader, target);
-    let (mut file, temporary) = TemporaryFile::create_beside(target, permissions.as_ref())?;
+    // Save starts from a copy-on-write clone of the file, so only the update reaches the disk: the whole file isn't written again for a turned page. Where the volume
+    // can't clone, the same call copies it. Anything else starts empty and has the original copied in, as a Save As has to.
+    let (mut file, temporary, cloned) = match destination {
+        AppendDestination::SameFile(_) => {
+            let (file, temporary) = TemporaryFile::clone_beside(target, permissions.as_ref())?;
+            if file.metadata()?.len() != reader.index.source_len {
+                return Err(SourceError::SourceChanged.into());
+            }
+            (file, temporary, true)
+        }
+        _ => {
+            let (file, temporary) = TemporaryFile::create_beside(target, permissions.as_ref())?;
+            (file, temporary, false)
+        }
+    };
     let summary = {
-        let mut writer = AppendWriter::new(reader, TemporaryOutput { file: &mut file })?;
+        let mut writer = if cloned {
+            AppendWriter::over_copy(reader, TemporaryOutput { file: &mut file })?
+        } else {
+            AppendWriter::new(reader, TemporaryOutput { file: &mut file })?
+        };
         build(&mut writer)?;
         writer.finish()?
     };
@@ -1371,7 +1397,11 @@ pub(super) fn temporary_prefix(target: &std::path::Path) -> String {
 /// could be a process, is `None`.
 #[cfg(unix)]
 fn temporary_owner(name: &str, prefix: &str) -> Option<u32> {
-    let (process, attempt) = name.strip_prefix(prefix)?.strip_suffix(".tmp")?.split_once('-')?;
+    let rest = name.strip_prefix(prefix)?;
+    let (process, attempt) = rest
+        .strip_suffix(".tmp")
+        .or_else(|| rest.strip_suffix(".d"))?
+        .split_once('-')?;
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     if !digits(process) || !digits(attempt) {
         return None;
@@ -1446,7 +1476,9 @@ fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age >= STALE_TEMPORARY_AGE);
-        if !metadata.is_file() || metadata.uid() != own_user || !old_enough {
+        // A clone's folder is ours only if it's a real folder, not a link to one.
+        let is_folder = metadata.is_dir() && name.to_str().is_some_and(|name| name.ends_with(".d"));
+        if !(metadata.is_file() || is_folder) || metadata.uid() != own_user || !old_enough {
             continue;
         }
         if probes == 0 && process_exists(std::process::id()) != Some(true) {
@@ -1457,7 +1489,16 @@ fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32
         }
         probes += 1;
         if process_exists(process) == Some(false) {
-            let _ = std::fs::remove_file(entry.path());
+            if is_folder {
+                // Only the one name a clone has, then the folder if that left it empty.
+                let clone = entry.path().join("clone");
+                if std::fs::symlink_metadata(&clone).is_ok_and(|inside| inside.is_file()) {
+                    let _ = std::fs::remove_file(clone);
+                }
+                let _ = std::fs::remove_dir(entry.path());
+            } else {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
     probes
@@ -1466,6 +1507,8 @@ fn sweep_stale_temporaries(folder: &std::path::Path, prefix: &str, own_user: u32
 #[cfg(any(unix, windows))]
 pub(super) struct TemporaryFile {
     pub(super) path: std::path::PathBuf,
+    /// A private folder beside the target that holds it, for a clone, which goes with it.
+    folder: Option<std::path::PathBuf>,
     committed: bool,
 }
 
@@ -1499,7 +1542,14 @@ impl TemporaryFile {
                         use std::os::unix::fs::MetadataExt;
                         sweep_stale_temporaries(folder, &prefix, file.metadata()?.uid());
                     }
-                    return Ok((file, Self { path, committed: false }));
+                    return Ok((
+                        file,
+                        Self {
+                            path,
+                            folder: None,
+                            committed: false,
+                        },
+                    ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1_024 => {
                     attempt += 1;
@@ -1507,6 +1557,56 @@ impl TemporaryFile {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// **A copy-on-write clone of `original` beside it, opened to append to.** `std::fs::copy` clones where the volume can (`fclonefileat` on APFS), so
+    /// the original's bytes aren't written again, and copies them where it can't. The clone goes in a folder of its own, made exclusively and private to
+    /// this user, since a copy that doesn't clone opens its destination without refusing what's there, and a name in a shared folder could be planted. The
+    /// clone keeps the original's mode, extended attributes and ACL. Its length is the caller's to check against what the reader opened, and every original
+    /// byte is compared before it's moved into place.
+    pub(super) fn clone_beside(
+        original: &std::path::Path, permissions: Option<&std::fs::Permissions>,
+    ) -> std::io::Result<(std::fs::File, Self)> {
+        let parent = folder_of(original);
+        let prefix = temporary_prefix(original);
+        let process = std::process::id();
+        let mut attempt = 0_u32;
+        let folder = loop {
+            let folder = parent.join(format!("{prefix}{process}-{attempt}.d"));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&folder) {
+                Ok(()) => break folder,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1_024 => attempt += 1,
+                Err(error) => return Err(error),
+            }
+        };
+        let path = folder.join("clone");
+        let temporary = Self {
+            path,
+            folder: Some(folder),
+            committed: false,
+        };
+        copy_for_append(original, &temporary.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = permissions.map_or(0o600, |permissions| permissions.mode() & 0o777) | 0o200;
+            std::fs::set_permissions(&temporary.path, std::fs::Permissions::from_mode(mode))?;
+            let own_user = std::fs::metadata(&temporary.path)?.uid();
+            sweep_stale_temporaries(parent, &prefix, own_user);
+        }
+        #[cfg(not(unix))]
+        let _ = permissions;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&temporary.path)?;
+        Ok((file, temporary))
     }
 
     /// Move into place at a path that has to stay empty. A hard link fails if the path has appeared, where a
@@ -1545,6 +1645,10 @@ impl TemporaryFile {
     pub(super) fn commit(mut self, target: &std::path::Path) -> std::io::Result<Option<std::io::Error>> {
         std::fs::rename(&self.path, target)?;
         self.committed = true;
+        // Its folder goes before the parent is synced, so the sync records that too.
+        if let Some(folder) = &self.folder {
+            let _ = std::fs::remove_dir(folder);
+        }
         Ok(sync_parent(target).err())
     }
 }
@@ -1564,7 +1668,29 @@ impl Drop for TemporaryFile {
         if !self.committed {
             let _ = std::fs::remove_file(&self.path);
         }
+        if let Some(folder) = &self.folder {
+            let _ = std::fs::remove_dir(folder);
+        }
     }
+}
+
+/// Copies a file for an update to be appended to: a clone where the volume allows. A test can ask for the copy a volume that can't clone gets.
+#[cfg(any(unix, windows))]
+fn copy_for_append(original: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if COPY_WITHOUT_CLONING.with(std::cell::Cell::get) {
+        let mut from = std::fs::File::open(original)?;
+        let mut into = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+        std::io::copy(&mut from, &mut into)?;
+        return Ok(());
+    }
+    std::fs::copy(original, to).map(|_| ())
+}
+
+#[cfg(all(test, any(unix, windows)))]
+thread_local! {
+    /// A volume that can't clone, for a test of that path.
+    static COPY_WITHOUT_CLONING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(all(test, any(unix, windows)))]
@@ -1642,6 +1768,126 @@ mod tests {
             40,
             "a live process's files were removed"
         );
+    }
+
+    /// A small file with one page, on disk, and a reader of it.
+    #[cfg(unix)]
+    fn one_page_on_disk(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, Vec<u8>) {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for body in [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] >>",
+        ] {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", offsets.len()).as_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        let path = dir.join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    }
+
+    /// A turned page in place, as a Save makes it.
+    #[cfg(unix)]
+    fn turn_in_place(path: &std::path::Path) -> AppendResult<AppendedFile> {
+        let reader = IndexedReader::open(crate::source::FileSource::open(path).unwrap()).unwrap();
+        append_atomically(
+            &reader,
+            AppendDestination::SameFile(path),
+            AppendOptions::new(),
+            |writer| {
+                writer
+                    .write_object(
+                        (3, 0),
+                        &Object::Dictionary(Dictionary::from_iter([
+                            ("Type", Object::Name(b"Page".to_vec())),
+                            ("Parent", Object::Reference((2, 0))),
+                            ("Rotate", Object::Integer(90)),
+                        ])),
+                    )
+                    .map(|_| ())
+            },
+        )
+    }
+
+    /// A Save writing the whole file again for one turned page, which costs a drive its whole size every time (RectoPDF's owner: "reduce SSD wear as much as
+    /// we can"); or a volume that can't clone getting a different file, or nothing. A Save starts from a clone, and where the volume can't clone, from a
+    /// copy: the two come out byte for byte the same, with every original byte first, and nothing left beside the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_starts_from_a_clone_and_a_copy_comes_out_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cloned, original) = one_page_on_disk(dir.path(), "cloned.pdf");
+        let (copied, _) = one_page_on_disk(dir.path(), "copied.pdf");
+        turn_in_place(&cloned).unwrap();
+        COPY_WITHOUT_CLONING.with(|copy| copy.set(true));
+        let done = turn_in_place(&copied);
+        COPY_WITHOUT_CLONING.with(|copy| copy.set(false));
+        let done = done.unwrap();
+        let (cloned, copied) = (std::fs::read(&cloned).unwrap(), std::fs::read(&copied).unwrap());
+        assert!(cloned.starts_with(&original) && cloned.len() > original.len());
+        assert_eq!(cloned, copied, "the clone and the copy give the same file");
+        assert_eq!(done.reader.page_count().unwrap(), 1);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "nothing left beside them: {names:?}");
+    }
+
+    /// A clone taken of a file that's changed since the reader opened it being appended to as if it were the file that was read. Its length is checked, every
+    /// original byte is compared, and the save is refused with nothing changed and nothing left.
+    #[cfg(unix)]
+    #[test]
+    fn a_clone_of_a_changed_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, original) = one_page_on_disk(dir.path(), "doc.pdf");
+        let reader = IndexedReader::open(crate::source::FileSource::open(&path).unwrap()).unwrap();
+        let mut changed = original.clone();
+        changed.extend_from_slice(b"% someone else's\n");
+        std::fs::write(&path, &changed).unwrap();
+        let refused = append_atomically(
+            &reader,
+            AppendDestination::SameFile(&path),
+            AppendOptions::new(),
+            |writer| writer.add_object(&Object::Integer(1)).map(|_| ()),
+        );
+        assert!(refused.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), changed, "the other version stays");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "nothing left beside it"
+        );
+    }
+
+    /// A crash leaving a clone's folder for ever, holding a whole file's old blocks. A later save of that file removes it once its process is gone and it's
+    /// an hour old, and only a real folder with nothing in it but the clone.
+    #[cfg(unix)]
+    #[test]
+    fn a_crashed_saves_clone_folder_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = one_page_on_disk(dir.path(), "doc.pdf");
+        let prefix = temporary_prefix(&path);
+        let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let folder = dir.path().join(format!("{prefix}{dead}-0.d"));
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("clone"), b"old blocks").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+        std::fs::File::open(&folder).unwrap().set_modified(old).unwrap();
+        assert_eq!(temporary_owner(&format!("{prefix}{dead}-0.d"), &prefix), Some(dead));
+        turn_in_place(&path).unwrap();
+        assert!(!folder.exists(), "the leftover went");
     }
 
     /// A number that can't be a process being probed, or taken as gone: `ps -p 0` and a number past `pid_t` say nothing useful.

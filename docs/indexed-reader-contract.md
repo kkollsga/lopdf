@@ -63,16 +63,23 @@ implemented for memory, `Sink`, and a temporary file only `append_atomically` ca
 - `OverwriteOther` replaces another file the caller named deliberately, and refuses if it changes meanwhile.
 
 A symbolic link is followed to the real file. A read-only target, or one with other hard links unless
-`AppendOptions::allow_breaking_hard_links` is set, is refused. **A replaced file gets the old one's name and mode
-bits and nothing else:** extended attributes, including Finder tags and `com.apple.quarantine`, ACLs, owner and
-birth time are lost unless `AppendOptions::prepare_replacement` copies them, which runs on the finished temporary
-file before it's checked and moved. The crate forbids unsafe code and can't copy them itself.
+`AppendOptions::allow_breaking_hard_links` is set, is refused.
 
-The temporary file is created exclusively, no more readable than the file it becomes, writable by its owner until the
-prepare step has run, and named from a hash of the target's name. A later save for the same target removes a leftover whose
-process is gone, if it's a regular file of this user's, over an hour old, and its name fits the pattern exactly, asking `ps`
-about at most 16 processes. One of these names that's a link to the target itself is removed whatever its age, since it isn't
-a hard link anyone made. After the rename, only `AppendedFile::durability_warning` can report a problem, since the file is
+**Save starts from a clone.** For `SameFile`, the temporary file is a copy-on-write clone of the original (`std::fs::copy`, which uses
+`fclonefileat` where the volume allows and copies where it doesn't), and only the update is written to it: a turned page on a 346 MiB file
+writes 8 KiB rather than the whole file. The clone sits in a folder of its own beside the target, made exclusively and private to this
+user, since a copy that can't clone opens its destination without refusing what's there. Its length must be what the reader opened, every
+original byte is still compared before the rename, and the rename is from that folder to the target. On macOS a clone, and a copy, keep
+the original's mode, extended attributes (Finder tags, `com.apple.quarantine`) and ACL; other platforms' copies may not. **A new file, or
+another file replaced, gets the old one's name and mode bits and nothing else:** extended attributes, ACLs, owner and birth time are lost
+unless `AppendOptions::prepare_replacement` copies them, which runs on the finished temporary file before it's checked and moved. The crate
+forbids unsafe code and can't copy them itself.
+
+Any other temporary file is created exclusively beside the target. Either is no more readable than the file it becomes, writable by its owner
+until the prepare step has run, and named from a hash of the target's name. A later save for the same target removes a leftover whose
+process is gone, if it's this user's, over an hour old, and its name fits the pattern exactly, asking `ps` about at most 16 processes: a
+regular file, or a clone's folder, which is a real folder and loses only the one file named `clone` inside it. One of these names that's a
+link to the target itself is removed whatever its age, since it isn't a hard link anyone made. After the rename, only `AppendedFile::durability_warning` can report a problem, since the file is
 already in place.
 
 A small gap remains between the last check and the rename, which safe code can't close.
