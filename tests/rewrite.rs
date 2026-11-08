@@ -3242,3 +3242,95 @@ fn a_copy_that_still_reads_as_signed_fails_its_check() {
         checked.err()
     );
 }
+
+/// A file with usage rights alone, as IRS forms have, not being rewritable in place even with their own consent, so an app can't save a page delete to
+/// it; or that consent letting a real signature be replaced too. Usage rights go in place with `remove_usage_rights`, and a file with any other signature
+/// beside them is refused in place as ever, and needs `remove_signatures` for a copy.
+#[test]
+fn usage_rights_alone_can_be_removed_in_place_and_nothing_else_can() {
+    let rights = |extra_field: &str| {
+        let mut builder = Builder::new(500);
+        let catalog = format!("<< /Type /Catalog /Pages 2 0 R /Perms << /UR3 7 0 R >> {extra_field} >>");
+        let mut objects = vec![
+            obj(1, &catalog),
+            obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 9 9] >>"),
+            obj(3, "<< /Type /Page /Parent 2 0 R >>"),
+            obj(4, "<< /Type /Page /Parent 2 0 R >>"),
+            Obj {
+                number: 7,
+                generation: 0,
+                body: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Reference [<< /TransformMethod /UR3 >>] /ByteRange [0 1 2 3] /Contents <00> >>".to_vec(),
+                is_stream: true,
+            },
+        ];
+        if !extra_field.is_empty() {
+            objects.push(obj(8, "<< /FT /Sig /T (Person) /V 9 0 R >>"));
+            objects.push(Obj {
+                number: 9,
+                generation: 0,
+                body: b"<< /Type /Sig /Filter /Adobe.PPKLite /ByteRange [0 4 5 6] /Contents <00> >>".to_vec(),
+                is_stream: true,
+            });
+        }
+        builder.place(Form::Table, &objects, 100);
+        builder.finish_revision(Form::Table, "/Root 1 0 R");
+        builder.bytes
+    };
+    let rights_policy = || RewriteOptions::new().policy(RewritePolicy::new().remove_usage_rights());
+
+    let bytes = rights("");
+    let folder = tempfile::tempdir().unwrap();
+    let (path, reader) = on_disk(folder.path(), &bytes);
+    let refused = rewrite_atomically(
+        &reader,
+        AppendDestination::SameFile(&path),
+        RewriteOptions::new(),
+        |changes| {
+            changes.remove_page(1);
+            Ok(())
+        },
+    );
+    assert!(
+        matches!(refused, Err(RewriteError::SignedFileCannotBeReplaced { .. })),
+        "not without being asked"
+    );
+    let done = rewrite_atomically(
+        &reader,
+        AppendDestination::SameFile(&path),
+        rights_policy(),
+        |changes| {
+            changes.remove_page(1);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(done.summary.removed_signatures.len(), 1);
+    assert_eq!(
+        done.summary.removed_signatures[0].kind,
+        IndexedSignatureKind::UsageRights
+    );
+    assert!(done.summary.signature_removal.permissions);
+    assert!(
+        done.reader.signatures().unwrap().is_empty(),
+        "the file in place has none"
+    );
+    assert_eq!(done.reader.page_count().unwrap(), 1);
+    assert_markers(&std::fs::read(&path).unwrap(), &["UR3", "ByteRange"], &[]);
+
+    let bytes = rights("/AcroForm << /Fields [8 0 R] >>");
+    let folder = tempfile::tempdir().unwrap();
+    let (path, reader) = on_disk(folder.path(), &bytes);
+    let refused = rewrite_atomically(&reader, AppendDestination::SameFile(&path), rights_policy(), |_| Ok(()));
+    assert!(
+        matches!(refused, Err(RewriteError::SignedFileCannotBeReplaced { .. })),
+        "a person's signature beside them holds the bytes"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let copy = folder.path().join("copy.pdf");
+    let refused = rewrite_atomically(&reader, AppendDestination::NewFile(&copy), rights_policy(), |_| Ok(()));
+    assert!(
+        matches!(refused, Err(RewriteError::SignedNeedsConsent { .. })),
+        "and a copy needs consent for it"
+    );
+    assert!(!copy.exists());
+}

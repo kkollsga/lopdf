@@ -310,6 +310,13 @@ fn check_signatures(
     if signatures.is_empty() {
         return Ok(());
     }
+    // Usage rights alone aren't a person's signature, and go with their own consent, in place or not. Anything else among them holds the bytes.
+    let rights_only = signatures
+        .iter()
+        .all(|signature| signature.kind == IndexedSignatureKind::UsageRights);
+    if rights_only && policy.remove_usage_rights {
+        return Ok(());
+    }
     if replaces_original {
         return Err(RewriteError::SignedFileCannotBeReplaced {
             signatures: signatures.to_vec(),

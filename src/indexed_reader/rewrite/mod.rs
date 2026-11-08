@@ -85,7 +85,8 @@
 //! And while planning:
 //!
 //! - **A file with signatures,** usage rights among them, unless [`RewritePolicy::remove_signatures`] gives consent, and even then
-//!   never over the signed file itself, because a signed file's bytes never change. A rewritten copy is unsigned, never broken (the
+//!   never over the signed file itself, because a signed file's bytes never change. A file whose only signatures are usage rights can be
+//!   rewritten in place, with them removed, with [`RewritePolicy::remove_usage_rights`]: they aren't a person's signature. A rewritten copy is unsigned, never broken (the
 //!   owner's decision 27): every signature goes, with what a viewer would show of it, and [`RewriteSummary::removed_signatures`] says which.
 //!   Nothing here ever says one is valid.
 //! - **An object that can be reached and can't be read,** which would otherwise be lost without a word. One whose entry is a little off
@@ -223,6 +224,7 @@ pub enum RewriteFormChoice {
 #[must_use]
 pub struct RewritePolicy {
     remove_signatures: bool,
+    remove_usage_rights: bool,
     form: RewriteFormChoice,
 }
 
@@ -240,6 +242,16 @@ impl RewritePolicy {
     /// since a signed file's bytes never change.
     pub fn remove_signatures(mut self) -> Self {
         self.remove_signatures = true;
+        self
+    }
+
+    /// Rewrite a file whose only signatures are usage rights (`/Perms /UR3` or `/UR`, as on IRS forms), with them removed, over the file itself
+    /// as well as into a copy. Usage rights are a signature by whoever enabled extra features in a reader, not a person's, so they don't hold the
+    /// file's bytes as a person's signature does (RectoPDF's owner, 2026-11-08). A file with any other signature, a certification or a document
+    /// timestamp among them, is refused in place whatever this says, and needs [`remove_signatures`](Self::remove_signatures) for a copy.
+    /// [`RewriteSummary::removed_signatures`] lists the usage rights that went.
+    pub fn remove_usage_rights(mut self) -> Self {
+        self.remove_usage_rights = true;
         self
     }
 

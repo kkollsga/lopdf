@@ -123,7 +123,9 @@ right pages. A failure at any step, or a kill, leaves what was at the destinatio
 `RewritePolicy::remove_signatures` gives consent, and even then never over the signed file itself. Signatures are found by form field, by `/Perms`, by every
 `/ByteRange` name in the file's bytes, however it's spelled and wherever it falls, which covers old revisions, and by anything the walk comes across. With
 consent every signature goes: the field, its value, its widgets and their appearances, `/Perms` with certification and usage rights, `/SigFlags`, `/DSS`. The
-check proves the copy has none. Usage rights are classed as their own kind, and need the same consent. Nothing here checks one or says one is valid.
+check proves the copy has none. Usage rights are classed as their own kind, and need the same consent, or `RewritePolicy::remove_usage_rights`, which lets a file whose only
+signatures are usage rights be rewritten in place with them removed: they're a signature by whoever enabled extra features in a reader, not a person's. Any other
+signature beside them still refuses in place. Nothing here checks one or says one is valid.
 
 **Refused:** encryption, a rebuilt index, a `/Prev` loop, an ambiguous hybrid, removing every page, and an object that can be reached and can't be read.
 
