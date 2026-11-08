@@ -1890,6 +1890,46 @@ fn usage_rights_are_classed_as_such_and_removed_with_consent() {
     assert_markers(&output, &["UR3", "ByteRange"], &[]);
 }
 
+/// Failure: a hostile blank signature field whose kids name the same object twice at every level makes the look for a signed kid visit it
+/// 2^depth times, so removing signatures runs on at full CPU and never ends. Each object is looked at once, so it ends at once, and the
+/// blank field, signed nowhere under it, stays.
+#[test]
+fn a_blank_signature_fields_doubled_kids_are_looked_at_once() {
+    let mut builder = Builder::new(500);
+    let levels = 50u32;
+    let mut objects = vec![
+        obj(1, "<< /Type /Catalog /Pages 2 0 R /Perms << /UR3 7 0 R >> /AcroForm << /SigFlags 3 /Fields [5 0 R] >> >>"),
+        obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 9 9] >>"),
+        obj(3, "<< /Type /Page /Parent 2 0 R >>"),
+        obj(5, "<< /FT /Sig /T (SignHere) /Kids [10 0 R 10 0 R] >>"),
+        Obj {
+            number: 7,
+            generation: 0,
+            body: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Reference [<< /TransformMethod /UR3 >>] /ByteRange [0 1 2 3] /Contents <00> >>".to_vec(),
+            is_stream: true,
+        },
+    ];
+    for level in 0..levels {
+        let number = 10 + level;
+        let body = if level + 1 == levels {
+            "<< /Rect [0 0 9 9] >>".to_string()
+        } else {
+            format!("<< /Kids [{next} 0 R {next} 0 R] >>", next = number + 1)
+        };
+        objects.push(obj(number, &body));
+    }
+    builder.place(Form::Table, &objects, 100);
+    builder.finish_revision(Form::Table, "/Root 1 0 R");
+    let (_output, _summary, after) = rewrite_with(&builder.bytes, RewritePolicy::new().remove_signatures(), |_| {});
+    let catalog = dict(&after, 1);
+    let acro = catalog.get(b"AcroForm").unwrap().as_dict().unwrap();
+    assert_eq!(
+        acro.get(b"Fields").unwrap().as_array().unwrap(),
+        &vec![Object::Reference((5, 0))],
+        "the blank field stays"
+    );
+}
+
 /// A blank signature field, with no value, removed with the signatures, as on an IRS form whose usage rights go in place, or a copy with a person's signature
 /// taken off: it isn't a signature, and a form loses the place a person was to sign. It stays, with its widget, and `SignaturesExist` with it, while
 /// `AppendOnly`, which is about signatures there are, goes, and the signed field goes as before.

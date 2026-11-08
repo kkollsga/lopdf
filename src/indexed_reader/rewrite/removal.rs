@@ -9,6 +9,8 @@ use super::*;
 /// Depth followed in a name tree, a number tree or a form's fields before a branch is left as it is. The stack each level costs
 /// is the limit. Real ones go a few levels deep.
 const MAX_TREE_DEPTH: usize = 64;
+/// How many objects one look under a blank signature field may visit, so a hostile field tree can't make it run on.
+const MAX_KID_VISITS: usize = 16_384;
 /// Bookmarks one document can have here. Each costs about 100 bytes while they're looked at.
 const MAX_OUTLINE_ITEMS: u64 = 500_000;
 /// Page-label ranges one document can have here. Each is a small dictionary, and a real document has a few.
@@ -1221,17 +1223,31 @@ impl Plan<'_> {
     }
 
     /// Whether anything under a signature field has a value, so it's signed, however its value was put on a kid.
+    ///
+    /// Each object is looked at once, and the walk has a budget: a hostile tree whose kids name the same object
+    /// twice at every level would otherwise be visited 2^depth times. Past the depth cap or the budget it answers
+    /// signed, so the field goes, which is the side that never leaves a signature behind.
     fn any_kid_signed(&mut self, kids: &[Object], depth: usize) -> RewriteResult<bool> {
-        if depth >= MAX_TREE_DEPTH {
-            return Ok(true);
-        }
-        for kid in kids {
-            if let Some(dict) = self.deref_dict(Some(kid))? {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut visits = 0usize;
+        let mut stack: Vec<(Object, usize)> = kids.iter().map(|kid| (kid.clone(), depth)).collect();
+        while let Some((kid, at)) = stack.pop() {
+            if at >= MAX_TREE_DEPTH || visits >= MAX_KID_VISITS {
+                return Ok(true);
+            }
+            visits += 1;
+            if let Object::Reference((number, _)) = kid
+                && !seen.insert(number)
+            {
+                continue;
+            }
+            if let Some(dict) = self.deref_dict(Some(&kid))? {
                 if dict.has(b"V") {
                     return Ok(true);
                 }
                 let grandkids = self.deref_array(dict.get(b"Kids").ok())?;
-                if !grandkids.is_empty() && self.any_kid_signed(&grandkids, depth + 1)? {
+                stack.extend(grandkids.into_iter().map(|grandkid| (grandkid, at + 1)));
+                if stack.len() > MAX_KID_VISITS {
                     return Ok(true);
                 }
             }
